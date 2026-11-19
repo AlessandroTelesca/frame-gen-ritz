@@ -69,6 +69,9 @@ struct Layer {
     double px = 0, py = 0;                          // pivot (layer coordinates = screen coordinates at tau = 0)
     double scaleRate = 0, rotDeg = 0, shx = 0, shy = 0;
     double period = 0;                              // > 0: the texture is modulated by vertical stripes of this period (px): a repetitive structure (the probes' test)
+    bool solid = false;                             // a flat colour instead of the texture (overlays: kind 3 / 4)
+    float srgb[3] = {255, 255, 255};
+    double gamma = 1.0;                             // the texture's levels to the power gamma (a nonlinear change of the histogram: the scene-cut test)
     uint32_t seed = 1;
     V2 toScreen(double tau, V2 u) const {
         const double s = 1.0 + scaleRate * tau, th = rotDeg * tau * M_PI / 180.0, c = std::cos(th), sn = std::sin(th);
@@ -82,11 +85,23 @@ struct Layer {
     }
     bool inMask(V2 u) const {
         if (kind == 0) return true;
+        if (kind == 3) {   // a plus (a reticle): centre (mcx, mcy), arms of half length mhw, half thickness mhh
+            const double dx = std::fabs(u.x - mcx), dy = std::fabs(u.y - mcy);
+            return (dx <= mhw && dy <= mhh) || (dy <= mhw && dx <= mhh);
+        }
+        if (kind == 4) {   // a text-like block: rectangle of half sizes (mhw, mhh), rows of 14 px every 18 px, glyph strokes 4 px wide every 6 px, 75% of the columns filled
+            const double rx0 = u.x - (mcx - mhw), ry0 = u.y - (mcy - mhh);
+            if (rx0 < 0 || ry0 < 0 || rx0 >= 2 * mhw || ry0 >= 2 * mhh) return false;
+            const int row = (int)(ry0 / 18.0), col = (int)(rx0 / 6.0);
+            if (std::fmod(ry0, 18.0) >= 14.0 || std::fmod(rx0, 6.0) >= 4.0) return false;
+            return (hash3((uint32_t)col, (uint32_t)row, 77u) & 255u) < 192u;
+        }
         const double dx = (u.x - mcx) / mhw, dy = (u.y - mcy) / mhh;
         return kind == 1 ? (std::fabs(dx) <= 1.0 && std::fabs(dy) <= 1.0) : dx * dx + dy * dy <= 1.0;
     }
     // the layer's texture at layer position u, levels 0..255 per channel
     void texture(V2 u, float rgb[3]) const {
+        if (solid) { rgb[0] = srgb[0]; rgb[1] = srgb[1]; rgb[2] = srgb[2]; return; }
         static const float lam[6] = {128, 64, 32, 16, 8, 4}, amp[6] = {0.38f, 0.30f, 0.24f, 0.18f, 0.12f, 0.07f};
         const float x = (float)u.x, y = (float)u.y;
         float v[3];
@@ -109,6 +124,7 @@ struct Layer {
                 if (!in) continue;
                 for (int c = 0; c < 3; c++) v[c] = 0.25f * v[c] + 0.75f * (20.0f + 210.0f * u01(hash3(h, 11 + c, 9)));
             }
+        if (gamma != 1.0) for (int c = 0; c < 3; c++) v[c] = 255.0f * std::pow(v[c] / 255.0f, (float)gamma);
         rgb[0] = v[0]; rgb[1] = v[1]; rgb[2] = v[2];
     }
 };
@@ -312,6 +328,16 @@ static std::vector<Scene> makeScenes(const std::string& which, int W, int H) {
         sc.layers = {l};
         add(sc);
     }
+    if (want("hud")) {   // a static overlay (a red reticle, a block of white text-like strokes) over a panning background: the overlay must stay where it is, the background must move
+        Scene sc; sc.name = name("hud", 60, 20);
+        Layer bg = plane(1, cx, cy); bg.shx = 60 * k; bg.shy = 20 * k;
+        Layer ret; ret.kind = 3; ret.solid = true; ret.srgb[0] = 255; ret.srgb[1] = 30; ret.srgb[2] = 30; ret.mcx = 0.62 * W; ret.mcy = 0.45 * H;
+        ret.mhw = std::max(14.0, 44 * k); ret.mhh = std::max(1.5, 2.0 * k); ret.px = ret.mcx; ret.py = ret.mcy; ret.seed = 5;
+        Layer txt; txt.kind = 4; txt.solid = true; txt.srgb[0] = txt.srgb[1] = txt.srgb[2] = 250; txt.mcx = 0.22 * W; txt.mcy = 0.84 * H;
+        txt.mhw = std::max(40.0, 120 * k); txt.mhh = std::max(18.0, 36 * k); txt.px = txt.mcx; txt.py = txt.mcy; txt.seed = 6;
+        sc.layers = {bg, ret, txt};
+        add(sc);
+    }
     if (want("fade")) {
         Scene sc; sc.name = name("fade", 120, 60); sc.fade = true;
         Layer l = plane(1, cx, cy); l.shx = 120 * k; l.shy = 60 * k;
@@ -500,6 +526,37 @@ static BetStat betweenStat(const std::vector<uint8_t>& out, const std::vector<ui
     return s;
 }
 
+// ---- the static overlay check (scene "hud"): the overlay layers (id >= 1 at time t) against the background around and away from them
+static std::vector<uint8_t> dilateBox(const std::vector<uint8_t>& m, int W, int H, int r) {
+    std::vector<uint8_t> tmp(m.size(), 0), d(m.size(), 0);
+    parallelRows(H, [&](int y) { for (int x = 0; x < W; x++) { uint8_t v = 0; for (int i = std::max(0, x - r); i <= std::min(W - 1, x + r) && !v; i++) v = m[(size_t)y * W + i]; tmp[(size_t)y * W + x] = v; } });
+    parallelRows(H, [&](int y) { for (int x = 0; x < W; x++) { uint8_t v = 0; for (int j = std::max(0, y - r); j <= std::min(H - 1, y + r) && !v; j++) v = tmp[(size_t)j * W + x]; d[(size_t)y * W + x] = v; } });
+    return d;
+}
+struct HudStat { double ovl = 0, ring = 0, ringBad = 0, far = 0; size_t nOvl = 0, nRing = 0, nFar = 0; };
+// ovl: mean error over the overlay's own pixels (eroded by 1 px: the anti-aliased rim is a blend of the two), ring: over the background 3..40 px from the overlay (where a dragged or doubled
+// copy of it would show; the revealed strips are in it: the background moves 60 px), ringBad: the share of the ring with an error above 40 levels, far: the background more than 60 px away
+static HudStat hudStat(const Scene& sc, const std::vector<uint8_t>& out, const std::vector<uint8_t>& ref, double t) {
+    const int W = sc.W, H = sc.H;
+    const std::vector<uint8_t> id = idMap(sc, t), hid = hiddenMask(sc, t);
+    std::vector<uint8_t> ov(id.size()), bgm(id.size());
+    for (size_t i = 0; i < id.size(); i++) { ov[i] = id[i] >= 1; bgm[i] = id[i] == 0 && !hid[i]; }   // (the content hidden in one real frame is the layers' own test, not this one)
+    const std::vector<uint8_t> inner = dilateBox(bgm, W, H, 1), d3 = dilateBox(ov, W, H, 3), d40 = dilateBox(ov, W, H, 40), d60 = dilateBox(ov, W, H, 60);
+    HudStat s;
+    double so = 0, sr = 0, sf = 0;
+    size_t bad = 0;
+    for (size_t i = 0; i < id.size(); i++) {
+        double e = 0;
+        for (int c = 0; c < 3; c++) e += std::abs((int)out[i * 4 + c] - (int)ref[i * 4 + c]);
+        e /= 3.0;
+        if (ov[i] && !inner[i]) { so += e; s.nOvl++; }
+        else if (bgm[i] && d40[i] && !d3[i]) { sr += e; s.nRing++; bad += e > 40.0; }
+        else if (bgm[i] && !d60[i]) { sf += e; s.nFar++; }
+    }
+    s.ovl = s.nOvl ? so / s.nOvl : 0; s.ring = s.nRing ? sr / s.nRing : 0; s.ringBad = s.nRing ? 100.0 * bad / s.nRing : 0; s.far = s.nFar ? sf / s.nFar : 0;
+    return s;
+}
+
 // ---- the CPU warp of the self-check: dst(c) = bilinear(src, c + fs F(m)) for the pixels whose flow pixel is visible
 static double warpError(const Scene& sc, const Flows& F, const std::vector<uint8_t>& src, const std::vector<uint8_t>& dst, const std::vector<float>& flow,
                         const std::vector<uint8_t>& vis, size_t* count, double gain, double offset) {
@@ -557,6 +614,7 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 static bool gDiag = false;
 static std::string gErrMap;
 static bool gProfile = false;   // --profile: the occlusion ramp along the middle row (layers scenes)
+static std::string gSave;   // --save PREFIX: the scene's two real frames as raw RGBA (PREFIX-NAME-p.rgba, -c.rgba) for the other tools (fgtest, v3flow.py)
 static std::string gFrames;   // --frames PREFIX: PPMs of every in-between frame, its reference and the error (x8, grey)
 static void writePpm(const std::string& fn, const std::vector<uint8_t>& rgba, int W, int H, bool err, const std::vector<uint8_t>* ref) {
     FILE* f = fopen(fn.c_str(), "wb");
@@ -664,6 +722,7 @@ static bool statsCheck(const Scene& sc, const Flows& F, const uint32_t* G, uint3
     }
     if (sc.layers.size() > 1) {   // every layer's motion is among the valid dominant motions (the foreground at its mask centre, the background at the frame centre)
         for (size_t L = 0; L < sc.layers.size(); L++) {
+            if (sc.layers[L].solid) continue;   // (an overlay of a few thousand px is below the dominant-motion mass minimum)
             const V2 c = L ? V2{sc.layers[L].mcx, sc.layers[L].mcy} : V2{0.5 * sc.W, 0.5 * sc.H};
             const V2 e = motionAt((int)L, c);
             double best = 1e9;
@@ -711,6 +770,7 @@ int main(int argc, char** argv) {
         else if (a == "--blk" && i + 1 < argc) gBlkLevel = atoi(argv[++i]);
         else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
         else if (a == "--frames" && i + 1 < argc) gFrames = argv[++i];
+        else if (a == "--save" && i + 1 < argc) gSave = argv[++i];
         else if (a == "--profile") gProfile = true;
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
@@ -718,7 +778,7 @@ int main(int argc, char** argv) {
     if ((fs != 1 && fs != 2 && fs != 4) || W < 16 || H < 16) { fprintf(stderr, "--fs 1|2|4, --size at least 16x16\n"); return 2; }
     for (double t : ts) if (!(t > 0.0 && t < 1.0)) { fprintf(stderr, "--t: times in (0, 1)\n"); return 2; }
     std::vector<Scene> scenes = makeScenes(which, W, H);
-    if (scenes.empty()) { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
+    if (scenes.empty() && which != "decide") { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
     if (list) { for (auto& s : scenes) printf("%s\n", s.name.c_str()); return 0; }
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -774,11 +834,51 @@ int main(int argc, char** argv) {
 
     printf("v3test %dx%d flowScale %d on %s%s\n", W, H, fs, props.deviceName, selfcheck ? " (selfcheck)" : "");
     int selfFails = 0;
+    if (which == "all" || which == "decide") {
+        // the decisions on pairs that are not ordinary: a cut (two unrelated frames) is mode 1, noise against a picture is failMix 1; a lighting change (gamma) is neither
+        struct Case { const char* name; int expectMode; float expectFail; };
+        const Case cases[] = {{"cut", 1, -1}, {"noise", 0, 1}, {"gamma 0.5", 0, 0}};
+        for (const Case& cs : cases) {
+            Scene A, B;
+            A.W = B.W = W; A.H = B.H = H;
+            A.layers = {plane(1, 0.5 * W, 0.5 * H)};
+            B.layers = {plane(9, 0.5 * W, 0.5 * H)};
+            std::vector<uint8_t> pa = renderFrame(A, 0.0), pb = renderFrame(B, 0.0);
+            if (!strcmp(cs.name, "cut")) for (size_t i = 0; i < pb.size() / 4; i++) {   // another scene: big dark / bright blocks (the same generator with another seed, or an inverted copy, has the same level statistics: not a cut a histogram could see)
+                const size_t x = i % W, y = i / W;
+                const uint8_t v = ((x / 240 + y / 135) & 1) ? 235 : 20;
+                pb[i * 4] = pb[i * 4 + 1] = pb[i * 4 + 2] = v;
+            }
+            if (!strcmp(cs.name, "noise")) { for (size_t i = 0; i < pb.size(); i++) pb[i] = i % 4 == 3 ? 255 : (uint8_t)(hash3((uint32_t)i, 3u, 5u) & 255u); }
+            if (!strcmp(cs.name, "gamma 0.5")) { pb = pa; for (size_t i = 0; i < pb.size(); i++) if (i % 4 != 3) pb[i] = (uint8_t)(255.0 * std::pow(pa[i] / 255.0, 0.5) + 0.5); }
+            upload(pa, a, W, H);
+            upload(pb, b, W, H);
+            Run r;
+            const bool rok = runV3(a, b, o, ts, nullptr, r);
+            const bool ok = rok && r.mode == cs.expectMode && (cs.expectFail < 0 || r.failMix == cs.expectFail);
+            printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut 0.45)   %s (expected mode %d%s)\n", cs.name, r.mode, r.failMix, r.histD, ok ? "PASS" : "FAIL", cs.expectMode, cs.expectFail < 0 ? "" : ", failMix 1.00 (or 0.00 for the gamma pair)");
+            verdict(ok, true);
+            if (rok && ts.size() && r.mode == 1) {   // a cut: every generated frame is a real frame (prev for t <= 0.5, curr after)
+                for (size_t k = 0; k < ts.size(); k++) {
+                    const std::vector<uint8_t>& want = ts[k] <= 0.5 ? pa : pb;
+                    size_t bad = 0;
+                    for (size_t i = 0; i < want.size(); i++) bad += r.out[k][i] != want[i];
+                    printf("%-20s cut output t=%.2f: %zu differing bytes from the real %s frame   %s\n", cs.name, ts[k], bad, ts[k] <= 0.5 ? "previous" : "current", bad == 0 ? "PASS" : "FAIL");
+                    verdict(bad == 0, true);
+                }
+            }
+        }
+    }
     for (const Scene& sc : scenes) {
         const Flows F = exactFlows(sc, fs);
         const std::vector<uint8_t> prev = renderFrame(sc, 0.0), curr = renderFrame(sc, 1.0);
         upload(prev, a, W, H);
         upload(curr, b, W, H);
+        if (!gSave.empty()) {
+            std::string base = gSave + "-" + sc.name;
+            for (char& ch : base) if (ch == '(' || ch == ')' || ch == ',' || ch == '%' || ch == '+') ch = '_';
+            for (int i = 0; i < 2; i++) if (FILE* f = fopen((base + (i ? "-c.rgba" : "-p.rgba")).c_str(), "wb")) { fwrite((i ? curr : prev).data(), 1, prev.size(), f); fclose(f); }
+        }
         const size_t N = (size_t)F.fw * F.fh;
         // the injected exact flows: F01 then F10 (fw * fh vec2 each)
         HostBuf fb = makeHostBuf(N * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -979,6 +1079,30 @@ int main(int argc, char** argv) {
                 }
             }
             printf("\n");
+        }
+        if (sc.name.rfind("hud", 0) == 0 && estOk) {
+            // a static overlay over a moving background (Settings::v2StaticMask is V3's switch too): with the mask the overlay stays at its place (small error on it, none in the ring around it
+            // where a dragged copy would show) and the background still moves (far error small); without it the check has teeth (the ring shows the copies)
+            HudStat on[8], off[8];
+            for (int maskOn = 1; maskOn >= 0; maskOn--) {
+                framegen::Settings st = info.settings;
+                st.v2StaticMask = maskOn != 0;
+                gFg.setSettings(st);
+                Run r;
+                const bool rok = runV3(a, b, o, ts, nullptr, r);
+                gFg.setSettings(info.settings);
+                for (size_t k = 0; rok && k < ts.size() && k < 8; k++) (maskOn ? on : off)[k] = hudStat(sc, r.out[k], renderFrame(sc, ts[k]), ts[k]);
+            }
+            for (size_t k = 0; k < ts.size() && k < 8; k++) {
+                const bool pass = on[k].ovl <= 8.0 && on[k].ring <= 4.0 && on[k].ringBad <= 1.0 && on[k].far <= 2.0;
+                const bool teeth = off[k].ringBad >= 2.0 * on[k].ringBad + 0.5 || off[k].ovl >= on[k].ovl + 1.0;
+                printf("%-20s static overlay t=%.2f  mask ON: overlay %5.2f (%zu px)  ring %5.2f  ring > 40 levels %5.2f%% (%zu px)  background far %5.2f   %s (overlay <= 8, ring <= 4, ring > 40 <= 1%%, far <= 2)\n", nm.c_str(), ts[k],
+                       on[k].ovl, on[k].nOvl, on[k].ring, on[k].ringBad, on[k].nRing, on[k].far, pass ? "PASS" : "FAIL");
+                printf("%-20s static overlay t=%.2f  mask OFF: overlay %5.2f           ring %5.2f  ring > 40 levels %5.2f%%             background far %5.2f   %s (the check has teeth: OFF worse than ON)\n", nm.c_str(), ts[k],
+                       off[k].ovl, off[k].ring, off[k].ringBad, off[k].far, teeth ? "PASS" : "FAIL");
+                verdict(pass, true);
+                verdict(teeth, true);
+            }
         }
         printf("%-20s inject readback (FD == the injected flows, bit-exact): %s\n", nm.c_str(), rtOk ? "PASS" : "FAIL");
         verdict(rtOk, true);

@@ -2056,6 +2056,7 @@ bool Interpolator::debugV3Layout(DebugV3Layout& l) const {
     VkDeviceSize o = l.blk;
     for (int i = 0; i < V.n; i++) { l.blkLevel[i] = o; o += (VkDeviceSize)V.gw[i] * V.gh[i] * 4 * 16; }
     l.g = o; o += 64 * 4;   // G words 0..63
+    l.cells = o; o += (VkDeviceSize)V.N8 * 12;   // (Y2) the static mask's cell maxima s8, enclosure E and "overlay near" bits C (N8 words each)
     l.size = o;
     return true;
 }
@@ -2081,8 +2082,8 @@ bool Interpolator::recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize 
     I.CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, dst, 3, fc);
     VkBufferCopy ac[2] = {{0, dstOffset + L.map0, 2 * n1}, {(VkDeviceSize)4 * V.N * 4, dstOffset + L.s, n1}};   // MAP[0..1]; S at word 4N
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, ac);
-    VkBufferCopy gc = {g0, dstOffset + L.g, 64 * 4};   // the state G, words 0..63 (step E2: dominant motions, camera, wide counters)
-    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 1, &gc);
+    VkBufferCopy gc[2] = {{g0, dstOffset + L.g, 64 * 4}, {(VkDeviceSize)5 * V.N * 4, dstOffset + L.cells, (VkDeviceSize)V.N8 * 12}};   // the state G, words 0..63 (step E2: dominant motions, camera, wide counters); s8, E, C
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, gc);
     return true;
 }
 

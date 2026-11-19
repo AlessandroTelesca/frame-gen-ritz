@@ -715,7 +715,7 @@ public:
     struct DebugV3Layout {
         uint32_t W, H, fw, fh, bw, bh, fscale, nLevels;
         uint32_t lw[16], lh[16], lgw[16], lgh[16];   // per level: size and 8x8 / 4x4 block grid (gpu/V3.md section 2)
-        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
+        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, cells, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
     };
     bool debugV3Layout(DebugV3Layout& l) const;
     bool recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

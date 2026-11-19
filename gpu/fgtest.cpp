@@ -31,6 +31,9 @@
 // per-pixel field and, at the start of the e part, its coverage (see fgmaps.py). MotionVersion::V3 also writes DIR/pair_NNNN.v3db, the raw
 // Interpolator::recordDebugV3 dump (framegen.h: header, FF[0..1] = F01 / F10, FD, MAP, S, BLK; gpu/v3flow.py reads it). (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
 // the same maps followed by its own, which no longer exist.)
+// --v3weights PREFIX [--v3wmax N] (MotionVersion::V3): after each pair also record Interpolator::recordDebugV3Weights(t[0], N) (output unchanged) and
+// write PREFIX_NNNN.bin: the weight stage's records, 28 float32 each (framegen.h DebugV3Weights: CAp CAc CBp CBc, oA holeA uA oB holeB uB t lenA lenB
+// sigma, w0..w3 s, 0), every stride-th pixel of the raster; prints "V3WEIGHTS <pair> <count> <stride> <W> <H>". N: the most records (default 65536).
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
 
@@ -376,6 +379,8 @@ int main(int argc, char** argv) {
     bool split = false, stats = false;
     int window = 0;
     const char* dumpDir = nullptr;
+    const char* wPrefix = nullptr;   // --v3weights
+    uint32_t wMax = 0;
     std::vector<float> ts{0.5f};
     framegen::Settings setA;
     char* thenArg = nullptr;
@@ -398,6 +403,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stats")) stats = true;
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
+        else if (!strcmp(argv[i], "--v3weights") && i + 1 < argc) wPrefix = argv[++i];
+        else if (!strcmp(argv[i], "--v3wmax") && i + 1 < argc) wMax = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) { if (!parseSettings(argv[++i], setA)) return 2; }
         else if (!strcmp(argv[i], "--then") && i + 1 < argc) thenArg = argv[++i];
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
@@ -699,6 +706,35 @@ int main(int argc, char** argv) {
             if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
             fwrite(dmp3Map, 1, dl3.size, f);
             fclose(f);
+        }
+        if (wPrefix) {   // the weight stage's records of this pair (a recordSynth(t[0]) with the dump on; the outputs below are the ones recorded above)
+            framegen::Interpolator::DebugV3Weights wl;
+            if (!fg.debugV3WeightsLayout(wMax, wl)) { fprintf(stderr, "--v3weights: V3 only\n"); return 1; }
+            VkBuffer wb;
+            VkDeviceMemory wm;
+            uint8_t* wp = nullptr;
+            VkBufferCreateInfo wbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            wbci.size = wl.size;
+            wbci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            CK(vkCreateBuffer(dev, &wbci, nullptr, &wb));
+            VkMemoryRequirements wreq;
+            vkGetBufferMemoryRequirements(dev, wb, &wreq);
+            VkMemoryAllocateInfo wma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, wreq.size, memType(wreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+            CK(vkAllocateMemory(dev, &wma, nullptr, &wm));
+            CK(vkBindBufferMemory(dev, wb, wm, 0));
+            CK(vkMapMemory(dev, wm, 0, wl.size, 0, (void**)&wp));
+            begin();
+            if (!fg.recordDebugV3Weights(cb, prev.fr(), curr.fr(), outs[0].fr(), ts[0], wb, 0, wMax)) { fprintf(stderr, "recordDebugV3Weights failed\n"); return 1; }
+            VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+            submit();
+            char path[4096];
+            snprintf(path, sizeof path, "%s_%04zu.bin", wPrefix, pairIdx);
+            if (FILE* f = fopen(path, "wb")) { fwrite(wp, 1, wl.size, f); fclose(f); }
+            printf("V3WEIGHTS %zu %u %u %u %u\n", pairIdx, wl.count, wl.stride, W, H);
+            vkUnmapMemory(dev, wm);
+            vkDestroyBuffer(dev, wb, nullptr);
+            vkFreeMemory(dev, wm, nullptr);
         }
         if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
         for (size_t k = 0; k < ts.size(); k++) {
