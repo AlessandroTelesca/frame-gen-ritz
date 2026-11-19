@@ -538,6 +538,8 @@ public:
     // kSetRing synth sets; record() takes one of each. A call returns false and records nothing (out
     // untouched, so the caller must not substitute it) if the object is not initialised, t is outside (0, 1),
     // or its ring already gave out kSetRing sets since the last beginFrame() (asserts in debug builds).
+    // With Settings::v3Guard on (V3) a recordEstimate takes TWO estimate sets (the guard's V2 estimate has its own descriptor set): at most
+    // kSetRing / 2 estimates per beginFrame(), the next returns false like any overflow.
     // The caller must also keep the estimates and the synths of all not-yet-retired submissions
     // <= kSetRing each, in total. With protection on, recordObserve takes 1 (Crosshair) or 2 (WholeScreen)
     // sets of a third ring of kUiSets, and so does every recordSynth (plus an implicit observe in a
