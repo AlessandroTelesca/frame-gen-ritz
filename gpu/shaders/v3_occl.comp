@@ -116,7 +116,8 @@ void main() {
         const V3Map m = v3MapUnpack(w1);
         const float o = v3Occ(m.e, F, 1.0);
         ax[2 * N + dir * N + pix] = floatBitsToUint(v3OccEff(o, m.g));   // o_eff for v3_fill's walks: V3B_AUX words [2N, 4N) (free: v2_static's layout leaves them)
-        const bool uns = v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0) >= 0.5;
+        const float uv = v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0);
+        const bool uns = uv >= 0.5, unsF = uv >= 0.9;   // unsF: the failed-estimate share counts the clearly unsure ones
         if (uns) atomicAdd(cntU, 1u);
         // the failed-estimate share counts only the pixels that could have found a partner: not those whose own vector or the camera model's leaves the frame
         // (content that enters or leaves the view is unmatched in the best of estimates; a 500 px pan is not a failed estimate)
@@ -126,7 +127,7 @@ void main() {
             const vec2 hi = vec2(float(pc.fw) - 0.5, float(pc.fh) - 0.5);
             if (all(greaterThanEqual(tc, vec2(-0.5))) && all(lessThanEqual(tc, hi)) && all(greaterThanEqual(tv, vec2(-0.5))) && all(lessThanEqual(tv, hi))) {
                 atomicAdd(cntE, 1u);
-                if (uns) atomicAdd(cntUE, 1u);
+                if (unsF) atomicAdd(cntUE, 1u);
             }
         }
         atomicAdd(sumC, cost8 * 2u);   // x16 fixed point of the cost: 16 * cost8 / 8
