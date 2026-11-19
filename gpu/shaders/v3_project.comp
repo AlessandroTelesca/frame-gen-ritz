@@ -44,10 +44,10 @@ void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
     if (f > 0.0) {   // the estimate failed (soft, per pair): toward the camera model
         vec2 gc = camModel(m);
         if (dir == 1) gc = -camModel(m - gc);   // F10: the content at curr position m came from m - d(m)
-        gv = mix(gv, gc, f);
-        un = max(un, f);
-        o *= 1.0 - f;
-        hole *= 1.0 - f;
+        const float fp = f * un;   // (tuning D1) the fallback acts where the pixel is itself unsure, not on the whole frame
+        gv = mix(gv, gc, fp);
+        o *= 1.0 - fp;
+        hole *= 1.0 - fp;
     }
     ohu = vec3(o, hole, un);
 }
