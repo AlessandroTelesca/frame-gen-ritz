@@ -69,7 +69,7 @@ void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so
     if (nearT) {
         const vec2 za2 = sOverAt(pa, sCell(pa)), zc2 = sOverAt(pc_, sCell(pc_));
         // (tuning D2) how much of a static overlay either tap hits (not at the zero vector, where both taps are the overlay's own place): the hypothesis is vetoed by the caller
-        if (!all(lessThan(abs(pc_ - pa), vec2(1.0)))) hit = clamp(max(max(za2.x, za2.y), max(zc2.x, zc2.y)), 0.0, 1.0);
+        if (!all(lessThan(abs(pc_ - pa), vec2(1.0)))) hit = clamp(max(max(za2.x, zc2.x), max(eBil(pa), eBil(pc_))), 0.0, 1.0);   // (tuning 2) S texels and E bilinear (the cell constant E made 16 px blocks of vetoed taps)
         so = sReject(pa, pc_, wa, wc, za2, zc2);
         if (so.z > 0.0) so.z *= tapsStatic(pa, pc_, a.rgb, c.rgb);
         if (so.y > 0.0) {   // (not where both taps are on CrosshairV2's UI: its patch and its own tap rule decide there)

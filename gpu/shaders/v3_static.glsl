@@ -31,6 +31,14 @@ vec3 sAt(vec2 x, uint bits) {   // bits: sCellBits of x's cell
     float sn = n.y == m.y ? (n.x == m.x ? s00 : s10) : (n.x == m.x ? s01 : s11);
     return vec3(sn, E, max(max(s00, s10), max(s01, s11)));
 }
+// (tuning 2) E bilinear on the cell grid, not gated by the cell's own near bit: a veto that does not stop at a 16 px cell edge
+float eBil(vec2 x) {
+    vec2 s = (x + 0.5) * (1.0 / float(V3_BLOCK * pc.fscale)) - 0.5;
+    vec2 fi = floor(s);
+    vec2 f = s - fi;
+    ivec2 i = ivec2(fi);
+    return mix(mix(eF(i), eF(i + ivec2(1, 0)), f.x), mix(eF(i + ivec2(0, 1)), eF(i + ivec2(1, 1)), f.x), f.y);
+}
 // the overlay at a tap: the largest of the 4 S texels around x, and E of its cell (c = sCell(x))
 vec2 sOverAt(vec2 x, ivec2 c) {
     if (!sNear(c)) return vec2(0.0);

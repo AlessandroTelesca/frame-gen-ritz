@@ -31,7 +31,7 @@ vec2 ffBil(int dir, vec2 q) {
 
 // (tuning D3) a garbage region's vector is taken for the camera model's where it is far from it: a ramp over the vector difference (flow px)
 const float V3_GARB0 = 20.0, V3_GARB1 = 50.0;
-const float SM = 4.0;
+const float SM = 8.0;
 
 // one hypothesis: dir 0 = A (prev's side, time weight tt = t), dir 1 = B (curr's side, tt = 1 - t); returns g, and the hole / occlusion / unsure values
 void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
