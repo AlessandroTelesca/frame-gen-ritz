@@ -1,0 +1,146 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E2 (gpu/V3.md section 3.6): the second, much wider search on the blocks where the first is unsure. Runs after level L_wide = n - 2's
+// iteration 1 (push: lvl = L_wide), one workgroup of 256 threads per block and direction (dispatch gw x gh x 2); workgroups of unflagged blocks leave at once.
+// Flag (slot 1, the level's result): cost > 14 levels, or the forward-backward error |F(p) + F_other(p + F(p))| > 3 level px at the block centre (bilinear over
+// the other direction's iteration-0 records: slot 1 is being rewritten by the other direction's workgroups), or the top level's ambiguity of the parent block > 0.5.
+// Stage A: the coarse grid v in {-24, -22, ..., 24}^2 (625 candidates, no prior, ties settle at the shorter vector), one thread per candidate; stage B: the 8
+// neighbours of the best, then the 8 neighbours of that at stride 1. The block's vector is replaced only if C_new < C_old - 2.0 (WIDE_MARGIN); a replaced block
+// gets amb = 0.5. Counters (state G): words G_WIDE_FLAGGED / G_WIDE_REPLACED count flagged and replaced blocks (tests).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+
+layout(local_size_x = 256) in;
+
+const float BAD = 1000.0;
+const float WIDE_MARGIN = 2.0, WIDE_COST = 7.0, WIDE_RATIO = 0.7;
+
+shared vec4 sf[64];
+shared int sval[64];
+shared float wc[256];
+shared int wi[256];
+shared float gc[16];
+shared int gi[16];
+shared ivec2 bestV;
+shared float bestC;
+shared float rc[8];
+
+int tid, dir, f0, f1, fOff, nWin;
+ivec2 wo;
+V3Lv L;
+vec2 dMu;
+
+bool inside(ivec2 t) { return all(greaterThanEqual(t, ivec2(0))) && all(lessThan(t, ivec2(L.w, L.h))); }
+vec2 recXY(int i) { return vec2(fl[i], fl[i + 1]); }
+
+// the cost of the window at vector v (1000 when fewer than half of the window's targets are inside); one thread, 64 taps
+float cost(ivec2 v) {
+    float s = 0.0, n = 0.0;
+    for (int k = 0; k < 64; k++) {
+        const ivec2 t = wo + ivec2(k & 7, k >> 3) + v;
+        const float ok = (sval[k] != 0 && inside(t)) ? 1.0 : 0.0;
+        s += ok * v3Term(sf[k], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
+        n += ok;
+    }
+    return (n * 2.0 >= float(nWin) && n > 0.0) ? s / n : BAD;
+}
+
+// the 8 neighbours of c at stride 1: threads 0..7 evaluate one each; bestV / bestC become the better of c (cost cc) and them
+void refine(ivec2 c, float cc) {
+    if (tid < 8) {
+        const int k = tid < 4 ? tid : tid + 1;
+        rc[tid] = cost(c + ivec2(k % 3 - 1, k / 3 - 1));
+    }
+    barrier();
+    if (tid == 0) {
+        ivec2 bv = c;
+        float bc = cc;
+        for (int i = 0; i < 8; i++) {
+            const int k = i < 4 ? i : i + 1;
+            if (rc[i] < bc) { bc = rc[i]; bv = c + ivec2(k % 3 - 1, k / 3 - 1); }
+        }
+        bestV = bv; bestC = bc;
+    }
+    barrier();
+}
+
+void main() {
+    tid = int(gl_LocalInvocationIndex);
+    dir = int(gl_WorkGroupID.z);
+    f0 = dir; f1 = 1 - dir;
+    const ivec2 blk = ivec2(gl_WorkGroupID.xy);
+    const int l = pc.lvl;
+    L = v3Lv(l);
+    int P, Bw, nLev;
+    v3Totals(P, Bw, nLev);
+    fOff = 2 * P;
+    const int ro = v3BlkIdx(L, dir, 1, blk);
+    const vec2 v0 = recXY(ro);
+    const float c0 = fl[ro + 2];
+
+    // flags (every thread the same)
+    bool flag = c0 > WIDE_COST;
+    if (!flag) {
+        const vec2 u = (vec2(4 * blk + 2) + v0 - 2.0) * 0.25;
+        const ivec2 i0 = ivec2(floor(u));
+        const vec2 a = u - vec2(i0);
+        const vec2 o = mix(mix(recXY(v3BlkIdx(L, 1 - dir, 0, i0)), recXY(v3BlkIdx(L, 1 - dir, 0, i0 + ivec2(1, 0))), a.x),
+                           mix(recXY(v3BlkIdx(L, 1 - dir, 0, i0 + ivec2(0, 1))), recXY(v3BlkIdx(L, 1 - dir, 0, i0 + ivec2(1, 1))), a.x), a.y);
+        flag = length(v0 + o) > 3.0;
+    }
+    if (!flag && l + 2 == nLev) {   // the top level's ambiguity of the parent block
+        const V3Lv Lp = v3Lv(l + 1);
+        flag = fl[v3BlkIdx(Lp, dir, 0, clamp(blk >> 1, ivec2(0), ivec2(Lp.gw - 1, Lp.gh - 1))) + 3] > 0.5;
+    }
+    if (!flag) return;
+    if (tid == 0) atomicAdd(ax[gOff() + G_WIDE_FLAGGED], 1u);
+
+    dMu = v3DMu(dir);
+    wo = blk * 4 - 2;
+    if (tid < 64) {
+        const ivec2 x = wo + ivec2(tid & 7, tid >> 3);
+        const bool in_ = inside(x);
+        sval[tid] = in_ ? 1 : 0;
+        sf[tid] = in_ ? v3FeatAt(L, fOff, f0, x) : vec4(0.0);
+    }
+    nWin = (min(wo.x + 8, L.w) - max(wo.x, 0)) * (min(wo.y + 8, L.h) - max(wo.y, 0));
+    barrier();
+
+    // stage A: 625 candidates, threads tid, tid + 256, tid + 512
+    float bm = 1e9;
+    int bidx = 0;
+    for (int idx = tid; idx < 625; idx += 256) {
+        const ivec2 v = ivec2(idx % 25 - 12, idx / 25 - 12) * 2;
+        const float c = cost(v);
+        const float cb = c < BAD ? c + 0.002 * float(abs(v.x) + abs(v.y)) : c;   // ties (flat blocks) settle at the shorter vector
+        if (cb < bm) { bm = cb; bidx = idx; }
+    }
+    wc[tid] = bm; wi[tid] = bidx;
+    barrier();
+    if (tid < 16) {
+        float m = wc[tid * 16];
+        int mi = wi[tid * 16];
+        for (int i = 1; i < 16; i++)
+            if (wc[tid * 16 + i] < m) { m = wc[tid * 16 + i]; mi = wi[tid * 16 + i]; }
+        gc[tid] = m; gi[tid] = mi;
+    }
+    barrier();
+    if (tid == 0) {
+        float m = gc[0];
+        int mi = gi[0];
+        for (int i = 1; i < 16; i++)
+            if (gc[i] < m) { m = gc[i]; mi = gi[i]; }
+        const ivec2 v = ivec2(mi % 25 - 12, mi / 25 - 12) * 2;
+        bestV = v;
+        bestC = m < BAD ? m - 0.002 * float(abs(v.x) + abs(v.y)) : m;   // (the pure cost)
+    }
+    barrier();
+    // stage B: two refinements of +-1
+    refine(bestV, bestC);
+    refine(bestV, bestC);
+    if (tid == 0 && bestC < c0 - WIDE_MARGIN && bestC < WIDE_RATIO * c0) {
+        fl[ro] = float(bestV.x); fl[ro + 1] = float(bestV.y); fl[ro + 2] = min(bestC, 255.0); fl[ro + 3] = 0.5;
+        atomicAdd(ax[gOff() + G_WIDE_REPLACED], 1u);
+    }
+}

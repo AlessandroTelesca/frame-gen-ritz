@@ -538,6 +538,120 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
     return out;
 }
 
+// --diag: where the wrong flow pixels (visible, error > 1 px) are, per layer: by distance to the nearest layer boundary of the source frame (flow px) and how many of them
+// carry another layer's true motion; --errmap PREFIX writes a PPM per direction (visible and right: dark grey, wrong: red, estimate = another layer's motion: yellow, not visible: black)
+static bool gDiag = false;
+static std::string gErrMap;
+static int gBlkLevel = -1;
+static void diagFlow(const Scene& sc, const Flows& F, const float* est, const std::vector<float>& truth, const std::vector<uint8_t>& vis, int dir, const std::string& nm) {
+    const int fw = F.fw, fh = F.fh, fs = F.fs, W = sc.W;
+    const std::vector<uint8_t> id = idMap(sc, dir ? 1.0 : 0.0);
+    auto idAt = [&](int mx, int my) { return id[(size_t)std::min(sc.H - 1, my * fs + fs / 2) * W + std::min(W - 1, mx * fs + fs / 2)]; };
+    const int NL = (int)sc.layers.size();
+    const double tau0 = dir ? 1.0 : 0.0, tau1 = dir ? 0.0 : 1.0;
+    std::vector<size_t> vis_n(NL, 0), wrong(NL, 0), wrongOther(NL, 0), byDist[4];
+    std::vector<double> sEx(NL, 0), sEy(NL, 0), sTx(NL, 0), sTy(NL, 0);
+    for (auto& v : byDist) v.assign(NL, 0);
+    std::vector<uint8_t> img;
+    if (!gErrMap.empty()) img.assign((size_t)fw * fh * 3, 0);
+    for (int my = 0; my < fh; my++)
+        for (int mx = 0; mx < fw; mx++) {
+            const size_t i = (size_t)my * fw + mx;
+            if (!vis[i]) continue;
+            const int L = idAt(mx, my);
+            vis_n[L]++;
+            sEx[L] += est[2 * i]; sEy[L] += est[2 * i + 1]; sTx[L] += truth[2 * i]; sTy[L] += truth[2 * i + 1];
+            const double dx = est[2 * i] - truth[2 * i], dy = est[2 * i + 1] - truth[2 * i + 1];
+            const bool bad = fs * std::sqrt(dx * dx + dy * dy) > 1.0;
+            if (!gErrMap.empty()) { uint8_t* o = &img[i * 3]; o[0] = o[1] = o[2] = 60; }
+            if (!bad) continue;
+            wrong[L]++;
+            if (gDiag && getenv("V3TEST_SAMPLES") && L == 0 && wrong[L] % 400 == 0) printf("    wrong bg px (%d,%d): est (%.2f,%.2f) true (%.2f,%.2f)\n", mx, my, est[2 * i], est[2 * i + 1], truth[2 * i], truth[2 * i + 1]);
+            int d = 99;   // Chebyshev distance (flow px) to the nearest pixel of another layer (up to 24)
+            for (int r = 1; r <= 24 && d == 99; r++)
+                for (int j = -r; j <= r && d == 99; j++)
+                    for (int k = -r; k <= r; k++) {
+                        if (std::max(std::abs(j), std::abs(k)) != r) continue;
+                        const int x = mx + k, y = my + j;
+                        if (x < 0 || y < 0 || x >= fw || y >= fh) continue;
+                        if (idAt(x, y) != L) { d = r; break; }
+                    }
+            byDist[d < 4 ? 0 : d < 8 ? 1 : d < 16 ? 2 : 3][L]++;
+            bool other = false;
+            const V2 c{fs * mx + 0.5 * fs, fs * my + 0.5 * fs};
+            for (int M = 0; M < NL && !other; M++) {
+                if (M == L) continue;
+                const V2 q = sc.layers[M].toScreen(tau1, sc.layers[M].toLayer(tau0, c));
+                const double ox = est[2 * i] - (q.x - c.x) / fs, oy = est[2 * i + 1] - (q.y - c.y) / fs;
+                other = fs * std::sqrt(ox * ox + oy * oy) <= 1.0;
+            }
+            wrongOther[L] += other;
+            if (!gErrMap.empty()) { uint8_t* o = &img[i * 3]; o[0] = 255; o[1] = other ? 255 : 0; o[2] = 0; }
+        }
+    for (int L = 0; L < NL; L++)
+        printf("  diag %-18s %s layer %d: visible %zu, wrong %zu (%.1f%%); wrong by distance to the layer boundary: <4 %zu, 4..8 %zu, 8..16 %zu, >=16 %zu; carrying another layer's motion %zu; mean est (%.2f, %.2f) true (%.2f, %.2f) flow px\n", nm.c_str(),
+               dir ? "F10" : "F01", L, vis_n[L], wrong[L], vis_n[L] ? 100.0 * wrong[L] / vis_n[L] : 0.0, byDist[0][L], byDist[1][L], byDist[2][L], byDist[3][L], wrongOther[L],
+               vis_n[L] ? sEx[L] / vis_n[L] : 0.0, vis_n[L] ? sEy[L] / vis_n[L] : 0.0, vis_n[L] ? sTx[L] / vis_n[L] : 0.0, vis_n[L] ? sTy[L] / vis_n[L] : 0.0);
+    if (!gErrMap.empty()) {
+        std::string fn = gErrMap + "-" + nm + (dir ? "-F10" : "-F01") + ".ppm";
+        for (char& c : fn) if (c == '(' || c == ')' || c == ',' || c == '%' || c == '+') c = '_';
+        if (FILE* f = fopen(fn.c_str(), "wb")) { fprintf(f, "P6\n%d %d\n255\n", fw, fh); fwrite(img.data(), 1, img.size(), f); fclose(f); }
+    }
+}
+
+// The check of the stats (state G) against the analytic motion of the scene. Expected affine camera = the background layer's motion in flow px (d at the frame
+// centre and its slopes over the half frame); the dominant motions = the motion of every layer at its own centre. Tolerances: the block vectors the stats read
+// come from level LH, an integer lattice of 2^LH flow px, so a translation is right to 0.75 2^LH (+ 2%), a slope to 1.5 flow px + 6% + 1% of the translation, and a layer's dominant
+// motion to 1.5 2^LH (a zooming layer's vector varies over it).
+static bool statsCheck(const Scene& sc, const Flows& F, const uint32_t* G, uint32_t nLevels, char* msg, size_t msgLen) {
+    float gf[64];
+    memcpy(gf, G, sizeof gf);
+    const double lat = nLevels >= 3 ? (double)(1 << std::max(1u, nLevels - 3)) : 1.0;
+    const int fs = F.fs;
+    const double hx = 0.5 * F.fw, hy = 0.5 * F.fh;   // half frame in flow px
+    auto motionAt = [&](int layer, V2 c) {           // the motion of layer `layer`'s content at screen position c (px), in flow px
+        const Layer& l = sc.layers[layer];
+        const V2 p = l.toScreen(1.0, l.toLayer(0.0, c));
+        return V2{(p.x - c.x) / fs, (p.y - c.y) / fs};
+    };
+    auto motion = [&](int layer, double X, double Y) { return motionAt(layer, V2{fs * (hx + X * hx), fs * (hy + Y * hy)}); };
+    bool ok = true;
+    size_t n = 0;
+    msg[0] = 0;
+    auto add = [&](const char* fmt, double a, double b, double c, double d) { if (n < msgLen - 120) n += snprintf(msg + n, msgLen - n, fmt, a, b, c, d); };
+    if (!(G[6] & 256u)) { ok = false; add("aff INVALID", 0, 0, 0, 0); }
+    else {
+        const V2 t0 = motion(0, 0, 0), tx0 = motion(0, -1, 0), tx1 = motion(0, 1, 0), ty0 = motion(0, 0, -1), ty1 = motion(0, 0, 1);
+        const double ex[6] = {t0.x, 0.5 * (tx1.x - tx0.x), 0.5 * (ty1.x - ty0.x), t0.y, 0.5 * (tx1.y - tx0.y), 0.5 * (ty1.y - ty0.y)};
+        double worst = 0;
+        for (int k = 0; k < 6; k++) {
+            const double tol = (k == 0 || k == 3) ? 0.75 * lat + 0.02 * std::fabs(ex[k]) : 1.5 + 0.06 * std::fabs(ex[k]) + 0.01 * std::hypot(t0.x, t0.y);
+            const double e = std::fabs(gf[16 + k] - ex[k]) / tol;
+            worst = std::max(worst, e);
+            if (e > 1.0) ok = false;
+        }
+        add("aff worst error %.2f of its tolerance (true %.2f %+.2f X, %+.2f Y)  ", worst, ex[0], ex[1], ex[2]);
+    }
+    if (sc.layers.size() > 1) {   // every layer's motion is among the valid dominant motions (the foreground at its mask centre, the background at the frame centre)
+        for (size_t L = 0; L < sc.layers.size(); L++) {
+            const V2 c = L ? V2{sc.layers[L].mcx, sc.layers[L].mcy} : V2{0.5 * sc.W, 0.5 * sc.H};
+            const V2 e = motionAt((int)L, c);
+            double best = 1e9;
+            for (int k = 0; k < 4; k++) if (G[6] & (1u << k)) best = std::min(best, std::hypot(gf[8 + 2 * k] - e.x, gf[9 + 2 * k] - e.y));
+            if (best > 1.5 * lat) ok = false;
+            add(L ? "fg dominant error %.1f (true %.1f,%.1f; tol %.1f)  " : "bg dominant error %.1f (true %.1f,%.1f; tol %.1f)  ", best, e.x, e.y, 1.5 * lat);
+        }
+    } else {   // a single layer: a pure translation has the layer's motion as dominant motion (a zoom / rotation has no single one: not tested)
+        const V2 t0 = motion(0, 0, 0), tx0 = motion(0, -1, 0), tx1 = motion(0, 1, 0);
+        if (std::hypot(tx1.x - tx0.x, tx1.y - tx0.y) < 2.0) {
+            const double e = (G[6] & 1u) ? std::hypot(gf[8] - t0.x, gf[9] - t0.y) : 1e9, tol = 0.75 * lat + 0.02 * std::hypot(t0.x, t0.y);
+            if (e > tol) ok = false;
+            add("dom[0] error %.1f flow px (tol %.1f)%.0s%.0s", e, tol, 0, 0);
+        }
+    }
+    return ok;
+}
+
 // ================================================================= main
 static std::vector<double> parseTs(const char* s) {
     std::vector<double> v;
@@ -563,8 +677,11 @@ int main(int argc, char** argv) {
         else if (a == "--t" && i + 1 < argc) ts = parseTs(argv[++i]);
         else if (a == "--report-only") gReportOnly = true;
         else if (a == "--selfcheck") selfcheck = true;
+        else if (a == "--diag") gDiag = true;
+        else if (a == "--blk" && i + 1 < argc) gBlkLevel = atoi(argv[++i]);
+        else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
         else if (a == "--list") list = true;
-        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--list]\n"); return 2; }
+        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
     if ((fs != 1 && fs != 2 && fs != 4) || W < 16 || H < 16) { fprintf(stderr, "--fs 1|2|4, --size at least 16x16\n"); return 2; }
     for (double t : ts) if (!(t > 0.0 && t < 1.0)) { fprintf(stderr, "--t: times in (0, 1)\n"); return 2; }
@@ -678,6 +795,51 @@ int main(int argc, char** argv) {
         const std::string nm = sc.name;
         const double flowThr = sc.fade ? 90.0 : 95.0;
         if (estOk) {
+            {   // the stats of the estimate (state G): dominant motions, the camera model, the wide search's counters
+                const uint32_t* G = (const uint32_t*)(est.dump.data() + est.L.g);
+                float gf[64];
+                memcpy(gf, G, sizeof gf);
+                printf("%-20s stats  dom", nm.c_str());
+                for (int k = 0; k < 4; k++) if (G[6] & (1u << k)) printf(" (%.1f,%.1f)", gf[8 + 2 * k], gf[9 + 2 * k]); else printf(" -");
+                if (G[6] & 256u) printf("  aff dx = %.2f %+.2f X %+.2f Y, dy = %.2f %+.2f X %+.2f Y (X, Y in half frames)", gf[16], gf[17], gf[18], gf[19], gf[20], gf[21]);
+                else printf("  aff invalid");
+                printf("  wide flagged %u replaced %u\n", G[25], G[26]);
+                if (est.L.nLevels >= 3) {
+                    char msg[600];
+                    const bool ok = statsCheck(sc, F, G, est.L.nLevels, msg, sizeof msg);
+                    printf("%-20s stats check: %s   %s\n", nm.c_str(), msg, ok ? "PASS" : "FAIL");
+                    verdict(ok, true);
+                }
+            }
+            if (gBlkLevel >= 0 && (uint32_t)gBlkLevel < est.L.nLevels) {   // --blk L: the block records of level L, F01 slot 0 and slot 1 (vx,vy / cost / amb%)
+                const int l = gBlkLevel, gw = est.L.lgw[l], gh = est.L.lgh[l];
+                for (int slot = 0; slot < 2; slot++) {
+                    printf("%s level %d F01 slot %d (vx,vy/cost/amb%%)\n", nm.c_str(), l, slot);
+                    const float* r = (const float*)(est.dump.data() + est.L.blkLevel[l] + (size_t)(slot) * gw * gh * 16);
+                    for (int y = 0; y < gh; y++) {
+                        for (int x = 0; x < gw; x++) { const float* q = r + 4 * (y * gw + x); printf(" %g,%g/%.1f/%d", q[0], q[1], q[2], (int)std::lround(100 * q[3])); }
+                        printf("\n");
+                    }
+                }
+            }
+            if (gDiag) {   // the level-0 block vectors (before the dense pass) against the exact flow at the block centres, visible ones
+                const int gw = est.L.lgw[0], gh = est.L.lgh[0];
+                for (int d = 0; d < 2; d++) {
+                    const float* r = (const float*)(est.dump.data() + est.L.blkLevel[0] + (size_t)(d * 2) * gw * gh * 16);
+                    size_t n = 0, c05 = 0, c1 = 0;
+                    for (int by = 0; by < gh; by++)
+                        for (int bx = 0; bx < gw; bx++) {
+                            const int mx = std::min(F.fw - 1, bx * 8 + 4), my = std::min(F.fh - 1, by * 8 + 4);
+                            const size_t i = (size_t)my * F.fw + mx;
+                            if (!(d ? F.vis10 : F.vis01)[i]) continue;
+                            const float* q = r + 4 * (by * gw + bx);
+                            const std::vector<float>& tr = d ? F.f10 : F.f01;
+                            const double e = F.fs * std::hypot(q[0] - tr[2 * i], q[1] - tr[2 * i + 1]);
+                            n++; c05 += e <= 0.5; c1 += e <= 1.0;
+                        }
+                    printf("%-20s level-0 blocks %s: visible %zu, within 0.5 px %.1f%%, 1 px %.1f%%\n", nm.c_str(), d ? "F10" : "F01", n, n ? 100.0 * c05 / n : 0.0, n ? 100.0 * c1 / n : 0.0);
+                }
+            }
             const float* f01 = (const float*)(est.dump.data() + est.L.ff0);
             const float* f10 = (const float*)(est.dump.data() + est.L.ff1);
             const FlowStat s01 = flowStat(F, f01, F.f01, F.vis01), s10 = flowStat(F, f10, F.f10, F.vis10);
@@ -687,6 +849,7 @@ int main(int argc, char** argv) {
                 printf("%-20s flow %s    visible %5.1f%%  within 0.5 px %5.1f%%  1 px %5.1f%%  2 px %5.1f%%   %s (>= %.0f%% within 1 px)\n", nm.c_str(), d ? "F10" : "F01",
                        ss[d]->vis, ss[d]->w05, ss[d]->w1, ss[d]->w2, pass ? "PASS" : "FAIL", flowThr);
                 verdict(pass, true);
+                if (gDiag && (sc.layers.size() > 1 || !pass || !gErrMap.empty())) diagFlow(sc, F, d ? f10 : f01, d ? F.f10 : F.f01, d ? F.vis10 : F.vis01, d, nm);
             }
         } else { printf("%-20s flow: the V3 estimate failed to record\n", nm.c_str()); verdict(false, true); }
         // ---- in-between, V3's own flows and the exact ones

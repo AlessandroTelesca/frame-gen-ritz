@@ -41,4 +41,4 @@ int cOff() { return eOff() + s8W() * s8H(); }
 int gOff() { return cOff() + s8W() * s8H(); }
 // the state G (word index from gOff(), 4096 words, zeroed by every estimate)
 const int G_SUM = 0, G_UNSURE_COUNT = 2, G_COST_SUM = 3, G_MODE = 4, G_UNSURE_COPY = 5, G_VALID = 6, G_DOM = 8, G_AFF = 16, G_CAM_TRANS = 22,
-          G_FAIL_MIX = 24, G_HIST = 32;
+          G_FAIL_MIX = 24, G_WIDE_FLAGGED = 25, G_WIDE_REPLACED = 26, G_SUMSQ = 27, G_HIST = 32;

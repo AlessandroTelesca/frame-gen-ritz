@@ -60,15 +60,25 @@ vec4 v3FeatBil(const V3Lv L, int fOff, int f, vec2 q) {
 // the cost weights of section 2: Yh / Cbh / Crh high-pass, and the raw Y with the pair's mean-luma difference removed
 const vec4 V3_CW = vec4(0.45, 0.20, 0.20, 0.15);
 const float V3_LAMBDA = 0.3;   // levels per level px, the prior of every candidate but the first
-// |a - b| per channel, weighted; b is the other frame's feature, dMu = mean(role 1) - mean(role 0) (section 2: the raw term is Y0 - (Y1 - dMu))
-float v3Term(vec4 a, vec4 b, float dMu) { return dot(abs(vec4(a.xyz - b.xyz, a.w - b.w + dMu)), V3_CW); }
+// |a - b| per channel, weighted; b is the other frame's feature, dm = (K, gm): the pair's lighting change as seen from this direction. The role-1 frame is
+// scaled to role 0's contrast and mean: raw term Y0 - (gm (Y1 - mu1) + mu0) = Y0 - gm Y1 + K, K = gm mu1 - mu0, and the high-pass channels Yh0 - gm Yh1 (gm = 1:
+// section 2's dMu form, K = mu1 - mu0). Step E2: the gain gm (a fade) was added because the sub-pixel refinement of a faded pair's F10 was biased by the
+// amplitude mismatch (level-0 block vectors 48% within 0.25 flow px against 98% for F01).
+float v3Term(vec4 a, vec4 b, vec2 dm) { return dot(abs(vec4(a.xyz - dm.y * b.xyz, a.w - dm.y * b.w + dm.x)), V3_CW); }
 
-// dMu of this block's direction: dir 0 (F01: roles prev, curr) mean(curr) - mean(prev); dir 1 the negative
-float v3DMu(int dir) {
-    const int g = gOff() + G_SUM;
-    const float s0 = float(ax[g]), s1 = float(ax[g + 1]);   // sums of luma, per frame (v3_hist.comp)
-    const float d = (s1 - s0) / float(pc.fw * pc.fh);
-    return dir == 0 ? d : -d;
+// dm of this block's direction (dir 0 = F01: role 0 prev, role 1 curr): K as above and the gain gm = sigma0 / sigma1 of the luma (from G.sum, G.sumSq of v3_hist),
+// clamped to [0.5, 2] and 1 inside a dead band of +-0.03 (shifts and layers move a little content in and out of the frame: their sigma ratio is not a lighting change)
+vec2 v3DMu(int dir) {
+    const int g = gOff();
+    const float n = float(pc.fw * pc.fh);
+    const float m0 = float(ax[g + G_SUM]) / n, m1 = float(ax[g + G_SUM + 1]) / n;
+    const float v0 = max(float(ax[g + G_SUMSQ]) * 64.0 / n - m0 * m0, 1e-3), v1 = max(float(ax[g + G_SUMSQ + 1]) * 64.0 / n - m1 * m1, 1e-3);
+    float r = sqrt(v0 / v1);   // sigma_prev / sigma_curr: the gain of role 1 = curr (dir 0)
+    if (dir == 1) r = 1.0 / r;
+    r = clamp(r, 0.5, 2.0);
+    const float gm = abs(r - 1.0) < 0.03 ? 1.0 : r - sign(r - 1.0) * 0.03;
+    const float mu0 = dir == 0 ? m0 : m1, mu1 = dir == 0 ? m1 : m0;
+    return vec2(gm * mu1 - mu0, gm);
 }
 
 // V3B_FLOW addressing (float words)

@@ -12,12 +12,12 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 shared uint sh[2 * 64];
-shared uint ssum[2];
+shared uint ssum[2], ssq[2];
 
 void main() {
     const int lid = int(gl_LocalInvocationIndex);
     if (lid < 128) sh[lid] = 0u;
-    if (lid < 2) ssum[lid] = 0u;
+    if (lid < 2) { ssum[lid] = 0u; ssq[lid] = 0u; }
     barrier();
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x < pc.fw && p.y < pc.fh) {
@@ -26,6 +26,7 @@ void main() {
             const float y = luma[f * N + p.y * pc.fw + p.x];
             atomicAdd(sh[f * 64 + min(63, int(y * 0.25))], 1u);
             atomicAdd(ssum[f], uint(y * 16.0 + 0.5));
+            atomicAdd(ssq[f], uint(y * y * 0.25 + 0.5));
         }
     }
     barrier();
@@ -37,5 +38,8 @@ void main() {
         const uint c = sh[lid];
         if (c != 0u) atomicAdd(ax[G + G_HIST + ((lid >> 6) * 9 + t) * 64 + (lid & 63)], c);
     }
-    if (lid < 2) atomicAdd(ax[G + G_SUM + lid], (ssum[lid] + 8u) >> 4);
+    if (lid < 2) {
+        atomicAdd(ax[G + G_SUM + lid], (ssum[lid] + 8u) >> 4);
+        atomicAdd(ax[G + G_SUMSQ + lid], (ssq[lid] + 8u) >> 4);   // sum of Y^2 in units of 64 (workgroup sum in units of 1/4, rounded to units of 64 per 16)
+    }
 }

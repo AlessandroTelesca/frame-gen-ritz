@@ -23,7 +23,7 @@ const int M_FF = 2, M_INJECT = 4;
 // mean cost of vector v at pixel p over the 5x5 window (invalid, 255, when fewer than half of the window's pixels have their target inside).
 // The bilinear weights are the same for every window pixel (one sub-pixel offset), so the 6x6 integer texels under the window's targets are read
 // once, row by row, and interpolated in registers (36 reads instead of 100).
-float winCost(const V3Lv L, int fOff, int dir, float dMu, ivec2 p, vec2 v) {
+float winCost(const V3Lv L, int fOff, int dir, vec2 dMu, ivec2 p, vec2 v) {
     const vec2 vf = floor(v), fr = v - vf;
     const ivec2 vi = ivec2(vf);
     const ivec2 mx = ivec2(L.w - 1, L.h - 1);
@@ -63,7 +63,7 @@ void main() {
     const V3Lv L = v3Lv(0);
     const int N = pc.fw * pc.fh;
     const int fOff = 2 * P;
-    const float dMu = v3DMu(dir);
+    const vec2 dMu = v3DMu(dir);
     const bool inFrame = p.x >= 0 && p.y >= 0 && p.x < L.w && p.y < L.h;
     const int pix = p.y * L.w + p.x;
     const int fd = Bw + dir * 2 * N + 2 * pix, ff = Bw + 4 * N + dir * 2 * N + 2 * pix;

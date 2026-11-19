@@ -12,6 +12,7 @@ const int WG = 64;
 layout(local_size_x = WG) in;
 
 const float BAD = 1000.0;
+const float V3_DOMCAP = 0.5;   // the prior of a dominant-motion candidate is capped (levels): it can still win against a far parent where the match is much better
 
 shared vec4 sf[64];        // the window's features of the role-0 frame
 shared int sval[64];       // 1: the window pixel lies inside the level
@@ -33,7 +34,7 @@ int dir, f0, f1;
 ivec2 blk, wo;
 V3Lv L;
 int fOff, nWin;
-float dMu;
+vec2 dMu;   // (K, gm) of v3_est.glsl
 
 bool inside(ivec2 t) { return all(greaterThanEqual(t, ivec2(0))) && all(lessThan(t, ivec2(L.w, L.h))); }
 vec2 recXY(int i) { return vec2(fl[i], fl[i + 1]); }
@@ -62,7 +63,7 @@ void evalRound() {
         if ((cflag[tid] & 1) != 0 && N * 2.0 >= float(nWin) && N > 0.0) cost = S / N;
         const ivec2 d = abs(cv[tid] - refV);
         cpur[tid] = cost;
-        cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : V3_LAMBDA * float(d.x + d.y));
+        cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9));
     }
     barrier();
 }
@@ -137,10 +138,10 @@ vec2 lk(ivec2 v0, inout float cost) {
                 const vec4 g = v3FeatBil(L, fOff, f1, tq);
                 const vec4 gx = v3FeatBil(L, fOff, f1, tq + vec2(0.5, 0.0)) - v3FeatBil(L, fOff, f1, tq - vec2(0.5, 0.0));
                 const vec4 gy = v3FeatBil(L, fOff, f1, tq + vec2(0.0, 0.5)) - v3FeatBil(L, fOff, f1, tq - vec2(0.0, 0.5));
-                vec4 r = sf[tid] - g;
-                r.w += dMu;
-                const vec4 wx = V3_CW * gx, wy = V3_CW * gy;
-                a[0] = dot(wx, gx); a[1] = dot(wx, gy); a[2] = dot(wy, gy);
+                vec4 r = sf[tid] - dMu.y * g;
+                r.w += dMu.x;
+                const vec4 wx = V3_CW * dMu.y * gx, wy = V3_CW * dMu.y * gy;
+                a[0] = dot(wx, dMu.y * gx); a[1] = dot(wx, dMu.y * gy); a[2] = dot(wy, dMu.y * gy);
                 a[3] = dot(wx, r); a[4] = dot(wy, r);
             }
         }
@@ -159,6 +160,30 @@ vec2 lk(ivec2 v0, inout float cost) {
 
 // the vector of a parent-level block (level l + 1, slot pfin) as an integer vector at this level (x2, rounded)
 ivec2 parentVec(const V3Lv Lp, int pfin, ivec2 pb) { return ivec2(roundEven(2.0 * recXY(v3BlkIdx(Lp, dir, pfin, pb)))); }
+
+// the stats of v3_stats.comp (G.dom, G.aff; zero and invalid until it has run, so levels at and above LH see no candidates): dominant motion k and the
+// camera model, as an integer vector of this level (x 2^-l, F10 negated), valid bit in the second result
+bool domValid(int k) { return (ax[gOff() + G_VALID] & (1u << k)) != 0u; }
+ivec2 domVec(int k, int l) {
+    const int g = gOff() + G_DOM + 2 * k;
+    const vec2 d = vec2(uintBitsToFloat(ax[g]), uintBitsToFloat(ax[g + 1]));
+    return ivec2(roundEven((dir == 0 ? d : -d) * (1.0 / float(1 << l))));
+}
+bool camValid() { return (ax[gOff() + G_VALID] & 256u) != 0u; }
+vec2 camAff(vec2 x) {   // the affine model at level-0 flow px x
+    const int g = gOff() + G_AFF;
+    const vec2 XY = (x - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
+    const vec3 a = vec3(uintBitsToFloat(ax[g]), uintBitsToFloat(ax[g + 1]), uintBitsToFloat(ax[g + 2]));
+    const vec3 b = vec3(uintBitsToFloat(ax[g + 3]), uintBitsToFloat(ax[g + 4]), uintBitsToFloat(ax[g + 5]));
+    return vec2(dot(a, vec3(1.0, XY)), dot(b, vec3(1.0, XY)));
+}
+// the camera model at the centre c (level-0 flow px) of this block: F01 d(c); F10 -d(c - d(c)) (the content at curr position c came from c + F10 = c - d)
+ivec2 camVec(vec2 c, int l) {
+    vec2 d = camAff(c);
+    if (dir == 1) d = -camAff(c - d);
+    return ivec2(roundEven(d * (1.0 / float(1 << l))));
+}
+vec2 blkCentre0(int l) { return l == 0 ? vec2(blk * 8 + 4) : vec2(blk * 4 + 2) * float(1 << l); }
 
 void main() {
     tid = int(gl_LocalInvocationIndex);
@@ -260,6 +285,8 @@ void main() {
             else if (tid == 2) { v = parentVec(Lp, pfin, pb + ivec2(0, sg.y)); fg = 1; }
             else if (tid == 3) { v = parentVec(Lp, pfin, pb + sg); fg = 1; }
             else if (tid == 4) { fg = 1; }
+            else if (tid == 5) { if (camValid()) { v = camVec(blkCentre0(l), l); fg = 1; } }
+            else if (tid >= 6 && tid <= 9) { if (domValid(tid - 6)) { v = domVec(tid - 6, l); fg = 5; } }
             else if (tid == 10) {   // the reverse vector of the other direction at the parent's target
                 const vec2 target = vec2(2 * blk + 1) + 0.5 * vec2(parentVec(Lp, pfin, pb));   // block centre in level l + 1 px, plus the parent's vector
                 const ivec2 tb = ivec2(floor(target * 0.25));
@@ -292,6 +319,9 @@ void main() {
                                    mix(recXY(v3BlkIdx(L, 1 - dir, 0, i0 + ivec2(0, 1))), recXY(v3BlkIdx(L, 1 - dir, 0, i0 + ivec2(1, 1))), a.x), a.y);
                 v = ivec2(roundEven(-o)); fg = 1;
             } else if (tid == 6) { fg = 1; }
+            else if (tid >= 7 && tid <= 9) { if (domValid(tid - 7)) { v = domVec(tid - 7, l); fg = 5; } }
+            else if (tid == 10) { if (camValid()) { v = camVec(blkCentre0(l), l); fg = 1; } }
+            else if (tid == 11) { if (domValid(3)) { v = domVec(3, l); fg = 5; } }
             cv[tid] = v;
             cflag[tid] = fg;
         }
@@ -301,6 +331,18 @@ void main() {
         barrier();
         ring(bv, bTot, bPure);
         slot = 1;
+        if (l == 1) {   // the ambiguity probes (section 3.6): the final vector shifted by 4 / 8 / 12 level px along x and y; the pure cost of the best of them
+            if (tid < 16) {
+                const int k = tid % 12, ax_ = k / 6, m = k % 6, mag = 4 * (m / 2 + 1), sg = (m & 1) != 0 ? -1 : 1;
+                cv[tid] = bv + (ax_ == 0 ? ivec2(sg * mag, 0) : ivec2(0, sg * mag));
+                cflag[tid] = tid < 12 ? 1 : 0;
+            }
+            barrier();
+            evalRound();
+            float pm = BAD;
+            for (int i = 0; i < 12; i++) pm = min(pm, cpur[i]);
+            amb = pm < BAD ? 1.0 - smoothstep(0.5, 3.0, pm - bPure) : 0.0;
+        }
     } else {   // level 0 below a coarser level
         const V3Lv Lp = v3Lv(1);
         const int pfin = nLev == 2 ? 0 : 1;

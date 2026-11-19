@@ -58,6 +58,8 @@
 #include "v3_search_spv.h"
 #include "v3_search_top_spv.h"
 #include "v3_dense_spv.h"
+#include "v3_wide_spv.h"
+#include "v3_stats_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -1721,6 +1723,8 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V3_SEARCH].sp = SPV(v3_search);
         spv[P_V3_SEARCH_TOP].sp = SPV(v3_search_top);
         spv[P_V3_DENSE].sp = SPV(v3_dense);
+        spv[P_V3_WIDE].sp = SPV(v3_wide);
+        spv[P_V3_STATS].sp = SPV(v3_stats);
         spv[P_V3_SYNTH] = {cs.v3Synth, spec};
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
@@ -2033,6 +2037,7 @@ bool Interpolator::debugV3Layout(DebugV3Layout& l) const {
     l.map0 = l.fd1 + n2; l.map1 = l.map0 + n1; l.s = l.map1 + n1; l.blk = l.s + n1;
     VkDeviceSize o = l.blk;
     for (int i = 0; i < V.n; i++) { l.blkLevel[i] = o; o += (VkDeviceSize)V.gw[i] * V.gh[i] * 4 * 16; }
+    l.g = o; o += 64 * 4;   // G words 0..63
     l.size = o;
     return true;
 }
@@ -2058,6 +2063,8 @@ bool Interpolator::recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize 
     I.CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, dst, 3, fc);
     VkBufferCopy ac[2] = {{0, dstOffset + L.map0, 2 * n1}, {(VkDeviceSize)4 * V.N * 4, dstOffset + L.s, n1}};   // MAP[0..1]; S at word 4N
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, ac);
+    VkBufferCopy gc = {g0, dstOffset + L.g, 64 * 4};   // the state G, words 0..63 (step E2: dominant motions, camera, wide counters)
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 1, &gc);
     return true;
 }
 
@@ -2716,6 +2723,16 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                     r.cbar();
                 }
                 r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
+                if (V.n >= 4 && l == V.n - 2) {   // the wide search on the blocks where level L_wide's result is unsure (section 3.6)
+                    r.runV3(P_V3_WIDE, sv, V.gw[l], V.gh[l], 2);
+                    r.cbar();
+                    r.stamp("wide");
+                }
+                if (V.n >= 3 && l == std::max(1, V.n - 3)) {   // the dominant motions and the camera from level LH (section 3.7)
+                    r.runV3(P_V3_STATS, sv, 1, 1, 1);
+                    r.cbar();
+                    r.stamp("stats");
+                }
             }
         } else {
             const VkDeviceSize n8 = (VkDeviceSize)I.fw * I.fh * 8;

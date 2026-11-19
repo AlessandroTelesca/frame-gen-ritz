@@ -22,7 +22,7 @@ shaders = shader_gen.process(
   'shaders/v2_morph_s.comp', 'shaders/v2_qmorph_s.comp',
   'shaders/ml_dup.comp', 'shaders/ml_reduce.comp', 'shaders/ml_pyr.comp', 'shaders/ml_match.comp', 'shaders/ml_conv.comp', 'shaders/ml_out.comp',
   'shaders/ml_zero.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp', 'shaders/ml_feat.comp',
-  'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
+  'shaders/v3_synth.comp', 'shaders/v3_planes.comp', 'shaders/v3_pyr.comp', 'shaders/v3_hist.comp', 'shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp', 'shaders/v3_wide.comp', 'shaders/v3_stats.comp')
 
 # MotionVersion::Learned's weights: gpu/ml/<run>/ (manifest.json + weights.bin, ml-fg's export unchanged) -> ml_weights.h, checked
 # against the manifest (sha256, shapes, offsets) and re-laid out for shaders/ml_conv.comp. Order = LearnedNet (E2v3, E1v3, E2v4, E1v4,
