@@ -31,8 +31,7 @@ shared float sw[64];       // hook (j): the window pixel's colour weight (0 outs
 shared float pWgt[64];
 #endif
 shared float red[5 * 64];
-shared float blkEv;        // task 105: the window's detail ramp (hudB > 0 only)
-shared float zeroPure;     // task 105: the zero vector's pure cost at the top level
+shared uint blkDetU;       // task 105: the window's summed detail x 256 (hudB > 0 only; integer atomics, no extra barrier)
 #if V3S_TOP
 shared float topc[289];
 shared float topp[64];
@@ -91,20 +90,14 @@ void evalRound() {
 #endif
         const ivec2 d = abs(cv[tid] - refV);
         cpur[tid] = cost;
-        cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9));
+        float bon = 0.0;
+        if (pc.hudB > 0.0 && cost < BAD && cv[tid] == ivec2(0)) {   // task 105: the zero vector's bonus; the gate is the reference (parent / own previous) vector's length
+            const float ev = v3HudEv(float(blkDetU) * (1.0 / 256.0) / float(max(nWin, 1)));
+            bon = pc.hudB * ev * v3HudAbs(cost) * v3HudGate(length(vec2(refV)) * float((1 << pc.lvl) * pc.fscale));
+        }
+        cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9)) - bon;
     }
     barrier();
-    if (pc.hudB > 0.0) {   // task 105: the zero vector's bonus, gated by the best moving candidate of the round (pure cost), then a barrier for the readers
-        if (tid < 16 && cv[tid] == ivec2(0) && cpur[tid] < BAD) {
-            float bc = BAD;
-            ivec2 bvv = ivec2(0);
-            for (int i = 0; i < 16; i++)
-                if (cv[i] != ivec2(0) && cpur[i] < bc) { bc = cpur[i]; bvv = cv[i]; }
-            const float vpx = length(vec2(bvv)) * float((1 << pc.lvl) * pc.fscale);
-            cres[tid] -= pc.hudB * blkEv * v3HudAbs(cpur[tid]) * v3HudGate(vpx);
-        }
-        barrier();
-    }
 }
 
 // the best of cres[0..n-1] (lowest index on a tie); callers barrier before overwriting
@@ -270,6 +263,7 @@ void main() {
             sf[tid] = in_ ? v3FeatAt(L, fOff, f0, x) : vec4(0.0);
         }
         nWin = (min(wo.x + 8, L.w) - max(wo.x, 0)) * (min(wo.y + 8, L.h) - max(wo.y, 0));
+        if (tid == 0) blkDetU = 0u;
 #if V3J
         // hook (j): the weights, once per block, from the role-0 frame's raw planes; the centre colour = the mean of the 4 pixels at the middle of the window
         // (the block's centre: window pixels 3..4 in x and y), clamped into the level
@@ -282,16 +276,10 @@ void main() {
 #endif
     }
     barrier();
-    if (pc.hudB > 0.0) {   // task 105: the window's detail, once per block
-        float a[5] = float[5](0.0, 0.0, 0.0, 0.0, 0.0);
-        if (tid < 64 && sval[tid] != 0) { a[0] = v3Detail(sf[tid]); a[1] = 1.0; }
-        reduce5(a);
-        if (tid == 0) blkEv = v3HudEv(a[0] / max(a[1], 1.0));
-        barrier();
-    }
+    if (pc.hudB > 0.0 && tid < 64 && sval[tid] != 0) atomicAdd(blkDetU, uint(v3Detail(sf[tid]) * 256.0 + 0.5));   // task 105: read after evalRound's first barrier
 
     ivec2 bv = ivec2(0);
-    float bTot = 0.0, bPure = 0.0, amb = 0.0;
+    float bTot = 0.0, bPure = 0.0, amb = 0.0, zc0 = 0.0;
     int slot = 0;
 #if V3S_TOP
     {
@@ -326,20 +314,8 @@ void main() {
 #else
             topc[idx] = (n * 2.0 >= float(nWin) && n > 0.0) ? s / n + 0.002 * float(abs(v.x) + abs(v.y)) : BAD;
 #endif
-            if (idx == 144) zeroPure = topc[idx];   // task 105: v = (0, 0): the pure cost (the bonus is applied after the loop)
         }
         barrier();
-        if (pc.hudB > 0.0) {   // task 105: the zero vector's bonus, gated by the best moving candidate
-            if (tid == 0 && topc[144] < BAD) {
-                float bc = BAD;
-                ivec2 bvv = ivec2(0);
-                for (int i = 0; i < 289; i++)
-                    if (i != 144 && topc[i] < bc) { bc = topc[i]; bvv = ivec2(i % 17 - 8, i / 17 - 8); }
-                const float vpx = length(vec2(bvv)) * float((1 << pc.lvl) * pc.fscale);
-                topc[144] -= pc.hudB * blkEv * v3HudAbs(zeroPure) * v3HudGate(vpx);
-            }
-            barrier();
-        }
         if (tid < 64) {   // each of 64 threads takes the best of its 5 candidates (idx = tid + 64 k)
             float bm = 1e9;
             int bi = 0;
@@ -372,7 +348,6 @@ void main() {
         for (int i = 1; i < 64; i++) gs = min(gs, topp[i]);
         bv = v0;
         bPure = gm >= BAD ? BAD : gm - 0.002 * float(abs(v0.x) + abs(v0.y));
-        if (pc.hudB > 0.0 && v0 == ivec2(0) && gm < BAD) { gm = zeroPure; bPure = zeroPure; }   // task 105: the winner's pure cost, not the biased one
         amb = 1.0 - smoothstep(0.5, 3.0, gs - gm);
         barrier();
     }
@@ -473,6 +448,8 @@ void main() {
         barrier();
         evalRound();
         best(16, bv, bTot, bPure);
+        if (tid == 0 && pc.hudB > 0.0)   // task 105: the block's evidence of a still part (detail x the zero vector's pure cost, candidate slot 5, on ramps 3x as wide as the bonus's), for the dense pass's pre-test
+            zc0 = v3HudEv(float(blkDetU) * (1.0 / 256.0) / float(max(nWin, 1))) * (1.0 - smoothstep(3.0 * pc.hp[0], 3.0 * pc.hp[1], cpur[5]));
         barrier();
         ring(bv, bTot, bPure);
         amb = fl[v3BlkIdx(Lp, dir, pfin, pb) + 3];
@@ -483,5 +460,6 @@ void main() {
     if (tid == 0) {
         const int o = v3BlkIdx(L, dir, slot, blk);
         fl[o] = vOut.x; fl[o + 1] = vOut.y; fl[o + 2] = min(bPure, 255.0); fl[o + 3] = amb;
+        if (l == 0 && pc.hudB > 0.0 && V3S_TOP == 0) fl[v3BlkIdx(L, dir, 1, blk) + 2] = zc0;   // (level 0 has no slot 1 otherwise)
     }
 }

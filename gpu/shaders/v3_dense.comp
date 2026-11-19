@@ -99,7 +99,13 @@ void main() {
         for (int j = i + 1; j < 4; j++) spread = max(spread, length(rec[i].xy - rec[j].xy));
     }
     // task 105: the zero vector as a candidate (hudBonus > 0; not where every block vector is nearly zero: it adds nothing there)
-    const bool needZ = pc.hudB > 0.0 && vmax >= 0.25;
+    bool needZ = pc.hudB > 0.0 && vmax * float(pc.fscale) >= pc.hp[3];
+    if (needZ && Bw > 0 && nLev > 1) {   // the pre-test: some block of the 4 has evidence of a still part (level 0's slot 1, .z)
+        float zmax = 0.0;
+        for (int k = 0; k < 4; k++) zmax = max(zmax, fl[v3BlkIdx(L, dir, 1, t0 + ivec2(k & 1, k >> 1)) + 2]);
+        needZ = zmax > V3H_BLKE;
+    }
+    //    // (the gate's lower edge: slower motion takes no bonus, and costs nothing)
     const ivec2 zto = ivec2(gl_WorkGroupID.xy) * 8 - 6;   // the apron's corner
     if (needZ) {
         for (int idx = lid; idx < 144; idx += 64) {

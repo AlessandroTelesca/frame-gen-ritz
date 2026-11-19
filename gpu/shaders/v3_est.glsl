@@ -115,5 +115,6 @@ float v3Detail(vec4 a) { return dot(abs(a.xyz), V3_CW.xyz); }
 float v3HudEv(float det) { return smoothstep(pc.hp[2], pc.hp[2] + 1.1, det); } // the window has detail
 // the motion the bonus would undo is worth undoing: the (best) moving vector, in frame pixels (vpx), is not a slow drift (slow real motion must not freeze)
 float v3HudGate(float vpx) { return smoothstep(pc.hp[3], pc.hp[4], vpx); }
+const float V3H_BLKE = 0.02;   // the dense pass looks for a still part only where a block of the tile has block evidence (level 0 slot 1 .z) above this
 const float V3H_D0 = -0.5;   // the margin (levels) at which the zero vector starts to take over in the dense pass; it takes over fully 1.5 above
 float v3HudAbs(float c0) { return 1.0 - smoothstep(pc.hp[0], pc.hp[1], c0); }  // the zero vector's window cost is small

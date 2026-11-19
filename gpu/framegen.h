@@ -55,7 +55,7 @@ enum class MotionVersion : uint32_t {
               // real frame; a scene cut shows the nearer real frame). Every Format (v3_planes and v3_synth have a variant per format: a host build
               // that lacks them gets V3 refused for that format with a reason, Interpolator::settingsError / initError). flowScale 1, 2, 4.
               // No device requirement beyond Vulkan 1.2 core compute. Settings::v3* apply; searchRadius, searchRadiusTop, pyramidMinSide,
-              // subpixel, trustLow / trustHigh, sceneCutSad, hudBonus, smoothBonus, searchPenalty, learned* and v2Mode are ignored.
+              // subpixel, trustLow / trustHigh, sceneCutSad, smoothBonus, searchPenalty, learned* and v2Mode are ignored. hudBonus applies (below).
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
@@ -169,7 +169,9 @@ struct Settings {
     float sceneCutSad = 30.0f;
     // Static-HUD protection: per-pixel cost bonus for the zero vector, so overlays, crosshairs and text
     // stay put instead of being dragged along with the background. [0, 255]; 0 = off, useful 0-4.
-    // Higher = HUD steadier, but slow motion near-still areas may freeze (judder).
+    // Higher = HUD steadier, but slow motion near-still areas may freeze (judder). V1 and V3 (V2 ignores it, Learned has its own zero test);
+    // under V3 the bonus acts only where the pixel's neighbourhood has detail that matches at the same place in both frames and the best
+    // moving vector is a real motion (about 4-10 px per pair and up), so slow pans keep moving; 0 = the V3 of before task 105, byte for byte.
     float hudBonus = 1.0f;
     // Per-pixel cost bonus for the smooth (bilinear) block field over the sharper per-block candidates.
     // [0, 255]; useful 0-2. Higher = smoother, fewer speckles, softer motion edges; lower = sharper edges.
