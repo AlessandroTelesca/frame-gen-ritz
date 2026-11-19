@@ -493,9 +493,13 @@ struct V3PC {
     float smear, occlSoft, unsure;
     float cx, cy;
     int32_t fdOff;   // Y1: word offset of FD in V3B_FLOW (16 B); FF = +4 N, TF = +8 N
-    float pad[6];
+    float hudB;      // task 105: Settings::hudBonus in V3 cost units (0 = off: every V3 pass is then exactly the pass without the bonus)
+    float hp[5];     // task 105: the bonus's ramps (v3_est.glsl): c0 lo, hi; detail lo; gate lo, hi (frame px)
 };
 static_assert(sizeof(V3PC) == sizeof(PC), "V3PC is pushed over PC's range");
+// task 105: hudBonus in V3 (gpu/V3.md "As built (HUD bonus, task 105)"): K converts V1's levels (5x5 mean abs luma error) to V3's cost units; P = the ramps
+const float kV3HudK = 0.7f;
+const float kV3HudP[5] = {1.0f, 3.0f, 1.5f, 4.0f, 10.0f};
 enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8 };   // synth mode bits (shaders/v3_common.glsl)
 // MotionVersion::Learned's duplicate test: FGR's own, proto/harness.py DUP_DIFF (and gpu/compare.py): a pair whose mean over the
 // pixels of the channel-mean |a - c| is at most this many 8-bit levels is a duplicate ("re-encoded duplicate frames differ by up to
@@ -2359,6 +2363,12 @@ struct Rec {
         v.smear = I.set.v3Smear; v.occlSoft = I.set.v3OcclSoft; v.unsure = I.set.v3Unsure;
         v.cx = 0.5f * (float)I.fw; v.cy = 0.5f * (float)I.fh;
         v.fdOff = (int)(16 * v3Layout(I.W, I.H, I.set.flowScale).B);   // FD in V3B_FLOW (words)
+        v.hudB = I.set.hudBonus * kV3HudK;
+        for (int i = 0; i < 5; i++) v.hp[i] = kV3HudP[i];
+        {   // the c0 ramp widens with the strength above Normal: a stronger setting accepts a looser match of the zero vector as stillness
+            const float f = std::max(1.0f, std::pow(I.set.hudBonus, 0.75f));
+            v.hp[0] *= f; v.hp[1] *= f;
+        }
         return v;
     }
     V2PC v2pc() const {

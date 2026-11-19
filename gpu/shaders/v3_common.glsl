@@ -15,7 +15,8 @@ layout(push_constant) uniform V3PC {
     float smear, occlSoft, unsure;           // Settings::v3Smear, v3OcclSoft, v3Unsure
     float cx, cy;                            // model centre x, y (fw/2, fh/2) (stats), spare otherwise
     int fdOff;                               // Y1: the word offset of FD in V3B_FLOW (= 16 B: after the block records); FF = fdOff + 4 N, TF = fdOff + 8 N
-    float pad[6];
+    float hudB;                              // task 105: Settings::hudBonus in V3 cost units (0 = off); v3_est.glsl
+    float hp[5];                             // task 105: the ramps of the bonus (v3_est.glsl)
 } pc;
 // mode bits, per pass (a pass never reads another's meaning): search: bit 0 = hook (j) colour window; dense: bit 0 = (j), bit 2 = inject
 // (tests); synth: bit 0 = Gaussian blur weights, bit 1 = hook (l) detail split, bit 3 = debug dump (then lw = the stride of the dumped pixels in the

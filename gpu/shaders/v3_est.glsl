@@ -106,3 +106,14 @@ float v3ColourWgt(vec3 a, vec3 c) {
     return V3J_FLOOR + (1.0 - V3J_FLOOR) * exp(-(d.x + d.y + d.z) * (1.0 / V3J_SCALE));
 }
 #endif
+
+// Task 105 (gpu/V3.md "As built (HUD bonus, task 105)"): Settings::hudBonus for V3. pc.hudB = hudBonus x K (V3's cost is in other units than V1's) is a reduction of the
+// zero vector's cost where there is evidence that the content did not move: the zero vector matches (c0 small: the two frames show the same there, gain-compensated) and
+// the window has detail (a flat window matches at every vector: it proves nothing, so a flat sky never freezes). Both are soft ramps. hudB = 0 skips every use.
+// detail of a feature texel: the cost's own channel weights over the high-pass channels
+float v3Detail(vec4 a) { return dot(abs(a.xyz), V3_CW.xyz); }
+float v3HudEv(float det) { return smoothstep(pc.hp[2], pc.hp[2] + 1.1, det); } // the window has detail
+// the motion the bonus would undo is worth undoing: the (best) moving vector, in frame pixels (vpx), is not a slow drift (slow real motion must not freeze)
+float v3HudGate(float vpx) { return smoothstep(pc.hp[3], pc.hp[4], vpx); }
+const float V3H_D0 = -0.5;   // the margin (levels) at which the zero vector starts to take over in the dense pass; it takes over fully 1.5 above
+float v3HudAbs(float c0) { return 1.0 - smoothstep(pc.hp[0], pc.hp[1], c0); }  // the zero vector's window cost is small

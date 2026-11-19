@@ -56,6 +56,8 @@ float winCost(const V3Lv L, int fOff, int dir, vec2 dMu, ivec2 p, vec2 v) {
     return n >= 12.5 ? min(s / n, BAD) : BAD;
 }
 
+shared float zmap[144];       // task 105: the zero vector's term of every pixel of the tile with its apron (-1 = outside)
+shared float dmap[144];       // task 105: the detail of the role-0 frame at every pixel of the tile with its apron
 shared float tmap[4 * 144];   // per candidate: the matching term of every pixel of the tile with a 2 px apron (12x12), -1 = no term (outside)
 #if V3J
 shared vec3 tcol[144];        // the role-0 raw colour of every pixel of the tile with its apron (the weights' source)
@@ -91,17 +93,50 @@ void main() {
         const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
         rec[k] = vec4(fl[o], fl[o + 1], fl[o + 2], 0.0);
     }
-    float spread = 0.0;
-    for (int i = 0; i < 4; i++)
+    float spread = 0.0, vmax = 0.0;
+    for (int i = 0; i < 4; i++) {
+        vmax = max(vmax, length(rec[i].xy));
         for (int j = i + 1; j < 4; j++) spread = max(spread, length(rec[i].xy - rec[j].xy));
+    }
+    // task 105: the zero vector as a candidate (hudBonus > 0; not where every block vector is nearly zero: it adds nothing there)
+    const bool needZ = pc.hudB > 0.0 && vmax >= 0.25;
+    const ivec2 zto = ivec2(gl_WorkGroupID.xy) * 8 - 6;   // the apron's corner
+    if (needZ) {
+        for (int idx = lid; idx < 144; idx += 64) {
+            const ivec2 x = zto + ivec2(idx % 12, idx / 12);
+            float t = -1.0, dt = 0.0;
+            if (x.x >= 0 && x.y >= 0 && x.x < L.w && x.y < L.h) {
+                const vec4 a0 = v3FeatAt(L, fOff, dir, x);
+                t = v3Term(a0, v3FeatAt(L, fOff, 1 - dir, x), dMu);
+                dt = v3Detail(a0);
+            }
+            zmap[idx] = t;
+            dmap[idx] = dt;
+        }
+    }
     const vec2 u = (vec2(p) - 3.5) * 0.125;
     const vec2 a = u - vec2(floor(u));
     const float bwt[4] = float[4]((1.0 - a.x) * (1.0 - a.y), a.x * (1.0 - a.y), (1.0 - a.x) * a.y, a.x * a.y);
     vec2 v = vec2(0.0);
     float cost = 0.0;
     if (spread < 0.5) {
+        if (needZ) barrier();
         if (!inFrame) return;
         for (int k = 0; k < 4; k++) { v += bwt[k] * rec[k].xy; cost += bwt[k] * rec[k].z; }
+        if (needZ) {   // task 105: against the blocks' cost (the vectors agree: no per-pixel costs of them)
+            float zs = 0.0, nz = 0.0, c0 = BAD, det = 0.0;
+            for (int j = 0; j < 5; j++)
+                for (int i = 0; i < 5; i++) {
+                    const float t = zmap[(lp.y + j) * 12 + lp.x + i];
+                    if (t >= 0.0) { zs += t; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+                }
+            if (nz >= 12.5) {
+                c0 = min(zs / nz, BAD);
+                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_D0, V3H_D0 + 1.5, cost - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
+                v *= 1.0 - z;
+                cost = mix(cost, c0, z);
+            }
+        }
     } else {
         // the cost of each distinct vector at each pixel of the tile and its apron, once (a 5x5 box sum of them per pixel afterwards), instead of
         // 25 bilinear windows per pixel; a vector within 0.25 px of an earlier one shares its map
@@ -172,6 +207,24 @@ void main() {
         }
         v /= ws;
         cost = cmin;
+        if (needZ) {   // task 105: the zero vector against the best of the 4 (same window, same weights)
+            float zs = 0.0, nz = 0.0, det = 0.0, wz = 0.0;
+            for (int j = 0; j < 5; j++)
+                for (int i = 0; i < 5; i++) {
+                    const float t = zmap[(lp.y + j) * 12 + lp.x + i];
+#if V3J
+                    if (t >= 0.0) { zs += cw[j * 5 + i] * t; wz += cw[j * 5 + i]; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+#else
+                    if (t >= 0.0) { zs += t; wz += 1.0; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+#endif
+                }
+            if (nz >= 12.5 && wz > 0.0) {
+                const float c0 = min(zs / wz, BAD);
+                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_D0, V3H_D0 + 1.5, cmin - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
+                v *= 1.0 - z;
+                cost = mix(cost, c0, z);
+            }
+        }
     }
     fl[fd] = v.x; fl[fd + 1] = v.y;
     if ((pc.mode & M_FF) != 0) { fl[ff] = v.x; fl[ff + 1] = v.y; }

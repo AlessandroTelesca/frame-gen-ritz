@@ -299,6 +299,17 @@ static std::vector<Scene> makeScenes(const std::string& which, int W, int H) {
             add(sc);
         }
     }
+    if (which == "slow") {   // task 105: slow whole-frame motions (not in "all"): the zero-vector bonus must not freeze them
+        const double S[4][2] = {{1, 0}, {2, 1}, {3, -2}, {6, 3}};
+        for (auto& s : S) {
+            Scene sc; sc.name = name("shift", s[0], s[1]);
+            Layer l = plane(1, cx, cy); l.shx = s[0] * k; l.shy = s[1] * k;
+            sc.layers = {l};
+            add(sc);
+        }
+        { Scene sc; sc.name = "zoom(+0.5%)"; Layer l = plane(1, cx, cy); l.scaleRate = 0.005; sc.layers = {l}; add(sc); }
+        { Scene sc; sc.name = "rotate(0.3deg)"; Layer l = plane(1, cx, cy); l.rotDeg = 0.3; sc.layers = {l}; add(sc); }
+    }
     if (want("zoom")) {
         Scene sc; sc.name = "zoom(+6%)";
         Layer l = plane(1, cx, cy); l.scaleRate = 0.06;
@@ -514,10 +525,10 @@ static bool runV3(Img& a, Img& b, Img& o, const std::vector<double>& ts, const H
     return true;
 }
 
-struct FlowStat { double vis = 0, w05 = 0, w1 = 0, w2 = 0; size_t n = 0; };
+struct FlowStat { double vis = 0, w05 = 0, w1 = 0, w2 = 0, zero = 0; size_t n = 0; };   // zero: % of visible px whose estimate is zero (< 0.25 px) though the true motion is not (>= 0.25 px)
 static FlowStat flowStat(const Flows& F, const float* est, const std::vector<float>& truth, const std::vector<uint8_t>& vis) {
     FlowStat s;
-    size_t c05 = 0, c1 = 0, c2 = 0, n = 0;
+    size_t c05 = 0, c1 = 0, c2 = 0, n = 0, cz = 0;
     const size_t N = (size_t)F.fw * F.fh;
     for (size_t i = 0; i < N; i++) {
         if (!vis[i]) continue;
@@ -525,9 +536,10 @@ static FlowStat flowStat(const Flows& F, const float* est, const std::vector<flo
         const double dx = (double)est[2 * i] - truth[2 * i], dy = (double)est[2 * i + 1] - truth[2 * i + 1];
         const double e = F.fs * std::sqrt(dx * dx + dy * dy);
         c05 += e <= 0.5; c1 += e <= 1.0; c2 += e <= 2.0;
+        cz += F.fs * std::hypot((double)est[2 * i], (double)est[2 * i + 1]) < 0.25 && F.fs * std::hypot((double)truth[2 * i], (double)truth[2 * i + 1]) >= 0.25;
     }
     s.n = n; s.vis = 100.0 * n / N;
-    if (n) { s.w05 = 100.0 * c05 / n; s.w1 = 100.0 * c1 / n; s.w2 = 100.0 * c2 / n; }
+    if (n) { s.w05 = 100.0 * c05 / n; s.w1 = 100.0 * c1 / n; s.w2 = 100.0 * c2 / n; s.zero = 100.0 * cz / n; }
     return s;
 }
 
@@ -640,6 +652,7 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 static bool gDiag = false;
 static bool gColourWindow = false;   // --colour-window
 static bool gDetailSplit = false;    // --detail-split
+static float gHud = -1.0f;            // --hud X: Settings::hudBonus (default: the library default)
 static std::string gErrMap;
 static bool gProfile = false;   // --profile: the occlusion ramp along the middle row (layers scenes)
 static std::string gSave;   // --save PREFIX: the scene's two real frames as raw RGBA (PREFIX-NAME-p.rgba, -c.rgba) for the other tools (fgtest, v3flow.py)
@@ -803,6 +816,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile") gProfile = true;
         else if (a == "--colour-window") gColourWindow = true;
         else if (a == "--detail-split") gDetailSplit = true;
+        else if (a == "--hud" && i + 1 < argc) gHud = (float)atof(argv[++i]);
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
@@ -863,6 +877,7 @@ int main(int argc, char** argv) {
     info.settings.flowScale = (uint32_t)fs;
     info.settings.v3ColourWindow = gColourWindow;
     info.settings.v3DetailSplit = gDetailSplit;
+    if (gHud >= 0.0f) info.settings.hudBonus = gHud;
     if (!gFg.init(info)) { fprintf(stderr, "init failed: %s\n", gFg.initError() ? gFg.initError() : "?"); return 1; }
 
     printf("v3test %dx%d flowScale %d on %s%s\n", W, H, fs, props.deviceName, selfcheck ? " (selfcheck)" : "");
@@ -1071,8 +1086,8 @@ int main(int argc, char** argv) {
             const FlowStat* ss[2] = {&s01, &s10};
             for (int d = 0; d < 2; d++) {
                 const bool pass = ss[d]->n && ss[d]->w1 >= flowThr;
-                printf("%-20s flow %s    visible %5.1f%%  within 0.5 px %5.1f%%  1 px %5.1f%%  2 px %5.1f%%   %s (>= %.0f%% within 1 px)\n", nm.c_str(), d ? "F10" : "F01",
-                       ss[d]->vis, ss[d]->w05, ss[d]->w1, ss[d]->w2, pass ? "PASS" : "FAIL", flowThr);
+                printf("%-20s flow %s    visible %5.1f%%  within 0.5 px %5.1f%%  1 px %5.1f%%  2 px %5.1f%%  zero-though-moving %5.2f%%   %s (>= %.0f%% within 1 px)\n", nm.c_str(), d ? "F10" : "F01",
+                       ss[d]->vis, ss[d]->w05, ss[d]->w1, ss[d]->w2, ss[d]->zero, pass ? "PASS" : "FAIL", flowThr);
                 verdict(pass, true);
                 if (gDiag && (sc.layers.size() > 1 || !pass || !gErrMap.empty())) diagFlow(sc, F, d ? f10 : f01, d ? F.f10 : F.f01, d ? F.vis10 : F.vis01, d, nm);
             }
