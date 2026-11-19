@@ -72,7 +72,8 @@ Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 
 | `v3Smear` | 0.35 | Strength of the smear where V3 is unsure (0-1; 0 = none). |
 | `v3OcclSoft`, `v3Unsure` | 1.0, 1.0 | Width of the occlusion ramp and trust in poor matches (0.25-4 each). |
 | `v3SceneCut` | 0.45 | Histogram divergence above which a pair is a scene cut (0-4; 0 = never). |
-| `v3ColourWindow`, `v3DetailSplit` | false, false | Reserved, no effect yet. |
+| `v3ColourWindow` | false | Experimental, off by default: weights the matching windows of the estimate by colour similarity to the block's centre. Applies from the next estimate; with it off the output is byte-identical to V3 without it. About +0.05 ms (1080p, `flowScale` 2). Measured: it sharpens a moving object of clear colour against a busy background (cs2a +0.3 dB) but breaks areas next to large flat dark regions (bf900 -1.1 dB) and makes the synthetic two-layer scenes slightly worse. An experiment for the eye. |
+| `v3DetailSplit` | false | Experimental, off by default: in the synthesis the blend keeps the coarse picture and the fine detail comes from the single frame with the largest weight (the later one at a tie); it fades out where the smear acts. Applies from the next synth; with it off the output is byte-identical to V3 without it. About +0.06 ms per generated frame. Measured: closes about 9 % of the sharpness gap to the real middle frame, -0.03 dB PSNR, flicker +0.1 to +0.6 %; a subtle effect. |
 
 V3 ignores `trustLow`, `trustHigh`, `sceneCutSad`, `hudBonus`, `smoothBonus`, `searchPenalty`, `searchRadius`, `searchRadiusTop`, `pyramidMinSide` and `subpixel`; it honours `flowScale`, `globalFallback` (as the "estimate failed" threshold), `v2StaticMask`, the `ui*` settings and `blurSamples`. All V3 settings are runtime.
 
@@ -80,16 +81,16 @@ Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N
 
 | flowScale, mult | V3 fast / calm | (V2 Quality) |
 |---|---|---|
-| 2, 2x | 0.89 / 0.84 | 0.261 |
-| 2, 3x | 1.07 / 1.04 | 0.364 |
-| 2, 4x | 1.26 / 1.23 | 0.432 |
-| 4, 2x | 0.44 / 0.45 | 0.159 |
-| 4, 3x | 0.61 / 0.64 | 0.272 |
-| 4, 4x | 0.78 / 0.85 | 0.344 |
+| 2, 2x | 0.99 / 0.91 | 0.264 |
+| 2, 3x | 1.21 / 1.15 | 0.370 |
+| 2, 4x | 1.43 / 1.37 | 0.446 |
+| 4, 2x | 0.46 / 0.47 | 0.157 |
+| 4, 3x | 0.66 / 0.67 | 0.265 |
+| 4, 4x | 0.85 / 0.86 | 0.341 |
 
-The limit for the design was 1.1 ms at `flowScale` 2, 2x; every format is under it at 2x (Rgb10 0.89, RgbaF16 encoded 0.94, linear 0.99, Nv12 0.92, P010 0.93 ms on the fast pair), 3x and 4x are above it. 1440p `flowScale` 2, 2x: 1.55 / 1.45 ms; `flowScale` 1, 2x: 2.84 / 2.62 ms. Each generated frame beyond the first costs about 0.18 ms. Memory: 56 MiB at 1080p `flowScale` 2 (100 MiB at 1440p), plus 7.9 MiB per interior sample of a motion-blurred output at 1080p. The per-pass table, per-format and per-size tables, reach, memory, the shader build list and the known limits are in INTEGRATION.md "Motion version 3".
+The limit for the design was 1.1 ms at `flowScale` 2, 2x; every format is under it at 2x (Rgb10 0.97, RgbaF16 encoded 1.02, linear 1.06, Nv12 1.00, P010 1.00 ms on the fast pair; Rgba8 0.97), 3x and 4x are above it. The cost grew by about 0.07 to 0.09 ms in the three tuning rounds since the first measurement (Rgba8 2x 0.89 / 0.84 then). 1440p `flowScale` 2, 2x: 1.69 / 1.57 ms; `flowScale` 1, 2x: 3.04 / 2.80 ms. Each generated frame beyond the first costs about 0.21 ms. With a switch on (Rgba8, 2x, fast pair): `v3ColourWindow` +-0.93 ms, `v3DetailSplit` +-0.92 ms, both +-0.88 ms (RgbaF16 linear: +-1.00 / +-0.99 / +-0.93; the detail switch costs the same again for every further generated frame). Memory: 56 MiB at 1080p `flowScale` 2 (100 MiB at 1440p), plus 7.9 MiB per interior sample of a motion-blurred output at 1080p; the switches add none. The per-pass table, per-format and per-size tables, the cost with each switch, reach, memory, the shader build list and the known limits are in INTEGRATION.md "Motion version 3".
 
-Known limits, plainly: the static-structure mask is luma-based (a HUD element with about the luma of its background is not protected); the smear is active on a large share of the pixels on hard footage, so a fast pan at a 30 fps base looks soft; content entering at the frame edge and areas uncovered behind a moving object are reconstructed approximately (mean error about 5-6 levels in the synthetic two-layer scene, against 0.7 with exact motion); a scene cut is found from histograms, so a cut between two scenes with the same level statistics is not seen; the fallback threshold was calibrated on a small set of clips; at `flowScale` 1 and 4 zoom and rotation fall slightly under the 95 % mark in the known-motion tests (about 94 %). `v3test` (known-motion tests with exact data), `fgtest --dump` with `gpu/v3flow.py` and `fgtest --v3weights` are its tools.
+Known limits, plainly: the static-structure mask is luma-based (a HUD element is only protected when it is static and differs in brightness from its background); the smear is active on a large share of the pixels on hard footage, so a fast pan at a 30 fps base looks soft; where the estimate is unsure the output can still show 8-16 px tile blocks or speckle instead of a clean smear (frame edges where content enters, object outlines against flat areas, small HUD elements whose content moves, e.g. a radar); content entering at the frame edge and areas uncovered behind a moving object are reconstructed approximately (mean error about 6-7 levels in the synthetic two-layer scene, against 0.6-0.9 with exact motion); a specular highlight present in one frame only can spread into a blotch; a scene cut is found from histograms, so a cut between two scenes with the same level statistics is not seen; the fallback threshold was calibrated on a small set of clips; at `flowScale` 1 and 4 zoom and rotation fall slightly under the 95 % mark in the known-motion tests (about 94 %), and at the default `flowScale` 2 the two-layer zoom scene sits exactly at its 95.0 % mark. `v3test` (known-motion tests with exact data), `fgtest --dump` with `gpu/v3flow.py` and `fgtest --v3weights` are its tools.
 
 ## Learned motion estimate (testing)
 
@@ -123,7 +124,7 @@ It costs more than V1: 1080p 2x, back-to-back per pair, e2v5 1.35-1.66 ms (half 
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `gpu/ml/`, `gpu/shaders/ml_*`, `gpu/mltest.cpp` | `MotionVersion::Learned`: the nets' weights (ml-fg export: e2v3, e1v3, e2v4, e1v4, e2v5, e1v5, and the colour / features variants g2v2, g2v3, m2v2, m2v3) and `embed_weights.py`, its passes (incl. `ml_zero`, `ml_guard`), its test against ml-fg's test vectors (`ml/synthcheck.py`: end to end; `ml/guardcheck.py`: the static guard vs ml-fg's `static_guard.py`) |
-| `gpu/V3.md`, `gpu/shaders/v3_*`, `gpu/v3test.cpp`, `gpu/v3flow.py` | `MotionVersion::V3`: the design page (with the as-built notes and the measured cost), its 14 passes (`v3_planes` and `v3_synth` have a variant per format), the known-motion test (`v3test`) and the flow statistics script |
+| `gpu/V3.md`, `gpu/shaders/v3_*`, `gpu/v3test.cpp`, `gpu/v3flow.py` | `MotionVersion::V3`: the design page (with the as-built notes and the measured cost), its 14 passes (`v3_planes` and `v3_synth` have a variant per format; the two hook switches add three more compiles of the search / dense passes and one of the synthesis, per format too), the known-motion test (`v3test`) and the flow statistics script |
 | `ML-FG-TESTING.md` | QC record of the learned motion estimator (both backends): status, parity, cost, integration notes |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
 
@@ -380,7 +381,7 @@ for (int k = 1; k < N; ++k)
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
 | `motionVersion` | V1 | `V1`, `V2` (see "Motion version 2"), `V3` (see "Motion version 3") or `Learned` (see "Learned motion estimate"; flowScale 2 only); all run every format. Runtime; a switch drops the current estimate. |
 | `v3Smear`, `v3OcclSoft`, `v3Unsure`, `v3SceneCut` | 0.35, 1.0, 1.0, 0.45 | V3 only: smear strength (0-1), occlusion softness (0.25-4), trust in poor matches (0.25-4), scene-cut histogram divergence (0-4, 0 = never). Runtime. |
-| `v3ColourWindow`, `v3DetailSplit` | false, false | V3 only: reserved, no effect yet. |
+| `v3ColourWindow`, `v3DetailSplit` | false, false | V3 only: two experimental switches (colour-weighted matching windows in the estimate, applies from the next estimate; fine detail from one frame in the synthesis, applies from the next synth). Runtime; each off = byte-identical to V3 without it. See "Motion version 3". |
 | `learnedNet`, `learnedHalf` | E2v5, false | Learned only: the net (`E2v5`, `E1v5` = the small net, `E2v4`, `E1v4`, `E2v3`, `E1v3`, and the variants `G2v2` / `M2v2` = colour, `G2v3` / `M2v3` = learned features) and fp16 activation storage. Runtime; the next estimate uses them. |
 | `learnedZeroTest`, `learnedStaticGuard` | true, false | Learned only: ml-fg's zero-motion test on the net's field (next estimate) and the opt-in static guard on the generated frames (next synth). Runtime. |
 | `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
