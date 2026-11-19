@@ -62,6 +62,14 @@ v3j_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DV3J=1', '--vn', '@BASENAME@_j_spv', '-o', '@OUTPUT@', '@INPUT@'])
 v3j_shaders = v3j_gen.process('shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
+# MotionVersion::V3 hook (l) (Settings::v3DetailSplit): the synthesis with the detail split, -DV3L=1, into v3_synth_l_spv (Rgba8 / Bgra8; the other formats'
+# variants are built below as v3_synth_l_<fmt>_spv). The plain v3_synth builds keep their SPIR-V (the switch off costs nothing).
+v3l_gen = generator(glslang,
+  output : '@BASENAME@_l_spv.h',
+  depfile : '@BASENAME@_l_spv.h.d',
+  arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+               '-DV3L=1', '--vn', '@BASENAME@_l_spv', '-o', '@OUTPUT@', '@INPUT@'])
+v3l_shaders = v3l_gen.process('shaders/v3_synth.comp')
 # The wide median histogram and the wide V2 Quality claims (reach settings off their defaults and a long vector): -DFG_WIDE=1,
 # into <name>_wide_spv as well (other basenames). The plain builds keep their SPIR-V.
 wide2_gen = generator(glslang,
@@ -79,6 +87,7 @@ ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_pl
 # MotionVersion::V3: its raw planes (the colour of both frames -> its level-0 planes) and its synthesis read colour (YUV: both planes); its other
 # passes work on those planes and the luma. The static-structure mask (v2_static.comp) is V2's plain build: it reads the luma only.
 v3_colour_srcs = ['shaders/v3_planes.comp', 'shaders/v3_synth.comp']
+v3l_colour_srcs = ['shaders/v3_synth.comp']   # ... and the same synthesis with hook (l) (-DV3L=1), per format
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,
@@ -86,14 +95,19 @@ foreach f : get_option('formats')
     depfile : '@BASENAME@_' + f + '_spv.h.d',
     arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                  '-DFG_FORMAT_' + f.to_upper() + '=1', '--vn', '@BASENAME@_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
-  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs), g.process(ml_colour_srcs), g.process(v3_colour_srcs)]
+  gl = generator(glslang,
+    output : '@BASENAME@_l_' + f + '_spv.h',
+    depfile : '@BASENAME@_l_' + f + '_spv.h.d',
+    arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+                 '-DFG_FORMAT_' + f.to_upper() + '=1', '-DV3L=1', '--vn', '@BASENAME@_l_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
+  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs), g.process(ml_colour_srcs), g.process(v3_colour_srcs), gl.process(v3l_colour_srcs)]
   if f == 'nv12' or f == 'p010'
     variant_shaders += [g.process(chroma_srcs)]
   endif
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, v3l_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

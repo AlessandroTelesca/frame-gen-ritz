@@ -325,9 +325,12 @@ struct Settings {
     // ramp of the unsure measure (higher = trusts worse matches). Runtime, act in the synthesis, no re-estimate needed.
     // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never), read by the estimate.
     // v3ColourWindow: hook (j), the matching windows of the block search and the dense pass weighted by colour similarity to the block's
-    // centre (from the next estimate; costs about +0.06 ms at 1080p flowScale 2; gpu/V3.md 3.5 "As built (j)"); with it off the output is
-    // byte-identical to V3 without the hook. v3DetailSplit: hook (l), fine detail from one frame and the coarse picture blended. RESERVED:
-    // accepted and wired through, no effect yet (output identical on and off); a later task implements it. Both off = the default.
+    // centre (applies from the next estimate; costs about +0.06 ms at 1080p flowScale 2; gpu/V3.md 3.5 "As built (j)"); with it off the
+    // output is byte-identical to V3 without the hook. v3DetailSplit: hook (l), fine detail from one frame only: in the synthesis the blend of
+    // the taps is kept for the coarse picture (3x3 low-pass of each tap) and the detail (tap minus its low-pass) comes from the dominant tap
+    // (sharpened weights, the later frame at a tie); it fades out with the smear, the static mask is applied after it (gpu/V3.md 3.16
+    // "As built (l)"). Acts in the synthesis (from the next recordSynth / recordSynthBlur, no re-estimate), selects a second build of the synthesis
+    // (P_V3_SYNTH_L); with it off the output is byte-identical to V3 without the hook. Both off = the default.
     // Other versions ignore all six. Runtime: setSettings() at any time; changing one does not drop the current estimate.
     float v3Smear = 0.35f;
     float v3OcclSoft = 1.0f;

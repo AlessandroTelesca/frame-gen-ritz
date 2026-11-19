@@ -22,7 +22,7 @@
 //   7. the static mask: where the two real frames show the same structure at x (a HUD stroke, a semi-transparent panel) the pixel takes the zero-vector
 //      time blend (1 - t) prev(x) + t curr(x) by the static weight (v2_morph.glsl's decision: S confirmed at full resolution, E, both taps on it).
 //   8. quantise exactly as the store does (V3_QUANT), accumulate with the blur weights; store.
-// Mode bits (V3PC.mode): 1 Gaussian blur weights, 2 hook (l) detail split (wired, no effect yet), 8 debug dump: the 28-float record of the weight stage
+// Mode bits (V3PC.mode): 1 Gaussian blur weights, 2 hook (l) detail split (host: selects the -DV3L=1 build, which does not read the bit), 8 debug dump: the 28-float record of the weight stage
 // per output pixel (V3.md 3.16), every pc.lw-th pixel of the raster, the first pc.lh of them, into the T-field slot after the interior ones.
 // The per-format variants (step F) go through the V3_* macros of v3_format.glsl (YUV also writes its CbCr plane once per 2x2 block, as v2_morph.glsl).
 #include "common.glsl"
@@ -31,6 +31,36 @@
 #include "v3_weights.glsl"
 #include "v3_static.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
+
+// Hook (l) v3DetailSplit (V3.md 3.16 "As built (l)"): the same source compiled with -DV3L=1 (gpu/meson.build v3l_gen, header v3_synth_l[_<fmt>]_spv.h,
+// pipeline P_V3_SYNTH_L). Without the define none of the code below exists: the plain build's SPIR-V is what it was.
+#if defined(V3L)
+#define V3L_PAR , out float va, out float vc
+#define V3L_ARG(a, b) , a, b
+#define V3L_DUM , vd0_, vd1_
+float vd0_, vd1_;
+// the tuning constants of the detail split (V3.md 3.16 "As built (l)")
+#ifndef V3L_SQ
+#define V3L_SQ 4            // the dominance power is 2^V3L_SQ (16): a sharpened share of the weight
+#endif
+#ifndef V3L_TILT
+#define V3L_TILT 0.1        // added to a curr tap's weight before the power: where prev and curr are equal (t = 0.5) the detail is curr's, not an average
+#endif
+#ifndef V3L_GAIN
+#define V3L_GAIN 1.0        // the share of the detail correction that is applied
+#endif
+#ifndef V3L_V0
+#define V3L_V0 2.0          // a working value this many levels from its tap's own colour is a rejection's replacement (validity ramp, levels)
+#endif
+#ifndef V3L_V1
+#define V3L_V1 10.0
+#endif
+float max3(vec3 v) { return max(v.r, max(v.g, v.b)); }
+#else
+#define V3L_PAR
+#define V3L_ARG(a, b)
+#define V3L_DUM
+#endif
 
 // A tap outside the frame reads the clamped edge: where content enters or leaves the view only the other frame shows it, so the tap takes its partner
 // (softly over V3_OUT px past the edge; both outside: as is). As v2_morph.glsl's outside() / edgeReject().
@@ -56,7 +86,7 @@ void edgeReject(vec2 pa, vec2 pb, inout vec3 ca, inout vec3 cb_) {
 // One hypothesis' pair of taps, pa on prev and pc_ on curr: the working values wa, wc after CrosshairV2's tap rejection (on the raw texels), the edge
 // rule and, near a static overlay (nearT), the overlay's tap rule; so = (sout, sboth, sbS) of v2_morph.glsl's sReject (sout = 1 away from overlays: the
 // taps leave them, 0 at the zero vector); em0 = the pair's disagreement before the overlay rule (the taps' own fit).
-void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so, out float em0, out float hit) {
+void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so, out float em0, out float hit V3L_PAR) {
     hit = 0.0;
     const vec4 a = V3_TAP(texPrev, texPrevC, pa), c = V3_TAP(texCurr, texCurrC, pc_);
     vec3 ra = a.rgb, rc = c.rgb;
@@ -79,6 +109,18 @@ void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so
             if (ha && hc) so.y = 0.0;
         }
     }
+#if defined(V3L)
+    // (hook (l)) how much of each working value is still the tap's own colour: the rejections (CrosshairV2, the frame edge, a static overlay) replace a tap by
+    // its partner's, and a value that is not the texels' own has no detail of its own: value minus the local mean would be the partner's against this place's
+    va = 1.0 - smoothstep(V3L_V0, V3L_V1, max3(V3_D(wa, V3_LEVELS(a.rgb))));
+    vc = 1.0 - smoothstep(V3L_V0, V3L_V1, max3(V3_D(wc, V3_LEVELS(c.rgb))));
+    // a tap whose 3x3 texels (its detail and its low-pass) touch CrosshairV2's patch has no detail of its own either: the crosshair is the UI's, not the picture's
+    {
+        const ivec2 qa = ivec2(floor(V3_UIP(pa) + 0.5)), qc = ivec2(floor(V3_UIP(pc_) + 0.5));
+        if (uiHitA(qa - 2, qa + 2)) va = 0.0;
+        if (uiHitC(qc - 2, qc + 2)) vc = 0.0;
+    }
+#endif
 }
 
 // the range (raw texel values) of the 3x3 texels around the texel nearest to the tap position pos
@@ -94,6 +136,28 @@ void v3Box(bool onCurr, vec2 pos, inout vec3 lo, inout vec3 hi) {
             hi = max(hi, v);
         }
 }
+
+#if defined(V3L)
+// v3Box and the mean of the same 9 texels (the 3x3 low-pass of the tap, raw values); box = false: only the mean
+void v3BoxMean(bool onCurr, vec2 pos, bool box, inout vec3 lo, inout vec3 hi, out vec3 mean) {
+    pos = roundEven(pos * 32.0) * (1.0 / 32.0);
+    const ivec2 c = ivec2(floor(pos + 0.5));
+    const ivec2 mx = ivec2(pc.W - 1, pc.H - 1);
+    vec3 sum = vec3(0.0);
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            const ivec2 q = clamp(c + ivec2(i, j), ivec2(0), mx);
+            const vec3 v = onCurr ? V3_PX(texCurr, texCurrC, q).rgb : V3_PX(texPrev, texPrevC, q).rgb;
+            sum += v;
+            if (box) { lo = min(lo, v); hi = max(hi, v); }
+        }
+    mean = sum * (1.0 / 9.0);
+}
+float v3Pow(float x) {   // x^(2^V3L_SQ)
+    for (int i = 0; i < V3L_SQ; i++) x *= x;
+    return x;
+}
+#endif
 
 // the static weight of the pixel p: the zero-vector time blend takes over where the two real frames show the same structure at p (v2_morph.glsl's
 // decision with the dominant mix of the two hypotheses' values: em = the pair disagreement after the overlay rule, em0 before it, so = (sout, sboth, sbS)).
@@ -193,11 +257,14 @@ void main() {
             const vec2 pAp = xp - t * gA, pAc = xp + (1.0 - t) * gA;
             const vec2 pBc = xp - (1.0 - t) * gB, pBp = xp + t * gB;
             V3WIn wi;
+#if defined(V3L)
+            float vAp, vAc, vBp, vBc;   // (hook (l): see v3Pair)
+#endif
             vec3 soA, soB;
             float em0A, em0B;
             float hitA, hitB;
-            v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A, hitA);
-            v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B, hitB);
+            v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A, hitA V3L_ARG(vAp, vAc));
+            v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B, hitB V3L_ARG(vBp, vBc));
             // (tuning D3) an occluded hypothesis owns one frame only (A prev, B curr): that tap outside the frame is no source at all, so the hypothesis is a hole
             wi.oA = rA.x; wi.holeA = max(max(rA.y, hitA), rA.x * outsideFar(pAp)); wi.uA = rA.z;
             wi.oB = rB.x; wi.holeB = max(max(rB.y, hitB), rB.x * outsideFar(pBc)); wi.uB = rB.z;
@@ -207,6 +274,37 @@ void main() {
             v3Weights(wi, wo);
             vec3 C = wo.w[0] * wi.CAp + wo.w[1] * wi.CAc + wo.w[2] * wi.CBp + wo.w[3] * wi.CBc;
             const float wA = wo.w[0] + wo.w[1], wB = wo.w[2] + wo.w[3];
+#if defined(V3L)
+            // step 5 with hook (l): the detail split. Cs = sum w_i LP_i + sum d_i (C_i - LP_i) = C - sum (w_i - d_i) (C_i - LP_i), LP_i the 3x3 mean around the
+            // tap (the same 9 texels as the clamp's box), d_i the detail shares: the sharpened weights (tilted to the later frame at a tie), the mass of a tap
+            // whose value is not its own texels' (v3Pair's validity) given back to the plain weights. A tap with w_i = d_i needs no mean. Then the clamp as below.
+            {
+                vec3 lo = vec3(1e9), hi = vec3(-1e9);
+                const bool clA = wA > wB - 0.25, clB = wB > wA - 0.25;
+                const vec2 tp[4] = vec2[4](pAp, pAc, pBp, pBc);
+                const vec3 ci[4] = vec3[4](wi.CAp, wi.CAc, wi.CBp, wi.CBc);
+                const float vl[4] = float[4](vAp, vAc, vBp, vBc);
+                float sc[4];
+                float s0 = 0.0, sv = 0.0;
+                for (int i = 0; i < 4; i++) {
+                    sc[i] = v3Pow(wo.w[i] + ((i & 1) == 1 ? V3L_TILT : 0.0));
+                    s0 += sc[i];
+                    sv += sc[i] * vl[i];
+                }
+                vec3 corr = vec3(0.0);
+                for (int i = 0; i < 4; i++) {
+                    const bool needClamp = i < 2 ? clA : clB;
+                    const float e = wo.w[i] - (sc[i] * vl[i] + (s0 - sv) * wo.w[i]) / s0;
+                    const bool needLp = abs(e) * vl[i] > 1.0 / 256.0;
+                    if (needClamp || needLp) {
+                        vec3 mean;
+                        v3BoxMean((i & 1) == 1, tp[i], needClamp, lo, hi, mean);
+                        if (needLp) corr += (e * vl[i]) * (ci[i] - V3_LEVELS(mean));
+                    }
+                }
+                C = clamp(C - V3L_GAIN * corr, V3_LEVELS(lo), V3_LEVELS(hi));
+            }
+#else
             // step 5: the pixel clamp, to the 3x3 neighbourhoods of the dominant hypothesis' taps (both where the weights are within 0.25)
             {
                 vec3 lo = vec3(1e9), hi = vec3(-1e9);
@@ -214,6 +312,7 @@ void main() {
                 if (wB > wA - 0.25) { v3Box(true, pBc, lo, hi); v3Box(false, pBp, lo, hi); }
                 C = clamp(C, V3_LEVELS(lo), V3_LEVELS(hi));
             }
+#endif
             // step 6: the smear along the motion where the estimate is unsure (no smear at all with v3Smear = 0)
             if (pc.smear > 0.0 && wo.s > 1.0 / 16.0) {
                 const float amt = 0.5 * pc.smear * wo.s;
@@ -230,8 +329,8 @@ void main() {
                     // (tuning 3) the 4 smear sets also sit on a plus of radius lat around the pixel: where the estimate is unsure the colour is low-passed across the motion too,
                     // so that no block edge of the vector field survives (taps of a hypothesis stay on its own line, shifted)
                     const vec2 xs = xp + lat * (((j + 2) & 1) == 0 ? vec2(float(j < 0 ? 1 : -1), 0.0) : vec2(0.0, float(j < 0 ? 1 : -1)));
-                    v3Pair(xs - tA * gA, xs + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_, h_);
-                    v3Pair(xs + tB * gB, xs - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_, h_);
+                    v3Pair(xs - tA * gA, xs + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_, h_ V3L_DUM);
+                    v3Pair(xs + tB * gB, xs - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_, h_ V3L_DUM);
                     Cm += (3.0 - abs(float(j))) * (wo.w[0] * cAp + wo.w[1] * cAc + wo.w[2] * cBp + wo.w[3] * cBc);
                 }
                 C = mix(C, Cm * (1.0 / 9.0), smoothstep(0.05, 0.5, wo.s));
@@ -255,7 +354,6 @@ void main() {
                 for (int i = 0; i < 10; i++) fl[rec + 12 + i] = sc_[i];
                 fl[rec + 22] = wo.w[0]; fl[rec + 23] = wo.w[1]; fl[rec + 24] = wo.w[2]; fl[rec + 25] = wo.w[3]; fl[rec + 26] = wo.s; fl[rec + 27] = 0.0;
             }
-            // (V3M_DETAIL: hook (l), the detail split, is a later task: the bit is read by nothing yet)
             v = V3_QUANT(C);
             a = mix(s0.a, s1.a, t);
         }

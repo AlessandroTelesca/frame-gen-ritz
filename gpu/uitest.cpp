@@ -264,7 +264,8 @@ static V2Mode gMode = V2Mode::Quality;   // --mode
 static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (MotionVersion::Learned only)
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
+static bool gDetailSplit = false;   // --detail-split: Settings::v3DetailSplit (V3 hook (l)) on in every instance
+static Settings algo(Settings s) { s.v3DetailSplit = gDetailSplit; s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
 static bool algoV3() { return gAlgo == MotionVersion::V3; }   // the skeleton of V3 (gpu/V3.md step S): a plain time-weighted blend, no motion
@@ -1669,7 +1670,7 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
 // V3 (gpu/V3.md): V1's luma, V2's static-mask pass and its own 14 passes (the page's 13 plus the top level's search) = 16 since step Y2 (13 after Y1: no
 // v3_enclose, v3_decide, v2_static); no motion-blur passes. Step F adds no pipeline (the per-format variants replace two of them).
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 19 : 16; }
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 20 : 16; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1900,6 +1901,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
 #ifndef UITEST_NO_MOTION
+        else if (!strcmp(argv[i], "--detail-split")) gDetailSplit = true;
         else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
@@ -1922,7 +1924,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
