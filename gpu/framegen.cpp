@@ -2818,7 +2818,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.runV3(P_V3_OCCL, ov, divUp(V.fw, 16), divUp(V.fh, 16), 2);
         r.cbar();
         r.stamp("occlusion");
-        r.runV3(P_V3_FILL, v, divUp(V.fw, 16), divUp(V.fh, 16), 2);
+        r.runV3(P_V3_FILL, ov, divUp(V.fw, 16), divUp(V.fh, 16), 2);   // fill: bit 2 = inject (injected flows are the exact ones: nothing to fill, tuning D5)
         r.cbar();
         r.stamp("fill");
         // Y2: the static mask's enclosure E / near bits C (section 3.13, from v2_static's cell maxima and the filled F01), and the pair's decisions

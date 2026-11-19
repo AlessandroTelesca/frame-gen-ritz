@@ -13,7 +13,8 @@
 #include "v3_maps.glsl"
 layout(local_size_x = 16, local_size_y = 16) in;
 
-const int R_FILL = 12;
+const int R_FILL = 12;   // flow px of the dense walk; beyond it the walk probes at growing strides up to R_FAR (tuning D5: strips of 90 flow px: a layer at 180 px per pair)
+const int R_FAR = 96;
 
 vec2 fdAt(int dir, int pix) {
     const int i = pc.fdOff + dir * 2 * pc.fw * pc.fh + 2 * pix;
@@ -34,7 +35,7 @@ void main() {
     const float o = oEstAt(dir, pix);
     vec2 r = vec2(0.0);
     bool copy = true;
-    if (o >= 0.2) {
+    if (o >= 0.2 && (pc.mode & 4) == 0) {   // (mode bit 2 = inject: the flows are the injected exact ones, there is nothing to fill)
         const vec3 col = rawAt(dir, pix);
         vec2 acc = vec2(0.0);
         float ws = 0.0;
@@ -42,23 +43,35 @@ void main() {
         ivec2 hit[4] = ivec2[4](ivec2(-1), ivec2(-1), ivec2(-1), ivec2(-1));
         int dist[4] = int[4](0, 0, 0, 0);
         const ivec2 dirs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
-        for (int s = 1; s <= R_FILL; s++) {
+        const bool farOk = (ax[mapOff(dir) + pix] >> 24) >= 0u;   // (the far probes in every flagged pixel; gating them by g cost bf400 0.25 dB): elsewhere a far neighbour's vector is another surface's
+        for (int i = 1; i <= R_FILL + (farOk ? 6 : 0); i++) {
+            const int s = i <= R_FILL ? i : R_FILL + (i - R_FILL) * (i - R_FILL) * 2 + (i - R_FILL) * 2;   // 12 dense steps, then 16, 28, 42, 60, 80, 102 (clamped to R_FAR)
+            if (s > R_FAR && i > R_FILL + 1) break;
             for (int k = 0; k < 4; k++) {
                 if (dist[k] != 0) continue;
-                const ivec2 q = p + dirs[k] * s;
+                const ivec2 q = p + dirs[k] * min(s, R_FAR);
                 if (q.x < 0 || q.y < 0 || q.x >= pc.fw || q.y >= pc.fh) { dist[k] = -1; continue; }
-                if (oEstAt(dir, q.y * pc.fw + q.x) < 0.1) { dist[k] = s; hit[k] = q; }
+                if (oEstAt(dir, q.y * pc.fw + q.x) < 0.1) { dist[k] = min(s, R_FAR); hit[k] = q; }
             }
             if (all(notEqual(ivec4(dist[0], dist[1], dist[2], dist[3]), ivec4(0)))) break;
         }
         for (int k = 0; k < 4; k++) {
             if (dist[k] <= 0) continue;
             const int qi = hit[k].y * pc.fw + hit[k].x;
-            const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0)) / (1.0 + float(dist[k]) * 0.125);
+            const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0)) / (1.0 + float(dist[k]) * 0.125) / (1.0 + float(dist[k]) * 0.125);   // (tuning D5: squared, a far neighbour counts for little where a near one exists)
             acc += w * fdAt(dir, qi);
             ws += w;
         }
-        if (ws > 0.0) { r = mix(fdAt(dir, pix), acc / ws, smoothstep(0.2, 0.8, o)); copy = false; }
+        if (ws > 0.0) {
+            const float wf = smoothstep(0.2, 0.8, o);
+            r = mix(fdAt(dir, pix), acc / ws, wf);
+            copy = false;
+            // (tuning D5) a pixel that now carries a trustworthy neighbour's vector is no longer a garbage pixel: its garbage measure g falls with the fill, so that the
+            // synth sees its occlusion (one-sided taps from the frame that shows it) instead of smearing it
+            const uint w0 = ax[mapOff(dir) + pix];
+            const uint g8 = uint(float(w0 >> 24) * (1.0 - wf) + 0.5);
+            ax[mapOff(dir) + pix] = (w0 & 0x00ffffffu) | (g8 << 24);
+        }
     }
     if (copy) r = fdAt(dir, pix);
     const int ff = pc.fdOff + 4 * N + dir * 2 * N + 2 * pix;   // FF[2] follows FD[2] (2N floats per direction)

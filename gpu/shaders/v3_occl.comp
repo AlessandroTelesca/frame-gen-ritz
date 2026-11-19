@@ -115,7 +115,7 @@ void main() {
         // the unsure count with the estimate's defaults (the stored, quantised values: what v3_project will see)
         const V3Map m = v3MapUnpack(w1);
         const float o = v3Occ(m.e, F, 1.0);
-        ax[2 * N + dir * N + pix] = floatBitsToUint(v3OccEff(o, m.g));   // o_eff for v3_fill's walks: V3B_AUX words [2N, 4N) (free: v2_static's layout leaves them)
+        ax[2 * N + dir * N + pix] = floatBitsToUint(o);   // (tuning D5: the raw o, so that v3_fill also acts in garbage regions)   // o_eff for v3_fill's walks: V3B_AUX words [2N, 4N) (free: v2_static's layout leaves them)
         const float uv = v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0);
         const bool uns = uv >= 0.5, unsF = uv >= 0.9;   // unsF: the failed-estimate share counts the clearly unsure ones
         if (uns) atomicAdd(cntU, 1u);
