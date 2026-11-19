@@ -1,0 +1,44 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3's synthesis (gpu/V3.md section 3.15), SKELETON (build step S): a plain time-weighted blend of the two real frames,
+// (1 - t) prev(x) + t curr(x) at the pixel itself (no motion), quantised as the format's store does. One full-resolution pass; all n
+// samples of the output are averaged in registers: n = 1 for recordSynth, recordSynthBlur's N sub-frames otherwise, each exactly
+// what recordSynth(t_k) gives (V3_QUANT), averaged with even or Gaussian weights (blur_resolve.comp's: exp(-2 x^2), x = (2k + 1 - n) / n)
+// and rounded once by the store. Sample times t_k = t0 + (t1 - t0)(k + 0.5)/n, as recordSynthBlur; a sample at t <= 0 / >= 1 is the real
+// frame prev / curr (recordSynthBlur with t1 = 0 or 1).
+// The later steps replace the body between the marks (projected flows, the two hypotheses, the weight stage, clamp, smear, static mask,
+// CrosshairV2 tap rejection, the whole-frame cut) and keep the sample loop and the store. Per-format variants (v3_colour_srcs, step F):
+// everything colour goes through the V3_* macros of v3_format.glsl; YUV also writes its CbCr plane (once per 2x2 block, as v2_morph.glsl).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_format.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.W || p.y >= pc.H) return;
+    vec3 acc = vec3(0.0);
+    float accA = 0.0, ws = 0.0;
+    for (int k = 0; k < pc.n; k++) {
+        float t = clamp(pc.t0 + (pc.t1 - pc.t0) * ((float(k) + 0.5) / float(pc.n)), pc.t0, pc.t1);
+        float x = (2.0 * float(k) + 1.0 - float(pc.n)) / float(pc.n);
+        float w = (pc.mode & V3M_GAUSS) != 0 ? exp(-2.0 * x * x) : 1.0;
+        vec3 v;
+        float a;
+        // ---- skeleton body ----
+        vec4 s0 = V3_PX(texPrev, texPrevC, p), s1 = V3_PX(texCurr, texCurrC, p);
+        if (t <= 0.0) {
+            v = V3_LEVELS(s0.rgb); a = s0.a;
+        } else if (t >= 1.0) {
+            v = V3_LEVELS(s1.rgb); a = s1.a;
+        } else {
+            v = V3_QUANT(mix(V3_LEVELS(s0.rgb), V3_LEVELS(s1.rgb), t));
+            a = mix(s0.a, s1.a, t);
+        }
+        // ---- end of body ----
+        acc += w * v;
+        accA += w * a;
+        ws += w;
+    }
+    imageStore(outImg, p, FG_STORE(acc / ws, accA / ws));
+}

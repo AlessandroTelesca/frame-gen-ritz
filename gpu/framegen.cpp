@@ -49,6 +49,8 @@
 #include "v2_enclose_spv.h"
 #include "v2_morph_s_spv.h"
 #include "v2_qmorph_s_spv.h"
+// MotionVersion::V3 (gpu/V3.md; skeleton: only its synthesis, which has a variant per format once step F adds them: Rgba8 so far)
+#include "v3_synth_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -219,17 +221,18 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
+#define V3_SET(c, f) (c.v3Synth = SPV(v3_synth##f))   // (V3: Rgba8 only so far; the other formats' variants come with step F of gpu/V3.md)
 #define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f), c.mlPlanes = SPV(ml_planes##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
     case Format::Rgba8:
-        c = COLOUR_SET(); V2_SET(c, );
+        c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, );
 #ifdef FG_HAVE_ML
         ML_SET(c, );
 #endif
@@ -283,6 +286,7 @@ bool colourSpv(Format f, ColourSpv& c) {
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
+const char* const kV3NotBuilt = "MotionVersion::V3 has no shader variants for this format yet (only Rgba8 so far); use MotionVersion::V1 or V2";
 const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard, ml_planes) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
 const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
 // The input variants of the learned nets (ml-fg export/SPEC.md sections 10.7, 11; the manifest's `variant`, read by gpu/ml/embed_weights.py,
@@ -416,6 +420,22 @@ struct MLPC {
     int32_t pad_[8];
 };
 static_assert(sizeof(MLPC) == sizeof(PC), "MLPC is pushed over PC's range");
+// Must match the push-constant block in shaders/v3_common.glsl (MotionVersion::V3's passes, gpu/V3.md section 5). Pushed over the same range of
+// the same pipeline layout as PC. The first 8 ints are V2PC's, so v2_static.comp can be pushed with it. (The page's listing adds up to 108 bytes:
+// the padding is 7 floats, not 2.)
+struct V3PC {
+    int32_t W, H, fw, fh, bw, bh, fscale, fIn;
+    int32_t lw, lh, gw, gh;
+    int32_t lvl, iter;
+    int32_t mode, n;
+    float t0, t1;
+    float cutThresh, globalFrac;
+    float smear, occlSoft, unsure;
+    float cx, cy;
+    float pad[7];
+};
+static_assert(sizeof(V3PC) == sizeof(PC), "V3PC is pushed over PC's range");
+enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8 };   // synth mode bits (shaders/v3_common.glsl)
 // MotionVersion::Learned's duplicate test: FGR's own, proto/harness.py DUP_DIFF (and gpu/compare.py): a pair whose mean over the
 // pixels of the channel-mean |a - c| is at most this many 8-bit levels is a duplicate ("re-encoded duplicate frames differ by up to
 // ~0.5"). The net is skipped there and the field is zero (shaders/ml_dup.comp).
@@ -500,7 +520,10 @@ struct UiEntry {
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised. P_ML_PLANES / P_ML_FEAT: the colour and features variants' per-frame planes and the features extractor.
 enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
             P_V2_MEDHIST, P_V2_MEDHIST_WIDE, P_V2_SEARCH, P_V2_SEARCH_WIDE, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QOWN_WIDE, P_V2_QCOV, P_V2_QCOV_WIDE, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
-            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD, P_COUNT };
+            P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD,
+            // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
+            P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
+            P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
 // variant (ML_EXT); the conv pipelines per activation storage too; convs per
 // net and shape (0 = first, 14 -> w; 1 = hidden, w -> w; 2 = last, w -> 2) and, but the last, whole or split (one output group per
@@ -523,13 +546,17 @@ struct Level { int w, h, bw, bh, offA, offC, fS, fM; };
 // Learned: V1's luma, synthesis and motion-blur pipelines plus its own (P_ML_*); its buffers (MLB_*) are the net's state and
 // activations (sized for the selected net, grown when a wider one is selected); the weights of both nets (Impl::mlWeights) are
 // size-independent and created with the pipelines.
-static const int kMotionVersions = 3;   // MotionVersion::V1, V2, Learned
+static const int kMotionVersions = 4;   // MotionVersion::V1, V2, Learned, V3
 // MotionGroup::bufs of V2: binding 13 (vec2): the cleaned block field, the fitted finest field (bw x bh each), Quality's per-pixel
 // field (fw x fh); binding 14 (uint): Quality's claims, own claims and coverage (4 x fw x fh, shaders/v2_quality.glsl)
 enum { V2B_FIELD, V2B_QUAL, V2B_COUNT };
 // MotionGroup::bufs of Learned: binding 13 (float): the pyramid, the field of every level, the partial sums; binding 14 (vec4): the
 // activations, two regions (shaders/ml_common.glsl)
 enum { MLB_STATE, MLB_ACT, MLB_COUNT };
+// MotionGroup::bufs of V3 (gpu/V3.md section 4), bound to bindings 13, 14, 15 of V3's sets: the raw planes and features of both frames at
+// all levels (uvec2 texels), the static layout + maps + the pair's state G (uint words), the block records / dense and filled fields /
+// T-field (floats)
+enum { V3B_PYR, V3B_AUX, V3B_FLOW, V3B_COUNT };
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
@@ -618,6 +645,40 @@ static MlLayout mlLayout(uint32_t W, uint32_t H, int fw, int fh, const Settings&
     return L;
 }
 
+// MotionVersion::V3's layout of a size (gpu/V3.md sections 2 and 4): its own pyramid (halve while the short side exceeds 32; level 0 = the
+// flow grid; 8x8 blocks at level 0, 4x4 above) and the sizes of its three buffers (ns = the T-field slots held: 1 in the skeleton).
+struct V3Layout {
+    int fw = 0, fh = 0, n = 0;
+    int w[16]{}, h[16]{}, gw[16]{}, gh[16]{};
+    uint64_t N = 0, N8 = 0, P = 0, B = 0;
+    uint64_t auxWords = 0;
+    uint64_t pyrBytes() const { return 32 * P; }
+    uint64_t auxBytes() const { return 4 * auxWords; }
+    uint64_t flowBytes(uint64_t ns) const { return 64 * B + 32 * N + 16 * N * ns; }
+    uint64_t gOff() const { return 5 * N + 3 * N8; }   // words of V3B_AUX before the state G
+};
+static const int kV3GWords = 4096;
+static V3Layout v3Layout(uint32_t W, uint32_t H, uint32_t flowScale) {
+    V3Layout L;
+    L.fw = rintHalfEven(W * (1.0 / flowScale));
+    L.fh = rintHalfEven(H * (1.0 / flowScale));
+    int w = L.fw, h = L.fh;
+    for (;;) {
+        const int bs = L.n == 0 ? 8 : 4;
+        L.w[L.n] = w; L.h[L.n] = h; L.gw[L.n] = (w + bs - 1) / bs; L.gh[L.n] = (h + bs - 1) / bs;
+        L.P += (uint64_t)w * h;
+        L.B += (uint64_t)L.gw[L.n] * L.gh[L.n];
+        L.n++;
+        if (std::min(w, h) <= 32 || L.n == 16) break;
+        w = rintHalfEven(w * 0.5);
+        h = rintHalfEven(h * 0.5);
+    }
+    L.N = (uint64_t)L.fw * L.fh;
+    L.N8 = (uint64_t)((L.fw + 7) / 8) * ((L.fh + 7) / 8);
+    L.auxWords = 5 * L.N + 3 * L.N8 + kV3GWords;
+    return L;
+}
+
 // Null if a W x H frame fits the device under these settings (the selected motion version's buffers and dispatches), else why not.
 // Below kMinSize the flow resolution degenerates (W or H = 1 -> size-0 buffers). The largest buffers grow with W * H / flowScale^2
 // (V2 Quality's claims and coverage, V1's motion-blur field scratch), the widest dispatch with W / 8 (and V2's static-mask cells).
@@ -629,7 +690,15 @@ static const char* sizeLimitError(uint32_t W, uint32_t H, const Settings& s, con
     const uint64_t fwh = (uint64_t)L.fw * L.fh, cells = (uint64_t)((L.fw + 7) / 8) * ((L.fh + 7) / 8);
     uint64_t big = std::max({(uint64_t)L.lumaWords * 4, (uint64_t)L.fieldEntries * 8, (uint64_t)(64 + (W + 3) / 4 * (uint64_t)H) * 4});
     uint64_t gx = (W + 7) / 8, gy = (H + 7) / 8;
-    if (s.motionVersion == MotionVersion::V2) {
+    if (s.motionVersion == MotionVersion::V3) {
+        // V3 owns three buffers (the pyramid, the aux words, the flow records; no V1 blur scratch: its blur is its synthesis) and its widest
+        // dispatches are v3_synth (W / 8), v3_dense ((fw + 4) / 8) and v3_search (the widest block grid); v3_wide / v3_project use z <= 16
+        const V3Layout V = v3Layout(W, H, s.flowScale);
+        big = std::max({big, V.pyrBytes(), V.auxBytes(), V.flowBytes(1)});
+        gx = std::max<uint64_t>(gx, (uint64_t)(V.fw + 4 + 7) / 8);
+        for (int l = 0; l < V.n; l++) gx = std::max<uint64_t>(gx, V.gw[l]);
+        if (lim.wg[2] < 16) return "a dispatch of MotionVersion::V3 exceeds the device's maxComputeWorkGroupCount in z (16 needed)";
+    } else if (s.motionVersion == MotionVersion::V2) {
         big = std::max({big, ((uint64_t)L.lv[0].bw * L.lv[0].bh * 2 + fwh) * 8, (fwh * 5 + 3 * cells) * 4});
         gx = std::max(gx, (cells + 7) / 8);   // v2_enclose.comp: 8 cells per workgroup, one row of workgroups
     } else {
@@ -723,6 +792,15 @@ struct Interpolator::Impl {
     void mlGuard(VkCommandBuffer cb, float t, float motionK, int pf, int cnt0, int nCnt);
     void mlEstimate(VkCommandBuffer cb);
     bool v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, const float* ts, int n, bool gauss);
+    // MotionVersion::V3 (gpu/V3.md). v3Fresh: its buffers were just created (zeroed by the next estimate, so nothing reads stale memory),
+    // v3Dirty: the latest estimate holds injected flows (the next normal estimate zeroes them: the skeleton writes none of its own),
+    // v3inj: set around recordEstimate by recordDebugV3Inject.
+    struct V3Inject { VkBuffer buf; VkDeviceSize f01, f10; };
+    bool v3Fresh = false, v3Dirty = false;
+    const V3Inject* v3inj = nullptr;
+    bool mv3() const { return set.motionVersion == MotionVersion::V3; }
+    void v3Reset(VkCommandBuffer cb);
+    bool v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, float t0, float t1, int n, bool gauss);
 
     // size dependent
     uint32_t W = 0, H = 0;
@@ -1263,6 +1341,7 @@ bool Interpolator::init(const InitInfo& ii) {
     if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && !cs.v2Morph.code) { err_ = kV2NotBuilt; return false; }
     if (ii.settings.motionVersion == MotionVersion::Learned && !cs.mlDup.code) { err_ = kMlNotBuilt; return false; }
+    if (ii.settings.motionVersion == MotionVersion::V3 && !cs.v3Synth.code) { err_ = kV3NotBuilt; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -1514,8 +1593,9 @@ bool Interpolator::validate(const Settings& s) {
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
-           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::Learned &&
+           (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
            (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
            in(s.uiBoxHeightFrac, 0.0f, 1.0f) &&
@@ -1540,6 +1620,7 @@ const char* Interpolator::settingsError(const Settings& s) const {
     if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
     if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
     if (m && s.motionVersion == MotionVersion::Learned && !m->cs.mlDup.code) return kMlNotBuilt;
+    if (m && s.motionVersion == MotionVersion::V3 && !m->cs.v3Synth.code) return kV3NotBuilt;
     return m && m->W ? sizeLimitError(m->W, m->H, s, m->lim) : nullptr;   // the held size under these settings
 }
 
@@ -1622,6 +1703,11 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_MORPH_S] = {cs.v2MorphS, spec};
         spv[P_V2_QMORPH_S] = {cs.v2QMorphS, spec};
     }
+    if (set.motionVersion == MotionVersion::V3) {
+        // V1's luma only (the format's); the rest is V3's own. Skeleton: the synthesis; the estimate's passes are reserved (P_V3_*)
+        for (int i = P_DOWN; i <= P_LOOKUP; i++) spv[i].sp = Spv{};
+        spv[P_V3_SYNTH] = {cs.v3Synth, spec};
+    }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
     // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
     struct MlSpec { int32_t gi, go, linear, got, half, ext; } mlSpec[2 * kMlNets * 5 + 2 * MLV_COUNT]{};
@@ -1670,8 +1756,8 @@ bool Interpolator::Impl::motionEnsure() {
         {SPV(blur_lookup), nullptr}, {cs.blurError, spec}, {cs.blurResolve, spec}};
     bool ok = true;
     for (int i = 0; ok && i < P_COUNT; i++) ok = !spv[i].sp.code || makePipe(spv[i].sp, layout, g.pipes[i], spv[i].sc);
-    // V2's motion blur is its synthesis pass with n samples (v2Synth): no blur pipelines
-    for (int i = 0; ok && set.motionVersion != MotionVersion::V2 && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
+    // V2's and V3's motion blur is their synthesis pass with n samples (v2Synth, v3Synth): no blur pipelines
+    for (int i = 0; ok && set.motionVersion != MotionVersion::V2 && set.motionVersion != MotionVersion::V3 && i < B_COUNT_; i++) ok = makePipe(bspv[i].sp, blurLayout, g.blurPipes[i], bspv[i].sc);
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
     g.live = true;
@@ -1682,6 +1768,20 @@ bool Interpolator::Impl::motionEnsure() {
 // createSizeDependent; destroySizeDependent frees them). V1 has none of its own; V2: V2B_*.
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
     if (&g == &mo[(int)MotionVersion::Learned]) return mlSized();
+    if (&g == &mo[(int)MotionVersion::V3]) {
+        if (!g.bufs.empty()) return true;
+        // gpu/V3.md section 4; all three are copied out by recordDebugV3. The T-field part of V3B_FLOW is held for one interior sample (ns = 1)
+        const V3Layout V = v3Layout(W, H, set.flowScale);
+        g.bufs.resize(V3B_COUNT);
+        if (allocBuf(g.bufs[V3B_PYR], V.pyrBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && allocBuf(g.bufs[V3B_AUX], V.auxBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
+            allocBuf(g.bufs[V3B_FLOW], V.flowBytes(1), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+            v3Fresh = true;
+            return true;
+        }
+        for (UiBuf& b : g.bufs) freeBuf(b);
+        g.bufs.clear();
+        return false;
+    }
     if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
     g.bufs.resize(V2B_COUNT);
     // the cleaned field, then the search's fitted finest field (v2_est.glsl); recordDebugMaps copies the cleaned one
@@ -1854,6 +1954,26 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     const MotionGroup& v2g = I.mo[(int)MotionVersion::V2];
+    if (I.mv3() && !I.mo[(int)MotionVersion::V3].bufs.empty()) {
+        // V3 in V1's slots (gpu/V3.md section 2, display only): the block slot holds F01 at the level-0 block centres (bw x bh), the pixel slot F01 at
+        // the flow pixels (fw x fh), the mismatch slot zeros. NOT halved and not resampled to the midpoint grid (that needs a pass, the skeleton has
+        // none): the vectors are full prev->curr vectors, which gpu/fgmaps.py halves for a V3 dump (header word 14 = 3).
+        const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
+        const VkBuffer fb = I.mo[(int)MotionVersion::V3].bufs[V3B_FLOW].b;
+        const VkDeviceSize ff0 = 64 * (VkDeviceSize)V.B + 2 * (VkDeviceSize)V.N * 8;   // FF[0] in V3B_FLOW
+        VkBufferCopy pc{ff0, dstOffset + L.pixOff, (VkDeviceSize)V.N * 8};
+        I.CmdCopyBuffer(cb, fb, dst, 1, &pc);
+        std::vector<VkBufferCopy> bc;
+        bc.reserve((size_t)L.bw * L.bh);
+        for (uint32_t j = 0; j < L.bh; j++)
+            for (uint32_t i = 0; i < L.bw; i++) {
+                const uint32_t x = std::min(8 * i + 4, L.fw - 1), y = std::min(8 * j + 4, L.fh - 1);
+                bc.push_back({ff0 + ((VkDeviceSize)y * L.fw + x) * 8, dstOffset + L.blockOff + ((VkDeviceSize)j * L.bw + i) * 8, 8});
+            }
+        I.CmdCopyBuffer(cb, fb, dst, (uint32_t)bc.size(), bc.data());
+        I.CmdFillBuffer(cb, dst, dstOffset + L.eOff, L.size - L.eOff, 0);
+        return true;
+    }
     if (I.mv2() && I.v2Clean && !v2g.bufs.empty()) {
         // V2: the cleaned block field (both modes). Performance: no pixel field, no e (zeros). Quality (with its coverage): its
         // per-pixel field (v2_qfield.comp) in the pixel-field slot, and the e slot starts with the coverage, fw * fh words
@@ -1883,6 +2003,60 @@ bool Interpolator::recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSiz
     VkBufferCopy e{(VkDeviceSize)kEOff * 4, dstOffset + L.eOff, L.size - L.eOff};
     I.CmdCopyBuffer(cb, I.buf[2], dst, 1, &e);
     return true;
+}
+
+bool Interpolator::debugV3Layout(DebugV3Layout& l) const {
+    if (!m || !m->W || !m->mv3() || m->lv.empty()) return false;
+    const Impl& I = *m;
+    const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
+    l = DebugV3Layout{};
+    l.W = I.W; l.H = I.H; l.fw = (uint32_t)V.fw; l.fh = (uint32_t)V.fh; l.bw = (uint32_t)I.lv[0].bw; l.bh = (uint32_t)I.lv[0].bh;
+    l.fscale = I.set.flowScale; l.nLevels = (uint32_t)V.n;
+    for (int i = 0; i < V.n; i++) { l.lw[i] = (uint32_t)V.w[i]; l.lh[i] = (uint32_t)V.h[i]; l.lgw[i] = (uint32_t)V.gw[i]; l.lgh[i] = (uint32_t)V.gh[i]; }
+    const VkDeviceSize n2 = (VkDeviceSize)V.N * 8, n1 = (VkDeviceSize)V.N * 4;
+    l.ff0 = 64; l.ff1 = l.ff0 + n2; l.fd0 = l.ff1 + n2; l.fd1 = l.fd0 + n2;
+    l.map0 = l.fd1 + n2; l.map1 = l.map0 + n1; l.s = l.map1 + n1; l.blk = l.s + n1;
+    VkDeviceSize o = l.blk;
+    for (int i = 0; i < V.n; i++) { l.blkLevel[i] = o; o += (VkDeviceSize)V.gw[i] * V.gh[i] * 4 * 16; }
+    l.size = o;
+    return true;
+}
+
+bool Interpolator::recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset) {
+    DebugV3Layout L;
+    if (!debugV3Layout(L) || m->mo[(int)MotionVersion::V3].bufs.empty()) return false;
+    Impl& I = *m;
+    const MotionGroup& g = I.mo[(int)MotionVersion::V3];
+    const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    // the 16-word header: the constants by CmdUpdateBuffer, then G.mode, G.unsureCount, G.failMix copied from the aux buffer
+    const uint32_t hdr[10] = {0x42443356u, 1u, L.W, L.H, L.fw, L.fh, L.bw, L.bh, L.fscale, L.nLevels};
+    I.CmdUpdateBuffer(cb, dst, dstOffset, sizeof(hdr), hdr);
+    const VkDeviceSize g0 = (VkDeviceSize)V.gOff() * 4;
+    VkBufferCopy h[3] = {{g0 + 4 * 4, dstOffset + 40, 4}, {g0 + 2 * 4, dstOffset + 44, 4}, {g0 + 24 * 4, dstOffset + 48, 4}};   // G_MODE, G_UNSURE_COUNT, G_FAIL_MIX
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 3, h);
+    I.CmdFillBuffer(cb, dst, dstOffset + 52, 12, 0);   // words 13..15 spare
+    const VkDeviceSize n2 = (VkDeviceSize)V.N * 8, n1 = (VkDeviceSize)V.N * 4, blkB = 64 * (VkDeviceSize)V.B;   // V3B_FLOW: BLK, FD[2], FF[2], TF
+    VkBufferCopy fc[4] = {{blkB + 2 * n2, dstOffset + L.ff0, 2 * n2}, {blkB, dstOffset + L.fd0, 2 * n2},   // FF[0..1], FD[0..1] (adjacent in dst)
+                          {0, dstOffset + L.blk, blkB}};
+    I.CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, dst, 3, fc);
+    VkBufferCopy ac[2] = {{0, dstOffset + L.map0, 2 * n1}, {(VkDeviceSize)4 * V.N * 4, dstOffset + L.s, n1}};   // MAP[0..1]; S at word 4N
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, ac);
+    return true;
+}
+
+bool Interpolator::recordDebugV3Inject(VkCommandBuffer cb, Frame prev, Frame curr, VkBuffer flows, VkDeviceSize f01Off, VkDeviceSize f10Off) {
+    if (!m || !m->W || !m->mv3() || m->mo[(int)MotionVersion::V3].bufs.empty() || !flows) return false;
+    Impl::V3Inject inj{flows, f01Off, f10Off};
+    m->v3inj = &inj;
+    const bool ok = recordEstimate(cb, prev, curr);
+    m->v3inj = nullptr;
+    return ok;
+}
+
+bool Interpolator::recordDebugV3Weights(VkCommandBuffer, Frame, Frame, Frame, float, VkBuffer, VkDeviceSize) {
+    return false;   // stub until steps Y1 / Y2 of gpu/V3.md (the weight stage does not exist yet)
 }
 
 void Interpolator::setDebugLearned(const LearnedDebug& d) {
@@ -1981,6 +2155,14 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(13, BUF).pBufferInfo = &vb;
         add(14, BUF).pBufferInfo = &qb;
     }
+    const MotionGroup& v3g = mo[(int)MotionVersion::V3];
+    VkDescriptorBufferInfo v3b[3];
+    if (mv3() && !v3g.bufs.empty()) {   // V3's sets only
+        for (uint32_t i = 0; i < 3; i++) {
+            v3b[i] = {v3g.bufs[V3B_PYR + i].b, 0, VK_WHOLE_SIZE};
+            add(13 + i, BUF).pBufferInfo = &v3b[i];
+        }
+    }
     if (mlearned() && mb[0].buffer && mb[1].buffer && mb[2].buffer)   // Learned's sets only
         for (uint32_t i = 0; i < 3; i++) add(13 + i, BUF).pBufferInfo = &mb[i];
     UpdateDescriptorSets(info.device, n, wr, 0, nullptr);
@@ -2024,6 +2206,7 @@ struct Rec {
         barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         I.CmdFillBuffer(cb, I.buf[2], 0, words * 4, 0);
         if (claims) I.v2ResetClaims(cb);
+        if (I.mv3() && words > 1) I.v3Reset(cb);   // (V3's estimate: its state G, and the buffers of a first use)
         I.mlUpload(cb);   // (Learned: its weights, once)
         barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
         I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
@@ -2038,6 +2221,21 @@ struct Rec {
         I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
         I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(V2PC), &v);
         I.CmdDispatch(cb, gx, gy, 1);
+    }
+    // V3's passes: their own block (V3PC) over the same range
+    void runV3(Pipe p, const V3PC& v, uint32_t gx, uint32_t gy, uint32_t gz = 1) {
+        I.CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.mg().pipes[p]);
+        I.CmdPushConstants(cb, I.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(V3PC), &v);
+        I.CmdDispatch(cb, gx, gy, gz);
+    }
+    V3PC v3pc() const {
+        V3PC v{};
+        v.W = (int)I.W; v.H = (int)I.H; v.fw = I.fw; v.fh = I.fh;
+        v.bw = I.lv[0].bw; v.bh = I.lv[0].bh; v.fscale = (int)I.set.flowScale;
+        v.cutThresh = I.set.v3SceneCut; v.globalFrac = I.set.globalFallback;
+        v.smear = I.set.v3Smear; v.occlSoft = I.set.v3OcclSoft; v.unsure = I.set.v3Unsure;
+        v.cx = 0.5f * (float)I.fw; v.cy = 0.5f * (float)I.fh;
+        return v;
     }
     V2PC v2pc() const {
         V2PC v{};
@@ -2464,6 +2662,27 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);   // the fills bound the UI set
         r.stamp("ui_fill");
     }
+    if (I.mv3()) {
+        // MotionVersion::V3, SKELETON (gpu/V3.md step S): no estimate yet. The state G is zeroed (clearCounters -> v3Reset), the flow buffers hold
+        // zeros (or, for recordDebugV3Inject, the caller's flows), which is "no motion, no cut, no fallback". Step E1 records planes, histograms,
+        // the pyramid and the search here (E4..E8), E2 the stats and the wide search, Y1 occlusion / fill, Y2 enclose / decide (E9..E12);
+        // with v3inj set they take the injected flows in place of the search (E6..E7).
+        if (I.v3inj) {
+            const MotionGroup& g = I.mo[(int)MotionVersion::V3];
+            const VkDeviceSize n8 = (VkDeviceSize)I.fw * I.fh * 8;
+            const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
+            const VkDeviceSize fd = 64 * V.B, ff = fd + 2 * n8;   // V3B_FLOW: BLK, FD[2], FF[2], TF
+            r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            // (FD and FF: the skeleton has no fill pass, FF = FD)
+            VkBufferCopy c0[2] = {{I.v3inj->f01, fd, n8}, {I.v3inj->f01, ff, n8}}, c1[2] = {{I.v3inj->f10, fd + n8, n8}, {I.v3inj->f10, ff + n8, n8}};
+            I.CmdCopyBuffer(cb, I.v3inj->buf, g.bufs[V3B_FLOW].b, 2, c0);
+            I.CmdCopyBuffer(cb, I.v3inj->buf, g.bufs[V3B_FLOW].b, 2, c1);
+            r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+            I.v3Dirty = true;
+            r.stamp("inject");
+        }
+        return true;
+    }
     if (I.mlearned()) {   // the learned estimator instead of V1's pyramid and search (V1's luma above, V1's synthesis after it)
         I.mlEstimate(cb);
         return true;
@@ -2788,6 +3007,57 @@ bool Interpolator::Impl::v2Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     return true;
 }
 
+// V3: what an estimate clears, recorded inside Rec::clearCounters' transfer window (every earlier record's use of the buffers is ordered before
+// it, the passes after it): the state G (4096 words of V3B_AUX; the estimate's counters and decisions accumulate there); the whole of V3's
+// buffers once after they were created, so that no pass or debug read ever sees uninitialised memory; and, after an injection, the flows.
+void Interpolator::Impl::v3Reset(VkCommandBuffer cb) {
+    const MotionGroup& g = mo[(int)MotionVersion::V3];
+    if (g.bufs.empty()) return;
+    const V3Layout V = v3Layout(W, H, set.flowScale);
+    if (v3Fresh) {
+        for (const UiBuf& b : g.bufs) CmdFillBuffer(cb, b.b, 0, VK_WHOLE_SIZE, 0);
+        v3Fresh = false;
+        v3Dirty = false;
+        return;
+    }
+    CmdFillBuffer(cb, g.bufs[V3B_AUX].b, V.gOff() * 4, (VkDeviceSize)kV3GWords * 4, 0);
+    if (v3Dirty) {   // FD and FF hold the flows of an injection
+        CmdFillBuffer(cb, g.bufs[V3B_FLOW].b, 64 * V.B, 32 * V.N, 0);
+        v3Dirty = false;
+    }
+}
+
+// V3: recordSynth (n = 1, t0 = t1 = t) and recordSynthBlur (n samples over [t0, t1]) in one pass, v3_synth.comp (gpu/V3.md section 3.15), then the
+// UI patch as V2's. The caller has checked the pair, the rings and the UI entries. Skeleton: the synthesis is a plain time-weighted blend of the
+// real frames (no projection pass yet).
+bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, float t0, float t1, int n, bool gauss) {
+    VkDescriptorSet set_ = takeSet(R_SYNTH, srcP, srcC, out, false, rejectMasks(cb));
+    Rec r(*this, cb);
+    // orders this record after every earlier one (shared buffers) and zeroes u[0] (the untrusted count, which recordDebugCounters reads: the skeleton has none)
+    r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    CmdFillBuffer(cb, buf[2], 0, 4, 0);
+    r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
+    CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set_, 0, nullptr);
+    V3PC v = r.v3pc();
+    v.n = n;
+    v.t0 = t0;
+    v.t1 = t1;
+    v.mode = gauss ? V3M_GAUSS : 0;
+    r.runV3(P_V3_SYNTH, v, divUp((int)W, 8), divUp((int)H, 8));
+    const char* name = n == 1 ? "synth" : "blur synth";
+    if (estUi) {
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);
+        r.stamp(name);
+        uiRecordPatch(cb, curr, out, uiE[estEnt[1]]);   // the real UI pixels back over the generated frame
+        r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
+        r.stamp("ui_patch");
+        return true;
+    }
+    r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, VK_ACCESS_SHADER_READ_BIT);   // compute-only queue safe
+    r.stamp(name);
+    return true;
+}
+
 bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t) {
     if (!m || !m->W || !(t > 0.0f && t < 1.0f)) return false;
     Impl& I = *m;
@@ -2803,6 +3073,7 @@ bool Interpolator::recordSynth(VkCommandBuffer cb, Frame prev, Frame curr, Frame
         if (I.estClean) { srcP = ep.frame(); srcC = ec.frame(); }
     }
     if (I.mv2()) return I.v2Synth(cb, srcP, srcC, curr, out, &t, 1, false);
+    if (I.mv3()) return I.v3Synth(cb, srcP, srcC, curr, out, t, t, 1, false);
     VkDescriptorSet set = I.takeSet(Impl::R_SYNTH, srcP, srcC, out, false, I.rejectMasks(cb));
 
     Rec r(I, cb);
@@ -2885,6 +3156,7 @@ bool Interpolator::recordSynthBlur(VkCommandBuffer cb, Frame prev, Frame curr, F
         if (bp.t[k] > 0.0f && bp.t[k] < 1.0f) { lo = std::min(lo, k); hi = k; }
     const int nInt = hi - lo + 1;
     if (I.mv2()) return I.v2Synth(cb, srcP, srcC, curr, out, bp.t, n, I.set.blurWeights == BlurWeights::Gaussian);
+    if (I.mv3()) return I.v3Synth(cb, srcP, srcC, curr, out, blur ? t0 : t1, t1, n, I.set.blurWeights == BlurWeights::Gaussian);
 
     // scratch: n slots of the field at t (flow res) and of the packed mismatch (full res)
     const VkDeviceSize errWords = (VkDeviceSize)((I.W + 3) / 4) * I.H;

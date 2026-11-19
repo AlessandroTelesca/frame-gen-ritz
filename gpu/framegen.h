@@ -49,6 +49,12 @@ enum class MotionVersion : uint32_t {
                   // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4 /
                   // E2v5 100 + 11 MB, E1v3 / E1v4 / E1v5 58 + 11 MB; 1440p E2v3 / E2v4 / E2v5 177 + 20 MB, E1v3 / E1v4 / E1v5 103 + 20 MB
                   // (learnedHalf: half the activations); the zero test and the static guard need none; the weights of all eight nets 2.3 MB.
+    V3 = 3,   // the third algorithm (design: gpu/V3.md): a gather-based, two-flow, occlusion-aware interpolator. UNDER CONSTRUCTION: this build
+              // has its skeleton only (build step S of gpu/V3.md): the library, buffers, settings and test hooks are final, the motion
+              // estimate does not exist yet and the synthesis is a plain time-weighted blend of the two real frames, (1 - t) prev + t curr,
+              // quantised as the format's store does (recordSynthBlur: the n sub-frames' blends, averaged). Only Format::Rgba8 so far: any
+              // other Format makes init() / setSettings() / reconfigure() refuse V3 with a reason (Interpolator::settingsError). No device
+              // requirement beyond Vulkan 1.2 core compute. Settings::v3* are accepted and validated and have no effect yet.
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
@@ -312,6 +318,20 @@ struct Settings {
     // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
     // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
     bool v2StaticMask = true;
+    // MotionVersion::V3 (see gpu/V3.md section 6; all have no effect in the skeleton build, which only blends the two frames):
+    // v3Smear [0, 1]: smear strength, +- (this x the inter-frame motion) at full unsureness; 0 = no smear.
+    // v3OcclSoft [0.25, 4]: width of the occlusion ramp (higher = softer one-sided transition). v3Unsure [0.25, 4]: scales the poor-match
+    // ramp of the unsure measure (higher = trusts worse matches). Runtime, act in the synthesis, no re-estimate needed.
+    // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never), read by the estimate.
+    // v3ColourWindow: hook (j), matching windows weighted by colour similarity (from the next estimate); v3DetailSplit: hook (l), fine
+    // detail from one frame and the coarse picture blended. Both off = the default. Other versions ignore all six. Runtime: setSettings()
+    // at any time; changing one does not drop the current estimate.
+    float v3Smear = 0.35f;
+    float v3OcclSoft = 1.0f;
+    float v3Unsure = 1.0f;
+    float v3SceneCut = 0.45f;
+    bool v3ColourWindow = false;
+    bool v3DetailSplit = false;
     // MotionVersion::Learned: the net (see LearnedNet). E2v5 = the default (E2v4, E2v3 before it); E1v5 = the small net, the recommended
     // fallback when E2v5 is too expensive (~2.4x cheaper at 1080p). Other versions ignore it (any valid value,
     // no effect). Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is
@@ -682,6 +702,32 @@ public:
     bool debugMapLayout(DebugMapLayout& l) const;
     bool recordDebugMaps(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
     // (MotionVersion::Learned has no block field: the block slot of recordDebugMaps is zero, the per-pixel field is the net's.)
+
+    // Debug / test only (gpu/v3test.cpp): MotionVersion::V3's estimate. All return false unless the selected version is V3 and a size is held.
+    // recordDebugV3(): copies the latest V3 estimate into dst (TRANSFER_DST usage) at dstOffset, laid out as debugV3Layout() says: a header of
+    // 16 uint32 [0 magic 'V3DB' = 0x42443356, 1 version = 1, 2 W, 3 H, 4 fw, 5 fh, 6 bw, 7 bh (level-0 8x8 block grid), 8 flowScale, 9 number of
+    // levels, 10 G.mode (0 normal, 1 scene cut), 11 G.unsureCount, 12 G.failMix (float bits), 13..15 spare], then fw*fh vec2 each (flow px, all
+    // full prev->curr vectors): FF[0] (F01, prev's grid, filled), FF[1] (F10, curr's grid), FD[0], FD[1] (dense, before the fill); then fw*fh
+    // uint32 each: MAP[0], MAP[1] (cost8 | e8 << 8 | amb8 << 16 | g8 << 24), S (the static-structure mask, float bits); then BLK, the block
+    // records of every level (V3B_FLOW's first region: per level l, direction d, slot p, gw_l*gh_l vec4 (vx, vy, cost, amb); gpu/V3.md
+    // section 4). Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. In the skeleton build
+    // (no estimate yet) everything is zero, except the flows of a recordDebugV3Inject, which FF and FD hold unchanged.
+    struct DebugV3Layout {
+        uint32_t W, H, fw, fh, bw, bh, fscale, nLevels;
+        uint32_t lw[16], lh[16], lgw[16], lgh[16];   // per level: size and 8x8 / 4x4 block grid (gpu/V3.md section 2)
+        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], size;   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
+    };
+    bool debugV3Layout(DebugV3Layout& l) const;
+    bool recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);
+    // recordDebugV3Inject(): records the V3 estimate with the flow SEARCH replaced by the caller's flows (as recordEstimate otherwise: same Frame
+    // rules, rings and UI plumbing; the next recordSynth(t) is the normal synthesis). f01 / f10: a VkBuffer (TRANSFER_SRC usage) holding fw*fh
+    // vec2 each (flow px, full prev->curr / curr->prev vectors on prev's / curr's grid, debugV3Layout's fw, fh) at the given byte offsets; the
+    // buffer must be alive until the record retires. In the skeleton build the flows are copied into FD[0..1] and FF[0..1]; the later steps
+    // run the estimate's tail (v3_dense in inject mode, occlusion, fill, enclose, decide) on them.
+    bool recordDebugV3Inject(VkCommandBuffer cb, Frame prev, Frame curr, VkBuffer flows, VkDeviceSize f01Off, VkDeviceSize f10Off);
+    // recordDebugV3Weights(): STUB until steps Y1/Y2 of gpu/V3.md (the weight stage's 28-float record per output pixel of a recordSynth(t)
+    // with mode bit 3). Returns false always for now.
+    bool recordDebugV3Weights(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t, VkBuffer dst, VkDeviceSize dstOffset);
 
     // Debug / test only (gpu/mltest.cpp): MotionVersion::Learned's internals, to verify the net against ml-fg's test vectors. Nothing
     // changes unless setDebugLearned() was called with a non-default value.
