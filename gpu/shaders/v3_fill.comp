@@ -60,7 +60,7 @@ void main() {
         for (int k = 0; k < 4; k++) {
             if (dist[k] <= 0) continue;
             const int qi = hit[k].y * pc.fw + hit[k].x;
-            const float w = (dist[k] > R_FILL ? 1.0 : exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0))) / (1.0 + float(dist[k]) * 0.125) / (1.0 + float(dist[k]) * 0.125);   // (tuning D5: squared, a far neighbour counts for little where a near one exists)
+            const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (dist[k] > R_FILL ? (1.0 / 30.0) : (1.0 / 24.0))) / (1.0 + float(dist[k]) * 0.125) / (1.0 + float(dist[k]) * 0.125);   // (tuning D5: squared, a far neighbour counts for little where a near one exists)
             const vec2 fv = fdAt(dir, qi);
             acc += w * fv;
             acc2 += w * dot(fv, fv);
