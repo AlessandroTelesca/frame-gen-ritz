@@ -54,6 +54,14 @@ wide_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DFG_MAXR=12', '--vn', '@BASENAME@_wide_spv', '-o', '@OUTPUT@', '@INPUT@'])
 wide_shaders = wide_gen.process('shaders/search.comp', 'shaders/v2_search.comp')
+# MotionVersion::V3 hook (j) (Settings::v3ColourWindow): the search and dense passes with the colour-similarity window weights, -DV3J=1, into
+# <name>_j_spv (v3_search_j, v3_search_top_j, v3_dense_j). The plain builds keep their SPIR-V (the switch off costs nothing).
+v3j_gen = generator(glslang,
+  output : '@BASENAME@_j_spv.h',
+  depfile : '@BASENAME@_j_spv.h.d',
+  arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+               '-DV3J=1', '--vn', '@BASENAME@_j_spv', '-o', '@OUTPUT@', '@INPUT@'])
+v3j_shaders = v3j_gen.process('shaders/v3_search.comp', 'shaders/v3_search_top.comp', 'shaders/v3_dense.comp')
 # The wide median histogram and the wide V2 Quality claims (reach settings off their defaults and a long vector): -DFG_WIDE=1,
 # into <name>_wide_spv as well (other basenames). The plain builds keep their SPIR-V.
 wide2_gen = generator(glslang,
@@ -85,7 +93,7 @@ foreach f : get_option('formats')
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, v3j_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

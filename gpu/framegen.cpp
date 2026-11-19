@@ -59,6 +59,9 @@
 #include "v3_search_top_spv.h"
 #include "v3_dense_spv.h"
 #include "v3_wide_spv.h"
+#include "v3_search_j_spv.h"
+#include "v3_search_top_j_spv.h"
+#include "v3_dense_j_spv.h"
 #include "v3_stats_spv.h"
 // (Y1: occlusion, fill, projection; the synthesis above is the real one)
 #include "v3_occl_spv.h"
@@ -576,6 +579,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD,
             // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
             P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
+            P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
@@ -1770,6 +1774,9 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V3_SEARCH].sp = SPV(v3_search);
         spv[P_V3_SEARCH_TOP].sp = SPV(v3_search_top);
         spv[P_V3_DENSE].sp = SPV(v3_dense);
+        spv[P_V3_SEARCH_J].sp = SPV(v3_search_j);
+        spv[P_V3_SEARCH_TOP_J].sp = SPV(v3_search_top_j);
+        spv[P_V3_DENSE_J].sp = SPV(v3_dense_j);
         spv[P_V3_WIDE].sp = SPV(v3_wide);
         spv[P_V3_STATS].sp = SPV(v3_stats);
         spv[P_V3_OCCL].sp = SPV(v3_occl);
@@ -2790,7 +2797,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         const MotionGroup& g = I.mo[(int)MotionVersion::V3];
         const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
         const bool inj = I.v3inj != nullptr;
-        const int hookJ = I.set.v3ColourWindow ? 1 : 0;   // (mode bit 0 of the search and dense passes: wired, a no-op until hook (j) is built)
+        const int hookJ = I.set.v3ColourWindow ? 1 : 0;   // hook (j): the search and dense passes of the colour-window build (P_V3_*_J); mode bit 0 stays set for them (they do not read it)
         V3PC v = r.v3pc();
         r.runV3(P_V3_PLANES, v, divUp(V.fw, I.set.flowScale == 4 ? 4 : 8), divUp(V.fh, I.set.flowScale == 4 ? 4 : 8));
         r.cbar();
@@ -2816,7 +2823,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                 const int its = (l >= 1 && l < V.n - 1) ? 2 : 1;
                 for (int it = 0; it < its; it++) {
                     sv.iter = it;
-                    r.runV3(l == V.n - 1 ? P_V3_SEARCH_TOP : P_V3_SEARCH, sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
+                    r.runV3(l == V.n - 1 ? (hookJ ? P_V3_SEARCH_TOP_J : P_V3_SEARCH_TOP) : (hookJ ? P_V3_SEARCH_J : P_V3_SEARCH), sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
                     r.cbar();
                 }
                 r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
@@ -2845,7 +2852,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         }
         V3PC dv = v;
         dv.mode = hookJ | (inj ? 4 : 0);   // dense: bit 0 hook (j), bit 1 also write FF (not since v3_fill writes it, step Y1), bit 2 inject
-        r.runV3(P_V3_DENSE, dv, divUp(V.fw + 4, 8), divUp(V.fh + 4, 8), 2);
+        r.runV3(hookJ ? P_V3_DENSE_J : P_V3_DENSE, dv, divUp(V.fw + 4, 8), divUp(V.fh + 4, 8), 2);
         r.cbar();
         r.stamp("dense");
         // Y1: forward-backward consistency, the garbage measure and the MAP word (e8, amb8, g8), then the vector fill into FF (section 3.9, 3.10)

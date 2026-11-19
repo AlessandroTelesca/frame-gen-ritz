@@ -2,7 +2,8 @@
 // rendered on the CPU (the two real frames, and the true in-between frame R_t for any t); V3's estimated flows (recordDebugV3) and its
 // in-between frames (recordSynth) are measured against them, once with V3's own estimate and once with the exact flows injected
 // (recordDebugV3Inject).
-//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--list]
+//   v3test [--size WxH] [--fs 1|2|4] [--scene NAME|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--colour-window] [--list]
+//     --colour-window   Settings::v3ColourWindow on (hook (j)); the pass marks stay the same (information with the hook on)
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.
 //     --fs     flowScale (1, 2 or 4; default 2)
@@ -636,6 +637,7 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 // --diag: where the wrong flow pixels (visible, error > 1 px) are, per layer: by distance to the nearest layer boundary of the source frame (flow px) and how many of them
 // carry another layer's true motion; --errmap PREFIX writes a PPM per direction (visible and right: dark grey, wrong: red, estimate = another layer's motion: yellow, not visible: black)
 static bool gDiag = false;
+static bool gColourWindow = false;   // --colour-window
 static std::string gErrMap;
 static bool gProfile = false;   // --profile: the occlusion ramp along the middle row (layers scenes)
 static std::string gSave;   // --save PREFIX: the scene's two real frames as raw RGBA (PREFIX-NAME-p.rgba, -c.rgba) for the other tools (fgtest, v3flow.py)
@@ -797,6 +799,7 @@ int main(int argc, char** argv) {
         else if (a == "--save" && i + 1 < argc) gSave = argv[++i];
         else if (a == "--sshare") gSShare = true;
         else if (a == "--profile") gProfile = true;
+        else if (a == "--colour-window") gColourWindow = true;
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
@@ -855,6 +858,7 @@ int main(int argc, char** argv) {
     info.viewFormat = VK_FORMAT_R8G8B8A8_UNORM; info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2;
     info.settings.motionVersion = framegen::MotionVersion::V3;
     info.settings.flowScale = (uint32_t)fs;
+    info.settings.v3ColourWindow = gColourWindow;
     if (!gFg.init(info)) { fprintf(stderr, "init failed: %s\n", gFg.initError() ? gFg.initError() : "?"); return 1; }
 
     printf("v3test %dx%d flowScale %d on %s%s\n", W, H, fs, props.deviceName, selfcheck ? " (selfcheck)" : "");

@@ -10,7 +10,12 @@
 //    vector, dMu), c_min = min; w_k = bil_k exp(-max(0, c_k - c_min) / TAU), v = sum w_k v_k / sum w_k, cost = c_min.
 //  - mode bit 2 (inject, tests only): FD already holds the caller's vector, the only candidate: its cost over the same window is written to MAP
 //    and nothing else changes.
-// mode bit 0 = hook (j) colour window (wired, a no-op).
+// Hook (j) (v3ColourWindow, the v3_dense_j build, V3J = 1): the 5x5 window's pixels carry the weight wgt = exp(-|colour(x) - colour(p)|_1 / 24) of the
+// role-0 frame's raw (Y, Cb, Cr) around the pixel p, and the window cost is sum(wgt t) / sum(wgt) (a pixel with no term does not count in either); the
+// 'half the window has a term' test stays on the unweighted count. The inject mode (tests) and the 4-vectors-agree branch (no cost map) are not weighted.
+#ifndef V3J
+#define V3J 0
+#endif
 #include "common.glsl"
 #include "v3_common.glsl"
 #include "v3_est.glsl"
@@ -52,6 +57,9 @@ float winCost(const V3Lv L, int fOff, int dir, vec2 dMu, ivec2 p, vec2 v) {
 }
 
 shared float tmap[4 * 144];   // per candidate: the matching term of every pixel of the tile with a 2 px apron (12x12), -1 = no term (outside)
+#if V3J
+shared vec3 tcol[144];        // the role-0 raw colour of every pixel of the tile with its apron (the weights' source)
+#endif
 
 void main() {
     const int dir = int(gl_WorkGroupID.z);
@@ -116,18 +124,43 @@ void main() {
             }
             tmap[idx] = t;
         }
+#if V3J
+        for (int idx = lid; idx < 144; idx += 64) {
+            const ivec2 x = to + ivec2(idx % 12, idx / 12);
+            tcol[idx] = (x.x >= 0 && x.y >= 0 && x.x < L.w && x.y < L.h) ? v3RawAt(L, dir, x) : vec3(0.0);
+        }
+#endif
         barrier();
         if (!inFrame) return;
         float c[4], cmin = 1e9;
+#if V3J
+        float cw[25];   // the window's colour weights around this pixel (the same for the 4 vectors)
+        {
+            const vec3 cen = tcol[(lp.y + 2) * 12 + lp.x + 2];
+            for (int j = 0; j < 5; j++)
+                for (int i = 0; i < 5; i++) cw[j * 5 + i] = v3ColourWgt(tcol[(lp.y + j) * 12 + lp.x + i], cen);
+        }
+#endif
         for (int k = 0; k < 4; k++) {
             if (rep[k] != k) { c[k] = c[rep[k]]; continue; }
             float s = 0.0, n = 0.0;
+#if V3J
+            float ws = 0.0;
+#endif
             for (int j = 0; j < 5; j++)
                 for (int i = 0; i < 5; i++) {
                     const float t = tmap[k * 144 + (lp.y + j) * 12 + lp.x + i];
+#if V3J
+                    if (t >= 0.0) { s += cw[j * 5 + i] * t; ws += cw[j * 5 + i]; n += 1.0; }
+#else
                     if (t >= 0.0) { s += t; n += 1.0; }
+#endif
                 }
+#if V3J
+            c[k] = (n >= 12.5 && ws > 0.0) ? min(s / ws, BAD) : BAD;
+#else
             c[k] = n >= 12.5 ? min(s / n, BAD) : BAD;
+#endif
             cmin = min(cmin, c[k]);
         }
         for (int k = 0; k < 4; k++) cmin = min(cmin, c[k]);

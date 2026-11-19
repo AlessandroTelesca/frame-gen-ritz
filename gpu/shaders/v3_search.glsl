@@ -1,6 +1,11 @@
 // The body of v3_search.comp / v3_search_top.comp (gpu/V3.md section 3.5): V3S_TOP = 1 builds the top level's exhaustive search (the only level
 // that needs the patch in shared memory: kept out of the other pipeline, whose workgroup occupancy depends on its shared memory), 0 the
 // candidate search of the other levels. Both include the Lucas-Kanade refinement of level 0 (a one-level pyramid has its level 0 at the top).
+// V3J = 1 (the v3_search_j / v3_search_top_j builds, Settings::v3ColourWindow, gpu/V3.md hook (j)): every window pixel carries the weight
+// wgt = exp(-|colour(x) - colour(centre)|_1 / 24) of the role-0 frame's raw (Y, Cb, Cr) and the cost is sum(wgt term) / sum(wgt). V3J = 0 is the unchanged plain build.
+#ifndef V3J
+#define V3J 0
+#endif
 #include "common.glsl"
 #include "v3_common.glsl"
 #include "v3_est.glsl"
@@ -21,6 +26,10 @@ shared int cflag[16];
 shared float cres[16], cpur[16];   // total (with the prior) and pure cost of each candidate
 shared ivec2 refV;
 shared float pSum[64], pCnt[64];
+#if V3J
+shared float sw[64];       // hook (j): the window pixel's colour weight (0 outside the level)
+shared float pWgt[64];
+#endif
 shared float red[5 * 64];
 #if V3S_TOP
 shared float topc[289];
@@ -43,24 +52,41 @@ vec2 recXY(int i) { return vec2(fl[i], fl[i + 1]); }
 void evalRound() {
     const int c = tid >> 2, q = tid & 3;
     float s = 0.0, n = 0.0;
+#if V3J
+    float wsum = 0.0;
+#endif
     if ((cflag[c] & 1) != 0) {
         const ivec2 v = cv[c];
         // (branch-free: the taps are always read, clamped into the level, and masked, so that the loads of the 16 pixels are issued together)
         for (int k = q * 16; k < q * 16 + 16; k++) {
             const ivec2 t = wo + ivec2(k & 7, k >> 3) + v;
             const float ok = (sval[k] != 0 && inside(t)) ? 1.0 : 0.0;
+#if V3J
+            const float tm = v3Term(sf[k], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
+            s += ok * sw[k] * tm;
+            wsum += ok * sw[k];
+#else
             s += ok * v3Term(sf[k], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
+#endif
             n += ok;
         }
     }
     pSum[tid] = s;
     pCnt[tid] = n;
+#if V3J
+    pWgt[tid] = wsum;
+#endif
     barrier();
     if (tid < 16) {
         const float S = pSum[4 * tid] + pSum[4 * tid + 1] + pSum[4 * tid + 2] + pSum[4 * tid + 3];
         const float N = pCnt[4 * tid] + pCnt[4 * tid + 1] + pCnt[4 * tid + 2] + pCnt[4 * tid + 3];
         float cost = BAD;
+#if V3J
+        const float Wt = pWgt[4 * tid] + pWgt[4 * tid + 1] + pWgt[4 * tid + 2] + pWgt[4 * tid + 3];
+        if ((cflag[tid] & 1) != 0 && N * 2.0 >= float(nWin) && N > 0.0 && Wt > 0.0) cost = S / Wt;
+#else
         if ((cflag[tid] & 1) != 0 && N * 2.0 >= float(nWin) && N > 0.0) cost = S / N;
+#endif
         const ivec2 d = abs(cv[tid] - refV);
         cpur[tid] = cost;
         cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9));
@@ -131,12 +157,21 @@ float costAt(vec2 v) {
     if (tid < 64 && sval[tid] != 0) {
         const vec2 tq = vec2(wo + ivec2(tid & 7, tid >> 3)) + v;
         if (insideF(tq)) {
+#if V3J
+            a[0] = sw[tid] * v3Term(sf[tid], v3FeatBil(L, fOff, f1, tq), dMu);
+            a[2] = sw[tid];
+#else
             a[0] = v3Term(sf[tid], v3FeatBil(L, fOff, f1, tq), dMu);
+#endif
             a[1] = 1.0;
         }
     }
     reduce5(a);
+#if V3J
+    return (a[1] * 2.0 >= float(nWin) && a[1] > 0.0 && a[2] > 0.0) ? a[0] / a[2] : BAD;
+#else
     return (a[1] * 2.0 >= float(nWin) && a[1] > 0.0) ? a[0] / a[1] : BAD;
+#endif
 }
 
 // Lucas-Kanade sub-pixel refinement (section 3.5, level 0): 2 iterations, each accepted only if the cost falls
@@ -152,7 +187,11 @@ vec2 lk(ivec2 v0, inout float cost) {
                 const vec4 gy = v3FeatBil(L, fOff, f1, tq + vec2(0.0, 0.5)) - v3FeatBil(L, fOff, f1, tq - vec2(0.0, 0.5));
                 vec4 r = sf[tid] - dMu.y * g;
                 r.w += dMu.x;
+#if V3J
+                const vec4 wx = (sw[tid] * V3_CW) * dMu.y * gx, wy = (sw[tid] * V3_CW) * dMu.y * gy;
+#else
                 const vec4 wx = V3_CW * dMu.y * gx, wy = V3_CW * dMu.y * gy;
+#endif
                 a[0] = dot(wx, dMu.y * gx); a[1] = dot(wx, dMu.y * gy); a[2] = dot(wy, dMu.y * gy);
                 a[3] = dot(wx, r); a[4] = dot(wy, r);
             }
@@ -218,6 +257,16 @@ void main() {
             sf[tid] = in_ ? v3FeatAt(L, fOff, f0, x) : vec4(0.0);
         }
         nWin = (min(wo.x + 8, L.w) - max(wo.x, 0)) * (min(wo.y + 8, L.h) - max(wo.y, 0));
+#if V3J
+        // hook (j): the weights, once per block, from the role-0 frame's raw planes; the centre colour = the mean of the 4 pixels at the middle of the window
+        // (the block's centre: window pixels 3..4 in x and y), clamped into the level
+        if (tid < 64) {
+            const ivec2 x = wo + ivec2(tid & 7, tid >> 3);
+            const ivec2 cc = wo + 3;
+            const vec3 cen = 0.25 * (v3RawC(L, f0, cc) + v3RawC(L, f0, cc + ivec2(1, 0)) + v3RawC(L, f0, cc + ivec2(0, 1)) + v3RawC(L, f0, cc + 1));
+            sw[tid] = inside(x) ? v3ColourWgt(v3RawAt(L, f0, x), cen) : 0.0;
+        }
+#endif
     }
     barrier();
 
@@ -237,14 +286,26 @@ void main() {
             if (idx >= 289) break;
             const ivec2 v = ivec2(idx % 17 - 8, idx / 17 - 8);
             float s = 0.0, n = 0.0;
+#if V3J
+            float wsum = 0.0;
+#endif
             for (int i = 0; i < 64; i++) {
                 const ivec2 d = ivec2(i & 7, i >> 3);
                 const float ok = (sval[i] != 0 && inside(wo + d + v)) ? 1.0 : 0.0;
                 const uvec2 pk = spatch[(d.y + v.y + 8) * 24 + d.x + v.x + 8];
+#if V3J
+                s += ok * sw[i] * v3Term(sf[i], vec4(unpackHalf2x16(pk.x), unpackHalf2x16(pk.y)), dMu);
+                wsum += ok * sw[i];
+#else
                 s += ok * v3Term(sf[i], vec4(unpackHalf2x16(pk.x), unpackHalf2x16(pk.y)), dMu);
+#endif
                 n += ok;
             }
+#if V3J
+            topc[idx] = (n * 2.0 >= float(nWin) && n > 0.0 && wsum > 0.0) ? s / wsum + 0.002 * float(abs(v.x) + abs(v.y)) : BAD;
+#else
             topc[idx] = (n * 2.0 >= float(nWin) && n > 0.0) ? s / n + 0.002 * float(abs(v.x) + abs(v.y)) : BAD;
+#endif
         }
         barrier();
         if (tid < 64) {   // each of 64 threads takes the best of its 5 candidates (idx = tid + 64 k)

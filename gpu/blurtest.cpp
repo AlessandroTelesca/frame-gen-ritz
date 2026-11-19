@@ -246,11 +246,12 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 // --algo: the motion version every Interpolator of the run is created and set with
 #ifndef BLURTEST_NO_MOTION
 static MotionVersion gAlgo = MotionVersion::V1;
+static bool gColourWindow = false;   // --colour-window: Settings::v3ColourWindow (V3 hook (j)) on in every instance
 static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
 static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; s.v3ColourWindow = gColourWindow; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -1016,13 +1017,14 @@ int main(int argc, char** argv) {
             else if (!strcmp(a, "performance")) gMode = V2Mode::Performance;
             else { fprintf(stderr, "--mode quality|performance\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--colour-window")) gColourWindow = true;
         else if (!strcmp(argv[i], "--zt") && i + 1 < argc) gZt = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--guard") && i + 1 < argc) gGuard = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3\n"); return 2; } }
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [--colour-window] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
