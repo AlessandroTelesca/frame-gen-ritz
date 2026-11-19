@@ -95,7 +95,7 @@ void evalRound() {
             const float ev = v3HudEv(float(blkDetU) * (1.0 / 256.0) / float(max(nWin, 1)));
             bon = pc.hudB * ev * v3HudAbs(cost) * v3HudGate(length(vec2(refV)) * float((1 << pc.lvl) * pc.fscale));
         }
-        cres[tid] = cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9)) - bon;
+        cres[tid] = (cflag[tid] & 8) != 0 ? 1e9 : cost + ((cflag[tid] & 2) != 0 ? 0.0 : min(V3_LAMBDA * float(d.x + d.y), (cflag[tid] & 4) != 0 ? V3_DOMCAP : 1e9)) - bon;
     }
     barrier();
 }
@@ -441,7 +441,7 @@ void main() {
                 const ivec2 o = tid == 0 ? ivec2(0) : tid == 1 ? ivec2(-1, 0) : tid == 2 ? ivec2(1, 0) : tid == 3 ? ivec2(0, -1) : ivec2(0, 1);
                 v = parentVec(Lp, pfin, pb + o);
                 fg = tid == 0 ? 3 : 1;
-            } else if (tid == 5 && pc.hudB > 0.0) { fg = 1; }   // task 105: the zero vector (level 0 has no zero candidate otherwise)
+            } else if (tid == 5 && pc.hudB > 0.0) { fg = 9; }   // task 105: the zero vector, measured only (cflag bit 3: never chosen; its cost is the block's evidence for the dense pass). As a candidate it let a static inpainted patch pull the blocks around it to zero (uitest, CrosshairV2)
             cv[tid] = v;
             cflag[tid] = fg;
         }

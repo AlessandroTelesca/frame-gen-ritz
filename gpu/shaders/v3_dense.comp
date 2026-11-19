@@ -130,15 +130,15 @@ void main() {
         if (!inFrame) return;
         for (int k = 0; k < 4; k++) { v += bwt[k] * rec[k].xy; cost += bwt[k] * rec[k].z; }
         if (needZ) {   // task 105: against the blocks' cost (the vectors agree: no per-pixel costs of them)
-            float zs = 0.0, nz = 0.0, c0 = BAD, det = 0.0;
+            float zs = 0.0, nz = 0.0, c0 = BAD, det = 0.0, nm = 0.0;
             for (int j = 0; j < 5; j++)
                 for (int i = 0; i < 5; i++) {
                     const float t = zmap[(lp.y + j) * 12 + lp.x + i];
-                    if (t >= 0.0) { zs += t; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+                    if (t >= 0.0) { zs += t; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; nm += t < pc.hp[1] ? 1.0 : 0.0; }
                 }
             if (nz >= 12.5) {
                 c0 = min(zs / nz, BAD);
-                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_D0, V3H_D0 + 1.5, cost - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
+                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_FR0, V3H_FR1, nm / nz) * smoothstep(V3H_D0, V3H_D0 + 1.5, cost - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
                 v *= 1.0 - z;
                 cost = mix(cost, c0, z);
             }
@@ -214,19 +214,19 @@ void main() {
         v /= ws;
         cost = cmin;
         if (needZ) {   // task 105: the zero vector against the best of the 4 (same window, same weights)
-            float zs = 0.0, nz = 0.0, det = 0.0, wz = 0.0;
+            float zs = 0.0, nz = 0.0, det = 0.0, wz = 0.0, nm = 0.0;
             for (int j = 0; j < 5; j++)
                 for (int i = 0; i < 5; i++) {
                     const float t = zmap[(lp.y + j) * 12 + lp.x + i];
 #if V3J
-                    if (t >= 0.0) { zs += cw[j * 5 + i] * t; wz += cw[j * 5 + i]; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+                    if (t >= 0.0) { zs += cw[j * 5 + i] * t; wz += cw[j * 5 + i]; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; nm += t < pc.hp[1] ? 1.0 : 0.0; }
 #else
-                    if (t >= 0.0) { zs += t; wz += 1.0; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; }
+                    if (t >= 0.0) { zs += t; wz += 1.0; det += dmap[(lp.y + j) * 12 + lp.x + i]; nz += 1.0; nm += t < pc.hp[1] ? 1.0 : 0.0; }
 #endif
                 }
             if (nz >= 12.5 && wz > 0.0) {
                 const float c0 = min(zs / wz, BAD);
-                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_D0, V3H_D0 + 1.5, cmin - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
+                const float z = v3HudEv(det / nz) * v3HudAbs(c0) * smoothstep(V3H_FR0, V3H_FR1, nm / nz) * smoothstep(V3H_D0, V3H_D0 + 1.5, cmin - (c0 - pc.hudB)) * v3HudGate(length(v) * float(pc.fscale));
                 v *= 1.0 - z;
                 cost = mix(cost, c0, z);
             }
