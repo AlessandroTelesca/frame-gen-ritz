@@ -75,7 +75,7 @@ Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 
 | `v3ColourWindow` | false | Experimental, off by default: weights the matching windows of the estimate by colour similarity to the block's centre. Applies from the next estimate; with it off the output is byte-identical to V3 without it. About +0.05 ms (1080p, `flowScale` 2). Measured: it sharpens a moving object of clear colour against a busy background (cs2a +0.3 dB) but breaks areas next to large flat dark regions (bf900 -1.1 dB) and makes the synthetic two-layer scenes slightly worse. An experiment for the eye. |
 | `v3DetailSplit` | false | Experimental, off by default: in the synthesis the blend keeps the coarse picture and the fine detail comes from the single frame with the largest weight (the later one at a tie); it fades out where the smear acts. Applies from the next synth; with it off the output is byte-identical to V3 without it. About +0.06 ms per generated frame. Measured: closes about 9 % of the sharpness gap to the real middle frame, -0.03 dB PSNR, flicker +0.1 to +0.6 %; a subtle effect. |
 
-V3 ignores `trustLow`, `trustHigh`, `sceneCutSad`, `hudBonus`, `smoothBonus`, `searchPenalty`, `searchRadius`, `searchRadiusTop`, `pyramidMinSide` and `subpixel`; it honours `flowScale`, `globalFallback` (as the "estimate failed" threshold), `v2StaticMask`, the `ui*` settings and `blurSamples`. All V3 settings are runtime.
+V3 ignores `trustLow`, `trustHigh`, `sceneCutSad`, `smoothBonus`, `searchPenalty`, `searchRadius`, `searchRadiusTop`, `pyramidMinSide` and `subpixel`; it honours `flowScale`, `hudBonus` (a bonus for the zero vector where the two frames agree and the surroundings move; see INTEGRATION.md), `globalFallback` (as the "estimate failed" threshold), `v2StaticMask`, the `ui*` settings and `blurSamples`. All V3 settings are runtime.
 
 Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N-1 synths), Battlefield frames 100 / 101 (fast) and 400 / 401 (calm); runs differ by about 3 %:
 
@@ -186,7 +186,7 @@ Full contract, the threshold table per format, build and gamescope notes: INTEGR
 
 ## Static UI protection
 
-A crosshair, a minimap frame or a health bar is static while the picture behind it moves. In a block-based motion search such a pixel shares its block with moving background, so either the crosshair is dragged along or the background around it freezes. `hudBonus` (zero-vector bias) only trades one for the other. Static UI protection removes the problem at the source, per pixel, and belongs in the library so that any host gets it by flipping one setting:
+A crosshair, a minimap frame or a health bar is static while the picture behind it moves. In a block-based motion search such a pixel shares its block with moving background, so either the crosshair is dragged along or the background around it freezes. `hudBonus` (zero-vector bias) only trades one for the other (under V3 it acts on evidence only, so it steadies HUD without freezing slow motion, but it fixes little of what a fast background does to a radar or minimap). Static UI protection removes the problem at the source, per pixel, and belongs in the library so that any host gets it by flipping one setting:
 
 - **Detect** (every real frame, `recordObserve`): a pixel is *still* when no channel moved more than `uiStillThreshold` (3.5 levels) since the previous real frame. After `uiStillFrames` (8) consecutive still frames it is masked; the mask is dilated by 2 px (1 px fully, the second px at half weight) to catch anti-aliased rims. The comparison is always against the previous *original*, never against the inpainted copy.
 - **Inpaint**: the library keeps its own "clean" copy of each real frame. Every masked pixel in it is replaced by the 1/d²-weighted average of the first unmasked pixel along each of 8 directions (reach `uiInpaintReach`, 12 px). The motion estimate and the warps run on the clean copies and never see the UI.
@@ -358,7 +358,7 @@ for (int k = 1; k < N; ++k)
 | `trustLow`, `trustHigh` | 12, 40 | Mismatch (8-bit levels) where the per-pixel fallback to the nearer real frame starts and where it is complete. Lower = fewer ghosts, more held pixels. |
 | `globalFallback` | 0.15 | Share of untrusted pixels above which the whole frame is the nearer real frame. 1 = off. |
 | `sceneCutSad` | 30 | Mean block SAD above which a pair counts as a scene cut. 255 = off. |
-| `hudBonus` | 1.0 | Zero-vector bonus that keeps static HUD elements in place. Too high can freeze slow motion. 0 = off. |
+| `hudBonus` | 1.0 | Zero-vector bonus that keeps static HUD elements in place. Too high can freeze slow motion. 0 = off. V1 and V3 (V2 ignores it); in V3 it acts only on evidence of stillness (see INTEGRATION.md). |
 | `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
 | `searchRadius` | 2 | Motion search: integer vectors tried within ± this many pixels of the seed on every pyramid level below the coarsest. 1-12. V1 and V2 (both modes); `Learned` and V3 ignore it. Runtime. Above 6 it runs a wider search shader and costs more. |
