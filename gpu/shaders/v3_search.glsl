@@ -77,20 +77,32 @@ void best(int n, out ivec2 v, out float tot, out float pure) {
     v = cv[bi]; tot = bt; pure = cpur[bi];
 }
 
-// the ring: the 8 integer neighbours of v, one round; v / tot / pure become the better of v and them
-void ring(inout ivec2 v, inout float tot, inout float pure) {
+// the ring: the 8 integer neighbours of v, one round; v / tot / pure become the better of v and them. With probes (level 1, iteration 1) the same round also
+// evaluates the 8 ambiguity probes around the incoming v (+-6 and +-12 level px along x, then along y; only windows wholly inside the level) and returns
+// the pure cost of the best probe along x and along y (BAD: none)
+void ring(inout ivec2 v, inout float tot, inout float pure, bool probes, out float pmx, out float pmy) {
     if (tid < 16) {
-        const int k = tid < 4 ? tid : tid + 1;   // the 3x3 without its centre (4)
-        cv[tid] = v + ivec2(k % 3 - 1, k / 3 - 1);
-        cflag[tid] = tid < 8 ? 1 : 0;
+        if (tid < 8) {
+            const int k = tid < 4 ? tid : tid + 1;   // the 3x3 without its centre (4)
+            cv[tid] = v + ivec2(k % 3 - 1, k / 3 - 1);
+            cflag[tid] = 1;
+        } else {
+            const int k = tid - 8, mag = (k & 1) != 0 ? 12 : 6, sg = (k & 2) != 0 ? -1 : 1;
+            cv[tid] = v + ((k >> 2) == 0 ? ivec2(sg * mag, 0) : ivec2(0, sg * mag));
+            const ivec2 tw = wo + cv[tid];   // a probe window that is clipped by the level's border matches on fewer pixels and is not comparable
+            cflag[tid] = (probes && all(greaterThanEqual(tw, ivec2(0))) && all(lessThan(tw + 7, ivec2(L.w, L.h)))) ? 1 : 0;
+        }
     }
     barrier();
     evalRound();
     ivec2 rv; float rt, rp;
     best(8, rv, rt, rp);
+    pmx = BAD; pmy = BAD;
+    for (int i = 0; i < 4; i++) { pmx = min(pmx, cpur[8 + i]); pmy = min(pmy, cpur[12 + i]); }
     if (rt < tot) { v = rv; tot = rt; pure = rp; }
     barrier();
 }
+void ring(inout ivec2 v, inout float tot, inout float pure) { float a, b; ring(v, tot, pure, false, a, b); }
 
 // the sum of 5 values per thread over the 64 threads (the result in every thread): 5 x 8 partial sums of 8, then 8 per value
 shared float redp[40];
@@ -329,19 +341,24 @@ void main() {
         evalRound();
         best(16, bv, bTot, bPure);
         barrier();
-        ring(bv, bTot, bPure);
+        float pmx = BAD, pmy = BAD;
+        ring(bv, bTot, bPure, l == 1, pmx, pmy);
         slot = 1;
-        if (l == 1) {   // the ambiguity probes (section 3.6): the final vector shifted by 4 / 8 / 12 level px along x and y; the pure cost of the best of them
-            if (tid < 16) {
-                const int k = tid % 12, ax_ = k / 6, m = k % 6, mag = 4 * (m / 2 + 1), sg = (m & 1) != 0 ? -1 : 1;
-                cv[tid] = bv + (ax_ == 0 ? ivec2(sg * mag, 0) : ivec2(0, sg * mag));
-                cflag[tid] = tid < 12 ? 1 : 0;
+        if (l == 1) {   // the ambiguity probes (section 3.5, As built E2): amb from how much worse the best probe along each axis is than the final vector
+            // the structure of the window along x and y: the mean weighted absolute difference of neighbouring high-pass features. A probe along an axis along which the
+            // window has no structure (a line pattern shifted along its lines: the aperture problem, or a flat wall) matches as well as the best by construction: it
+            // says nothing, so that axis counts with the weight smoothstep(0.6, 1.4, structure)
+            float ea[5] = float[5](0.0, 0.0, 0.0, 0.0, 0.0);
+            if (tid < 64 && sval[tid] != 0) {
+                const int ix = tid & 7, iy = tid >> 3;
+                if (ix < 7 && sval[tid + 1] != 0) { ea[0] = dot(abs(sf[tid].xyz - sf[tid + 1].xyz), V3_CW.xyz); ea[2] = 1.0; }
+                if (iy < 7 && sval[tid + 8] != 0) { ea[1] = dot(abs(sf[tid].xyz - sf[tid + 8].xyz), V3_CW.xyz); ea[3] = 1.0; }
             }
-            barrier();
-            evalRound();
-            float pm = BAD;
-            for (int i = 0; i < 12; i++) pm = min(pm, cpur[i]);
-            amb = pm < BAD ? 1.0 - smoothstep(0.5, 3.0, pm - bPure) : 0.0;
+            reduce5(ea);
+            const vec2 gs = vec2(ea[0] / max(ea[2], 1.0), ea[1] / max(ea[3], 1.0));
+            const float ax0 = pmx < BAD ? (1.0 - smoothstep(0.12, 0.40, (pmx - bPure) / max(pmx, 0.5))) * smoothstep(0.6, 1.4, gs.x) : 0.0;
+            const float ay0 = pmy < BAD ? (1.0 - smoothstep(0.12, 0.40, (pmy - bPure) / max(pmy, 0.5))) * smoothstep(0.6, 1.4, gs.y) : 0.0;
+            amb = max(ax0, ay0);
         }
     } else {   // level 0 below a coarser level
         const V3Lv Lp = v3Lv(1);

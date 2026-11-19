@@ -24,7 +24,7 @@ shared float gc[16];
 shared int gi[16];
 shared ivec2 bestV;
 shared float bestC;
-shared float rc[8];
+shared float rc[9];
 
 int tid, dir, f0, f1, fOff, nWin;
 ivec2 wo;
@@ -46,18 +46,31 @@ float cost(ivec2 v) {
     return (n * 2.0 >= float(nWin) && n > 0.0) ? s / n : BAD;
 }
 
-// the 8 neighbours of c at stride 1: threads 0..7 evaluate one each; bestV / bestC become the better of c (cost cc) and them
-void refine(ivec2 c, float cc) {
-    if (tid < 8) {
-        const int k = tid < 4 ? tid : tid + 1;
+// the same on every second pixel in x and y (16 taps): stage A's coarse screening
+float costSub(ivec2 v) {
+    float s = 0.0, n = 0.0;
+    for (int k = 0; k < 16; k++) {
+        const int p = (k & 3) * 2 + (k >> 2) * 16;
+        const ivec2 t = wo + ivec2(p & 7, p >> 3) + v;
+        const float ok = (sval[p] != 0 && inside(t)) ? 1.0 : 0.0;
+        s += ok * v3Term(sf[p], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
+        n += ok;
+    }
+    return (n * 8.0 >= float(nWin) && n > 0.0) ? s / n : BAD;
+}
+
+// c and its 8 neighbours at stride 1 with the full window: threads 0..8 evaluate one each; bestV / bestC become the best of them (c on a tie)
+void refine(ivec2 c) {
+    if (tid < 9) {
+        const int k = tid == 0 ? 4 : tid <= 4 ? tid - 1 : tid;   // the centre first, then the 3x3 without it
         rc[tid] = cost(c + ivec2(k % 3 - 1, k / 3 - 1));
     }
     barrier();
     if (tid == 0) {
         ivec2 bv = c;
-        float bc = cc;
-        for (int i = 0; i < 8; i++) {
-            const int k = i < 4 ? i : i + 1;
+        float bc = rc[0];
+        for (int i = 1; i < 9; i++) {
+            const int k = i <= 4 ? i - 1 : i;
             if (rc[i] < bc) { bc = rc[i]; bv = c + ivec2(k % 3 - 1, k / 3 - 1); }
         }
         bestV = bv; bestC = bc;
@@ -112,7 +125,7 @@ void main() {
     int bidx = 0;
     for (int idx = tid; idx < 625; idx += 256) {
         const ivec2 v = ivec2(idx % 25 - 12, idx / 25 - 12) * 2;
-        const float c = cost(v);
+        const float c = costSub(v);
         const float cb = c < BAD ? c + 0.002 * float(abs(v.x) + abs(v.y)) : c;   // ties (flat blocks) settle at the shorter vector
         if (cb < bm) { bm = cb; bidx = idx; }
     }
@@ -137,8 +150,8 @@ void main() {
     }
     barrier();
     // stage B: two refinements of +-1
-    refine(bestV, bestC);
-    refine(bestV, bestC);
+    refine(bestV);
+    refine(bestV);
     if (tid == 0 && bestC < c0 - WIDE_MARGIN && bestC < WIDE_RATIO * c0) {
         fl[ro] = float(bestV.x); fl[ro + 1] = float(bestV.y); fl[ro + 2] = min(bestC, 255.0); fl[ro + 3] = 0.5;
         atomicAdd(ax[gOff() + G_WIDE_REPLACED], 1u);

@@ -6,7 +6,7 @@
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.
 //     --fs     flowScale (1, 2 or 4; default 2)
-//     --scene  shift | zoom | rotate | layers | fade | all (default all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
+//     --scene  shift | zoom | rotate | layers | fade | stripes | all (default all; stripes = repetitive texture, informational, not in all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
 //     --t      times of the in-between frames measured (default 0.25,0.5)
 //     --report-only   always exit 0 (until the later steps of V3 make the metrics pass)
 //     --selfcheck     verify the tool itself instead of V3: (i) the CPU warp of prev by the exact F10 (and of curr by F01) reproduces curr (prev)
@@ -68,6 +68,7 @@ struct Layer {
     double mcx = 0, mcy = 0, mhw = 0, mhh = 0;      // centre and half sizes of the mask
     double px = 0, py = 0;                          // pivot (layer coordinates = screen coordinates at tau = 0)
     double scaleRate = 0, rotDeg = 0, shx = 0, shy = 0;
+    double period = 0;                              // > 0: the texture is modulated by vertical stripes of this period (px): a repetitive structure (the probes' test)
     uint32_t seed = 1;
     V2 toScreen(double tau, V2 u) const {
         const double s = 1.0 + scaleRate * tau, th = rotDeg * tau * M_PI / 180.0, c = std::cos(th), sn = std::sin(th);
@@ -92,6 +93,7 @@ struct Layer {
         for (int c = 0; c < 3; c++) {
             float s = 0.5f;
             for (int o = 0; o < 6; o++) s += amp[o] * (vnoise(x, y, lam[o], seed * 977u + (uint32_t)(c * 31 + o)) - 0.5f);
+            if (period > 0) s = 0.35f * s + 0.65f * (0.5f + 0.5f * std::cos(6.2831853f * x / (float)period));
             v[c] = std::min(255.0f, std::max(0.0f, 28.0f + 200.0f * s));
         }
         // sharp-edged rectangles and ellipses, one candidate per 96 px cell (up to 40 px half size: neighbours' too)
@@ -302,6 +304,12 @@ static std::vector<Scene> makeScenes(const std::string& which, int W, int H) {
             sc.layers = {bg, fg};
             add(sc);
         }
+    }
+    if (which == "stripes") {   // not in "all": a repetitive texture (vertical stripes of 24 px over the noise) shifted by 2.5 periods; the flow may be wrong (informational), the ambiguity is the point
+        Scene sc; sc.name = name("stripes", 60, 8);
+        Layer l = plane(1, cx, cy); l.shx = 60 * k; l.shy = 8 * k; l.period = 24;
+        sc.layers = {l};
+        add(sc);
     }
     if (want("fade")) {
         Scene sc; sc.name = name("fade", 120, 60); sc.fade = true;
@@ -681,7 +689,7 @@ int main(int argc, char** argv) {
         else if (a == "--blk" && i + 1 < argc) gBlkLevel = atoi(argv[++i]);
         else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
         else if (a == "--list") list = true;
-        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
+        else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
     if ((fs != 1 && fs != 2 && fs != 4) || W < 16 || H < 16) { fprintf(stderr, "--fs 1|2|4, --size at least 16x16\n"); return 2; }
     for (double t : ts) if (!(t > 0.0 && t < 1.0)) { fprintf(stderr, "--t: times in (0, 1)\n"); return 2; }
@@ -810,6 +818,26 @@ int main(int argc, char** argv) {
                     printf("%-20s stats check: %s   %s\n", nm.c_str(), msg, ok ? "PASS" : "FAIL");
                     verdict(ok, true);
                 }
+            }
+            {   // the ambiguity measure of the level-0 blocks (the level-1 probes' result), over the visible blocks: share above 0.5, and the same over the blocks whose vector is right
+                const int gw = est.L.lgw[0], gh = est.L.lgh[0];
+                printf("%-20s amb   ", nm.c_str());
+                for (int d = 0; d < 2; d++) {
+                    const float* r = (const float*)(est.dump.data() + est.L.blkLevel[0] + (size_t)(d * 2) * gw * gh * 16);
+                    size_t n = 0, hi = 0, nOk = 0, hiOk = 0, hiBad = 0;
+                    for (int by = 0; by < gh; by++)
+                        for (int bx = 0; bx < gw; bx++) {
+                            const int mx = std::min(F.fw - 1, bx * 8 + 4), my = std::min(F.fh - 1, by * 8 + 4);
+                            const size_t i = (size_t)my * F.fw + mx;
+                            if (!(d ? F.vis10 : F.vis01)[i]) continue;
+                            const float* q = r + 4 * (by * gw + bx);
+                            const std::vector<float>& tr = d ? F.f10 : F.f01;
+                            const bool right = F.fs * std::hypot(q[0] - tr[2 * i], q[1] - tr[2 * i + 1]) <= 1.0;
+                            n++; hi += q[3] > 0.5f; nOk += right; hiOk += right && q[3] > 0.5f; hiBad += !right && q[3] > 0.5f;
+                        }
+                    printf(" %s: %.1f%% of visible blocks above 0.5 (%.1f%% of the right ones, %.1f%% of the wrong ones)", d ? "F10" : "F01", n ? 100.0 * hi / n : 0.0, nOk ? 100.0 * hiOk / nOk : 0.0, n > nOk ? 100.0 * hiBad / (n - nOk) : 0.0);
+                }
+                printf("\n");
             }
             if (gBlkLevel >= 0 && (uint32_t)gBlkLevel < est.L.nLevels) {   // --blk L: the block records of level L, F01 slot 0 and slot 1 (vx,vy / cost / amb%)
                 const int l = gBlkLevel, gw = est.L.lgw[l], gh = est.L.lgh[l];

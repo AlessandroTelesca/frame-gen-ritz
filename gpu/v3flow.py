@@ -27,6 +27,19 @@ def load(path):
     for name in ("map0", "map1", "s"):
         out[name] = np.frombuffer(raw, np.uint32, n, o).reshape(fh, fw)
         o += n * 4
+    # BLK of every level (4 arrays of gw*gh vec4 per level: dir 0 slot 0, dir 0 slot 1, dir 1 slot 0, dir 1 slot 1), then (step E2) the first 64 words of G
+    lw, lh = fw, fh
+    blk = []
+    for lv in range(out["levels"]):
+        bs = 8 if lv == 0 else 4
+        gw, gh = (lw + bs - 1) // bs, (lh + bs - 1) // bs
+        a = np.frombuffer(raw, np.float32, 4 * gw * gh * 4, o).reshape(4, gh, gw, 4)
+        blk.append(a)
+        o += 4 * gw * gh * 16
+        lw, lh = (lw + 1) // 2 if lw % 2 == 0 else lw // 2 + (lw // 2) % 2, (lh + 1) // 2 if lh % 2 == 0 else lh // 2 + (lh // 2) % 2
+    out["blk"] = blk
+    if len(raw) >= o + 256:
+        out["g"] = np.frombuffer(raw, np.uint32, 64, o)
     return out
 
 
@@ -58,6 +71,15 @@ def stats(path):
     for name, m in (("F01", d["map0"]), ("F10", d["map1"])):
         c = (m & 255).astype(np.float32) / 8
         print(f"  {name} match cost: mean {c.mean():.2f} p50 {np.median(c):.2f} p95 {np.percentile(c, 95):.2f} levels, share >= 18 {float((c >= 18).mean()) * 100:.1f}%")
+    g = d.get("g")
+    if g is not None:
+        gf = g.view(np.float32)
+        doms = [f"({gf[8 + 2 * k]:.1f},{gf[9 + 2 * k]:.1f})" for k in range(4) if g[6] & (1 << k)]
+        aff = f"dx = {gf[16]:.2f} {gf[17]:+.2f} X {gf[18]:+.2f} Y, dy = {gf[19]:.2f} {gf[20]:+.2f} X {gf[21]:+.2f} Y" if g[6] & 256 else "invalid"
+        print(f"  stats: dominant {' '.join(doms) or 'none'}; affine {aff}; wide search flagged {int(g[25])} replaced {int(g[26])} blocks")
+        for dn in range(2):
+            amb = d["blk"][0][dn * 2, :, :, 3]
+            print(f"  amb F{'01' if dn == 0 else '10'} (level-0 blocks): share > 0.5 {float((amb > 0.5).mean()) * 100:.1f}%, mean {amb.mean():.3f}")
     yy, xx = np.mgrid[0:fh, 0:fw].astype(np.float32)
     for name, a, b in (("F01", d["ff0"], d["ff1"]), ("F10", d["ff1"], d["ff0"])):
         tx, ty = xx + a[..., 0], yy + a[..., 1]

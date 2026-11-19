@@ -28,6 +28,9 @@ shared int wtot;
 shared int domOk;
 
 int tid;
+const int NC = 8;   // samples per thread kept in registers (the passes below walk them again and again)
+vec4 cs[NC];          // (x, d) of this thread's samples tid + 256 j, j < NC; w in csw
+float csw[NC];
 V3Lv L;
 int nSamp, nBlk, nLev;
 float sc;   // 2^LH
@@ -45,6 +48,14 @@ void sampleAt(int i, out vec2 x, out vec2 d, out float w) {
     if (dir == 0) { x = c; d = v; }
     else { x = c + v; d = -v; }
     w = 1.0 - smoothstep(6.0, 18.0, r.z);
+}
+
+// sample j of this thread (index tid + 256 j): from the cache for j < NC; weight 0 beyond the last sample
+void mySample(int j, out vec2 x, out vec2 d, out float w) {
+    if (j < NC) { x = cs[j].xy; d = cs[j].zw; w = csw[j]; return; }
+    const int i = tid + 256 * j;
+    if (i >= nSamp) { x = d = vec2(0.0); w = 0.0; return; }
+    sampleAt(i, x, d, w);
 }
 
 // the sums of 12 values per thread over the 256 threads (the result in every thread); smem holds the products
@@ -80,10 +91,10 @@ vec3 solve3(float m[6], vec3 r, out float det) {
 // a[0..5] the matrix, a[6..8] the right-hand side of dx, a[9..11] of dy.
 void accumulate(int pass, const float aff[6], out float a[12]) {
     for (int k = 0; k < 12; k++) a[k] = 0.0;
-    for (int i = tid; i < nSamp; i += 256) {
+    for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
         float w;
-        sampleAt(i, x, d, w);
+        mySample(j, x, d, w);
         if (w <= 0.0) continue;
         const vec2 XY = (x - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
         const vec2 m = vec2(aff[0] + aff[1] * XY.x + aff[2] * XY.y, aff[3] + aff[4] * XY.x + aff[5] * XY.y);
@@ -103,10 +114,10 @@ void meanShift(vec2 c, float r) {
     if (tid < 4) msum[tid] = 0;
     barrier();
     float sx = 0.0, sy = 0.0, sw = 0.0;
-    for (int i = tid; i < nSamp; i += 256) {
+    for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
         float w;
-        sampleAt(i, x, d, w);
+        mySample(j, x, d, w);
         if (w > 0.0 && length(d - c) < r) { sx += w * d.x; sy += w * d.y; sw += w; }
     }
     atomicAdd(msum[0], int(round(sx * 16.0)));
@@ -136,10 +147,12 @@ void main() {
     for (int i = tid; i < 3072; i += 256) smem[i] = 0;
     if (tid == 0) { wtot = 0; domOk = 0; }
     barrier();
-    for (int i = tid; i < nSamp; i += 256) {
+    for (int j = 0; j < NC; j++) { cs[j] = vec4(0.0); csw[j] = 0.0; }
+    for (int j = 0; tid + 256 * j < nSamp; j++) {
         vec2 x, d;
         float w;
-        sampleAt(i, x, d, w);
+        sampleAt(tid + 256 * j, x, d, w);
+        if (j < NC) { cs[j] = vec4(x, d); csw[j] = w; }
         const int w16 = int(w * 16.0 + 0.5);
         if (w16 <= 0) continue;
         const ivec2 bn = clamp(ivec2(floor((d + RH) * (16.0 / RH))), ivec2(0), ivec2(31));
