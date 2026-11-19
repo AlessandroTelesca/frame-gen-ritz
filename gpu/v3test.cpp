@@ -1129,9 +1129,9 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; rok && k < ts.size() && k < 8; k++) (maskOn ? on : off)[k] = hudStat(sc, r.out[k], renderFrame(sc, ts[k]), ts[k]);
             }
             for (size_t k = 0; k < ts.size() && k < 8; k++) {
-                const bool pass = on[k].ovl <= 10.0 && on[k].ring <= 6.0 && on[k].ringBad <= 2.5 && on[k].far <= 2.0;
+                const bool pass = on[k].ovl <= 7.0 && on[k].ring <= 4.0 && on[k].ringBad <= 0.5 && on[k].far <= 0.5;
                 const bool teeth = off[k].ringBad >= 2.0 * on[k].ringBad + 0.5 || off[k].ovl >= on[k].ovl + 1.0;
-                printf("%-20s static overlay t=%.2f  mask ON: overlay %5.2f (%zu px)  ring %5.2f  ring > 40 levels %5.2f%% (%zu px)  background far %5.2f   %s (overlay <= 10, ring <= 6, ring > 40 <= 2.5%%, far <= 2)\n", nm.c_str(), ts[k],
+                printf("%-20s static overlay t=%.2f  mask ON: overlay %5.2f (%zu px)  ring %5.2f  ring > 40 levels %5.2f%% (%zu px)  background far %5.2f   %s (overlay <= 7, ring <= 4, ring > 40 <= 0.5%%, far <= 0.5; measured t=0.25 / 0.5: 5.5 / 5.7, 2.8 / 2.95, 0.21 / 0.08, 0.08)\n", nm.c_str(), ts[k],
                        on[k].ovl, on[k].nOvl, on[k].ring, on[k].ringBad, on[k].nRing, on[k].far, pass ? "PASS" : "FAIL");
                 printf("%-20s static overlay t=%.2f  mask OFF: overlay %5.2f           ring %5.2f  ring > 40 levels %5.2f%%             background far %5.2f   %s (the check has teeth: OFF worse than ON)\n", nm.c_str(), ts[k],
                        off[k].ovl, off[k].ring, off[k].ringBad, off[k].far, teeth ? "PASS" : "FAIL");

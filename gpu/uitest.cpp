@@ -1103,7 +1103,7 @@ static int v2Check(int W, int H) {
         // 624c1f4, vanish / appear: Performance 34 / 10, Quality 15 / 11; ceilings ~1.5-2x that). V1 keeps a2 == 0.
         const bool mv2 = algoV2() || algoV3();   // V3: its own ceiling (Y2 measured vanish / appear 8 / 20; V1 162 / 144)
         if (mv2) {
-            const size_t cap = algoV3() ? 25 : algoV2Quality() ? (grow ? 20 : 25) : (grow ? 20 : 50);
+            const size_t cap = (algoV3() || algoV2Quality()) ? (grow ? 20 : 25) : (grow ? 20 : 50);
             printf("   V2 %s: artifact px %zu, ceiling %zu\n", algoV3() ? "V3" : algoV2Quality() ? "quality" : "performance", a2, cap);
             expect(m2 <= mo + 0.5 && b2 <= bo, grow ? "V2: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
                                                     : "V2: arm ends vanish: the window is not worse than Off (mean, pixels > 32)");
@@ -1214,7 +1214,7 @@ static int v2Check(int W, int H) {
         (void)sameCurr2;
         size_t restBad = uiDiffers(sc, r2.out[0], real, 1, rest);
         printf(" pair gate: %zu crosshair pixels change in the last pair; pasted (== curr) V1 %zu, V2 %zu; unchanged crosshair wrong V2 %zu\n", nChanged, pasted1, pasted2, restBad);
-        expect(nChanged > 0 && (pasted2 == 0 || (algoV3() && pasted2 <= 4)), "V2: no pixel that changed in the pair is pasted (t = 0.5)");
+        expect(nChanged > 0 && (pasted2 == 0 || (algoV3() && pasted2 <= 2)), "V2: no pixel that changed in the pair is pasted (t = 0.5)");
         expect(restBad == 0, "V2: the unchanged part of the crosshair stays pixel-exact in the same pair");
         {   // recordSynthBlur: the patch after the blend has the same gate
             size_t pastedB = 0, nB = 0;

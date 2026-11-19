@@ -41,18 +41,29 @@ void main() {
     for (int j = -1; j <= 1; j++)
         for (int i = -1; i <= 1; i++) nb = max(nb, s8(c + ivec2(i, j)));
     const bool near_ = max(e, nb) > 0.0;
-    // tap: the segment m - v .. m + v of the cell's centre pixel
+    // tap: the segments m - v .. m + v of the vectors the cell's pixels carry (tuning D2: both fields F01 and F10, and 5 pixels of the cell: its centre and four
+    // inner corners; the page's first draft used F01 at the centre only, so a cell whose F10 garbage / background vector differs from its centre's F01 had its taps
+    // land on a HUD without the synthesis ever looking)
     float tap = 0.0;
     {
-        const ivec2 cp = clamp(c * 8 + 4, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
         const int N = pc.fw * pc.fh;
-        const int o = pc.fdOff + 4 * N + 2 * (cp.y * pc.fw + cp.x);   // FF[0]
-        const vec2 v = vec2(fl[o], fl[o + 1]) * (1.0 / 8.0);          // the full vector in cells
-        const int ns = min(WALK_MAX, int(ceil(0.5 * max(abs(v.x), abs(v.y)))) + 1);   // steps of at most 2 cells on each half: with the box around each, no gap
-        for (int st = -ns; st <= ns && tap <= 0.0; st++) {
-            const ivec2 ce = ivec2(floor(vec2(c) + 0.5 + v * (float(st) / float(ns))));
-            for (int j = -1; j <= 1; j++)
-                for (int i = -1; i <= 1; i++) tap = max(tap, s8(ce + ivec2(i, j)));
+        const ivec2 offs[5] = ivec2[5](ivec2(4, 4), ivec2(1, 1), ivec2(6, 1), ivec2(1, 6), ivec2(6, 6));
+        vec2 seen[10];
+        int nseen = 0;
+        for (int q = 0; q < 10 && tap <= 0.0; q++) {
+            const ivec2 cp = clamp(c * 8 + offs[q % 5], ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+            const int o = pc.fdOff + 4 * N + (q / 5) * 2 * N + 2 * (cp.y * pc.fw + cp.x);   // FF[0], FF[1]
+            const vec2 v = vec2(fl[o], fl[o + 1]) * (1.0 / 8.0);          // the full vector in cells
+            bool dup = false;
+            for (int k = 0; k < nseen; k++) dup = dup || all(lessThan(abs(seen[k] - v), vec2(0.5)));
+            if (dup) continue;
+            seen[nseen++] = v;
+            const int ns = min(WALK_MAX, int(ceil(0.5 * max(abs(v.x), abs(v.y)))) + 1);   // steps of at most 2 cells on each half: with the box around each, no gap
+            for (int st = -ns; st <= ns && tap <= 0.0; st++) {
+                const ivec2 ce = ivec2(floor(vec2(c) + 0.5 + v * (float(st) / float(ns))));
+                for (int j = -1; j <= 1; j++)
+                    for (int i = -1; i <= 1; i++) tap = max(tap, s8(ce + ivec2(i, j)));
+            }
         }
     }
     ax[eOff() + ci] = floatBitsToUint(e);

@@ -39,6 +39,12 @@ float outside(vec2 p) {
     const vec2 o = max(-0.5 - p, p - vec2(pc.W, pc.H) + 0.5);
     return clamp(max(o.x, o.y) * (1.0 / V3_OUT), 0.0, 1.0);
 }
+// how far past the frame edge a tap lies, as a ramp from V3_FAR0 to V3_FAR1 px (a tap just past the edge is content entering or leaving: edgeReject)
+const float V3_FAR0 = 16.0, V3_FAR1 = 48.0;
+float outsideFar(vec2 p) {
+    const vec2 o = max(-0.5 - p, p - vec2(pc.W, pc.H) + 0.5);
+    return smoothstep(V3_FAR0, V3_FAR1, max(o.x, o.y));
+}
 void edgeReject(vec2 pa, vec2 pb, inout vec3 ca, inout vec3 cb_) {
     const float oa = outside(pa), ob = outside(pb);
     const vec3 a = ca;
@@ -49,7 +55,8 @@ void edgeReject(vec2 pa, vec2 pb, inout vec3 ca, inout vec3 cb_) {
 // One hypothesis' pair of taps, pa on prev and pc_ on curr: the working values wa, wc after CrosshairV2's tap rejection (on the raw texels), the edge
 // rule and, near a static overlay (nearT), the overlay's tap rule; so = (sout, sboth, sbS) of v2_morph.glsl's sReject (sout = 1 away from overlays: the
 // taps leave them, 0 at the zero vector); em0 = the pair's disagreement before the overlay rule (the taps' own fit).
-void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so, out float em0) {
+void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so, out float em0, out float hit) {
+    hit = 0.0;
     const vec4 a = V3_TAP(texPrev, texPrevC, pa), c = V3_TAP(texCurr, texCurrC, pc_);
     vec3 ra = a.rgb, rc = c.rgb;
     uiReject(V3_UIP(pa), V3_UIP(pc_), ra, rc);
@@ -60,7 +67,10 @@ void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so
     em0 = max(d0.r, max(d0.g, d0.b));
     so = vec3(all(lessThan(abs(pc_ - pa), vec2(1.0))) ? 0.0 : 1.0, 0.0, 0.0);
     if (nearT) {
-        so = sReject(pa, pc_, wa, wc, sOverAt(pa, sCell(pa)), sOverAt(pc_, sCell(pc_)));
+        const vec2 za2 = sOverAt(pa, sCell(pa)), zc2 = sOverAt(pc_, sCell(pc_));
+        // (tuning D2) how much of a static overlay either tap hits (not at the zero vector, where both taps are the overlay's own place): the hypothesis is vetoed by the caller
+        if (!all(lessThan(abs(pc_ - pa), vec2(1.0)))) hit = clamp(max(max(za2.x, za2.y), max(zc2.x, zc2.y)), 0.0, 1.0);
+        so = sReject(pa, pc_, wa, wc, za2, zc2);
         if (so.z > 0.0) so.z *= tapsStatic(pa, pc_, a.rgb, c.rgb);
         if (so.y > 0.0) {   // (not where both taps are on CrosshairV2's UI: its patch and its own tap rule decide there)
             bool ha, hc;
@@ -184,10 +194,12 @@ void main() {
             V3WIn wi;
             vec3 soA, soB;
             float em0A, em0B;
-            v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A);
-            v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B);
-            wi.oA = rA.x; wi.holeA = rA.y; wi.uA = rA.z;
-            wi.oB = rB.x; wi.holeB = rB.y; wi.uB = rB.z;
+            float hitA, hitB;
+            v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A, hitA);
+            v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B, hitB);
+            // (tuning D3) an occluded hypothesis owns one frame only (A prev, B curr): that tap outside the frame is no source at all, so the hypothesis is a hole
+            wi.oA = rA.x; wi.holeA = max(max(rA.y, hitA), rA.x * outsideFar(pAp)); wi.uA = rA.z;
+            wi.oB = rB.x; wi.holeB = max(max(rB.y, hitB), rB.x * outsideFar(pBc)); wi.uB = rB.z;
             wi.t = t;
             wi.lenA = length(gA); wi.lenB = length(gB);
             V3WOut wo;
@@ -212,8 +224,9 @@ void main() {
                     const float tA = t + tj * kA, tB = t + tj * kB;
                     vec3 cAp, cAc, cBp, cBc, so_;
                     float e_;
-                    v3Pair(xp - tA * gA, xp + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_);
-                    v3Pair(xp + tB * gB, xp - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_);
+                    float h_;
+                    v3Pair(xp - tA * gA, xp + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_, h_);
+                    v3Pair(xp + tB * gB, xp - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_, h_);
                     Cm += (3.0 - abs(float(j))) * (wo.w[0] * cAp + wo.w[1] * cAc + wo.w[2] * cBp + wo.w[3] * cBc);
                 }
                 C = mix(C, Cm * (1.0 / 9.0), smoothstep(0.05, 0.5, wo.s));

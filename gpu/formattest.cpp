@@ -1116,8 +1116,8 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
                off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
         expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
-        const size_t lim = algoV3() ? 80 : 8;   // V3 (Y2 measured 64 / 12 against Off 239 / 125): its own ceiling; the V2 limit is 8
-        expect(v2.art05 <= lim && v2.artBlur <= lim, algoV3() ? "CrosshairV2 leaves at most 80 artifact px around the plus, t = 0.5 and blurred (V3: Off 239 / 125)" : "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
+        const size_t lim = algoV3() ? 64 : 8;   // V3 (Y2 measured 64 / 12, tuning D2 58 / 19, against Off 239 / 125): its own ceiling; the V2 limit is 8
+        expect(v2.art05 <= lim && v2.artBlur <= lim, algoV3() ? "CrosshairV2 leaves at most 64 artifact px around the plus, t = 0.5 and blurred (V3: Off 239 / 125)" : "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
         expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
     double pw = psnr(w05, truth, &near, false);
