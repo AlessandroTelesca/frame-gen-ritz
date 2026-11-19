@@ -7,7 +7,7 @@
 // t1 = 0 or 1). The interior samples (0 < t < 1) are contiguous: v3_project wrote their T-field records, slot k - pc.iter (pc.lvl = their count).
 // Per interior sample:
 //   TF: the two projected vectors gA, gB bilinear over the 4 flow px around x (full-resolution vector = fs x the flow vector), the scalars
-//       (o, hole, u of A and B) from the nearest flow px;
+//       (o, hole, u of A and B) bilinear as well;
 //   taps (positions rounded to 1/32 px by V3_TAP): A: prev(x - t gA), curr(x + (1 - t) gA); B: curr(x - (1 - t) gB), prev(x + t gB); a tap outside the
 //       frame takes its partner, softly over 2 px past the edge;
 //   the weight stage (v3_weights.glsl) -> w[4] and the smear s; sharp colour Cs = sum w_i C_i; quantised as the store does.
@@ -43,7 +43,6 @@ void main() {
     const vec2 fp = (vec2(p) - 0.5 * (fsc - 1.0)) / fsc;
     const ivec2 f0 = ivec2(floor(fp));
     const vec2 fa = fp - vec2(f0);
-    const ivec2 fn = clamp(ivec2(floor(fp + 0.5)), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));   // nearest
     ivec2 fc[4];
     for (int k = 0; k < 4; k++) fc[k] = clamp(f0 + ivec2(k & 1, k >> 1), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
     const float bw[4] = float[4]((1.0 - fa.x) * (1.0 - fa.y), fa.x * (1.0 - fa.y), (1.0 - fa.x) * fa.y, fa.x * fa.y);
@@ -52,7 +51,7 @@ void main() {
     vec3 acc = vec3(0.0);
     float accA = 0.0, ws = 0.0;
     for (int k = 0; k < pc.n; k++) {
-        const float t = clamp(pc.t0 + (pc.t1 - pc.t0) * ((float(k) + 0.5) / float(pc.n)), pc.t0, pc.t1);
+        const float t = uintBitsToFloat(ax[gOff() + G_TK + k]);   // the host's t_k (v3Synth writes them: t0 + (t1 - t0)(k + 0.5)/n in double, clamped)
         const float x = (2.0 * float(k) + 1.0 - float(pc.n)) / float(pc.n);
         const float w = (pc.mode & V3M_GAUSS) != 0 ? exp(-2.0 * x * x) : 1.0;
         vec3 v;
@@ -65,15 +64,16 @@ void main() {
             // Y2: step 1, G.mode == 1 (scene cut): output = prev (t <= 0.5) or curr, skip the rest. Step 2: the static mask bits and sigma.
             const int tf = pc.fdOff + 8 * N + (k - pc.iter) * 4 * N;
             vec2 gA = vec2(0.0), gB = vec2(0.0);
+            vec4 rA = vec4(0.0), rB = vec4(0.0);   // (o, hole, u, 0) of A and B: bilinear too (a ramp of a few px, not a step at the flow grid)
             for (int j = 0; j < 4; j++) {
                 const int o = tf + 4 * (fc[j].y * pc.fw + fc[j].x);
                 gA += bw[j] * unpackHalf2x16(floatBitsToUint(fl[o]));
                 gB += bw[j] * unpackHalf2x16(floatBitsToUint(fl[o + 1]));
+                rA += bw[j] * unpackUnorm4x8(floatBitsToUint(fl[o + 2]));
+                rB += bw[j] * unpackUnorm4x8(floatBitsToUint(fl[o + 3]));
             }
             gA *= fsc;
             gB *= fsc;
-            const int on = tf + 4 * (fn.y * pc.fw + fn.x);
-            const vec4 rA = unpackUnorm4x8(floatBitsToUint(fl[on + 2])), rB = unpackUnorm4x8(floatBitsToUint(fl[on + 3]));
             const vec2 pAp = vec2(p) - t * gA, pAc = vec2(p) + (1.0 - t) * gA;
             const vec2 pBc = vec2(p) - (1.0 - t) * gB, pBp = vec2(p) + t * gB;
             // Y2: the CrosshairV2 tap rejection (uiReject(V3_UIP(pa), V3_UIP(pc_), wa, wc)) on each raw tap pair, before the levels

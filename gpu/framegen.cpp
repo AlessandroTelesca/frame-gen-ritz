@@ -3125,9 +3125,10 @@ void Interpolator::Impl::v3Reset(VkCommandBuffer cb) {
 // estimate included, into a larger one; the old buffer waits in blurGrave).
 bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, float t0, float t1, int n, bool gauss) {
     int lo = n, hi = -1;
-    for (int k = 0; k < n; k++) {
-        const float t = std::min(std::max(t0 + (t1 - t0) * (((float)k + 0.5f) / (float)n), t0), t1);
-        if (t > 0.0f && t < 1.0f) { lo = std::min(lo, k); hi = k; }
+    float tk[16]{};   // the sample times, as recordSynthBlur computes them (double arithmetic): the shaders read these, so a sub-frame is recordSynth(t_k) exactly
+    for (int k = 0; k < n && k < 16; k++) {
+        tk[k] = std::min(std::max((float)((double)t0 + ((double)t1 - (double)t0) * (k + 0.5) / n), t0), t1);
+        if (tk[k] > 0.0f && tk[k] < 1.0f) { lo = std::min(lo, k); hi = k; }
     }
     const int nInt = hi - lo + 1;   // 0: every sample is a real frame
     Rec r(*this, cb);
@@ -3147,6 +3148,7 @@ bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     }
     VkDescriptorSet set_ = takeSet(R_SYNTH, srcP, srcC, out, false, rejectMasks(cb));
     CmdFillBuffer(cb, buf[2], 0, 4, 0);
+    CmdUpdateBuffer(cb, mo[(int)MotionVersion::V3].bufs[V3B_AUX].b, ((VkDeviceSize)v3Layout(W, H, set.flowScale).gOff() + 1200) * 4, sizeof(tk), tk);   // G.tk (G_TK)
     r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
     CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set_, 0, nullptr);
     V3PC v = r.v3pc();

@@ -78,7 +78,7 @@ void main() {
     if (m.x >= pc.fw || m.y >= pc.fh) return;
     if (ax[g + G_MODE] == 1u) return;   // scene cut (Y2): the synth copies a real frame
     const int k = pc.iter + int(gz);
-    const float t = clamp(pc.t0 + (pc.t1 - pc.t0) * ((float(k) + 0.5) / float(pc.n)), pc.t0, pc.t1);
+    const float t = uintBitsToFloat(ax[g + G_TK + k]);   // the host's t_k (double arithmetic, so that a blur sample equals recordSynth(t_k) exactly)
     const float f = clamp(uintBitsToFloat(ax[g + G_FAIL_MIX]), 0.0, 1.0);
     vec2 gA, gB;
     vec3 a, b;

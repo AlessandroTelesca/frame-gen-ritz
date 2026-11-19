@@ -551,6 +551,7 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 // carry another layer's true motion; --errmap PREFIX writes a PPM per direction (visible and right: dark grey, wrong: red, estimate = another layer's motion: yellow, not visible: black)
 static bool gDiag = false;
 static std::string gErrMap;
+static bool gProfile = false;   // --profile: the occlusion ramp along the middle row (layers scenes)
 static std::string gFrames;   // --frames PREFIX: PPMs of every in-between frame, its reference and the error (x8, grey)
 static void writePpm(const std::string& fn, const std::vector<uint8_t>& rgba, int W, int H, bool err, const std::vector<uint8_t>* ref) {
     FILE* f = fopen(fn.c_str(), "wb");
@@ -705,6 +706,7 @@ int main(int argc, char** argv) {
         else if (a == "--blk" && i + 1 < argc) gBlkLevel = atoi(argv[++i]);
         else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
         else if (a == "--frames" && i + 1 < argc) gFrames = argv[++i];
+        else if (a == "--profile") gProfile = true;
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
@@ -937,6 +939,33 @@ int main(int argc, char** argv) {
                     printf("%-20s hidden strips %s t=%.2f  mean %6.2f  p99 %6.2f  (%.1f%% of the frame)   plain blend: mean %6.2f  p99 %6.2f\n", nm.c_str(), path ? "exact flows" : "estimated  ", ts[k], so.mean, so.p99, so.frac, sb.mean, sb.p99);
                 }
             }
+        }
+        if (gProfile && estOk && sc.layers.size() > 1) {   // o_eff of F01 along the middle row of the estimate: where it changes, over how many flow px
+            const float* f01 = (const float*)(est.dump.data() + est.L.ff0);
+            const uint32_t* mp = (const uint32_t*)(est.dump.data() + est.L.map0);
+            const int y = est.L.fh / 2;
+            std::vector<float> o(est.L.fw);
+            for (uint32_t x = 0; x < est.L.fw; x++) {
+                const size_t i = (size_t)y * est.L.fw + x;
+                const double e = ((mp[i] >> 8) & 255) / 8.0, g = (mp[i] >> 24) / 255.0, F = std::hypot(f01[2 * i], f01[2 * i + 1]);
+                double r = e / (0.6 + 0.02 * F);
+                r = std::min(1.0, std::max(0.0, (r - 1.0) / 1.5));
+                o[x] = (float)(r * r * (3 - 2 * r) * (1 - g));
+            }
+            printf("%-20s occlusion o_eff (F01, middle row, flow px) transitions (0.05 < o < 0.95 counted):", nm.c_str());
+            for (uint32_t x = 1; x < est.L.fw; x++) {
+                const bool lo0 = o[x - 1] < 0.05f, hi1 = o[x] >= 0.95f, hi0 = o[x - 1] >= 0.95f, lo1 = o[x] < 0.05f;
+                if ((lo0 && !hi1 && !lo1) || (hi0 && !lo1 && !hi1)) {   // a transition starts at x
+                    int w = 0;
+                    uint32_t q = x;
+                    while (q < est.L.fw && o[q] >= 0.05f && o[q] < 0.95f) { w++; q++; }
+                    printf("  [x=%u width %d:", x, w);
+                    for (int k = 0; k < w + 1 && k < 24; k++) printf(" %.2f", o[x + k]);
+                    printf("]");
+                    x = q;
+                }
+            }
+            printf("\n");
         }
         printf("%-20s inject readback (FD == the injected flows, bit-exact): %s\n", nm.c_str(), rtOk ? "PASS" : "FAIL");
         verdict(rtOk, true);
