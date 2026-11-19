@@ -52,6 +52,14 @@ wide_gen = generator(glslang,
   arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                '-DFG_MAXR=12', '--vn', '@BASENAME@_wide_spv', '-o', '@OUTPUT@', '@INPUT@'])
 wide_shaders = wide_gen.process('shaders/search.comp', 'shaders/v2_search.comp')
+# The wide median histogram and the wide V2 Quality claims (reach settings off their defaults and a long vector): -DFG_WIDE=1,
+# into <name>_wide_spv as well (other basenames). The plain builds keep their SPIR-V.
+wide2_gen = generator(glslang,
+  output : '@BASENAME@_wide_spv.h',
+  depfile : '@BASENAME@_wide_spv.h.d',
+  arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+               '-DFG_WIDE=1', '--vn', '@BASENAME@_wide_spv', '-o', '@OUTPUT@', '@INPUT@'])
+wide2_shaders = wide2_gen.process('shaders/medhist.comp', 'shaders/v2_medhist.comp', 'shaders/v2_qown.comp', 'shaders/v2_qcov.comp')
 
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
@@ -72,7 +80,7 @@ foreach f : get_option('formats')
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, wide2_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

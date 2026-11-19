@@ -9,6 +9,7 @@
 #include "luma_spv.h"
 #include "down_spv.h"
 #include "medhist_spv.h"
+#include "medhist_wide_spv.h"
 #include "search_spv.h"
 #include "search_wide_spv.h"
 #include "median3_spv.h"
@@ -32,11 +33,14 @@
 #include "blur_resolve_spv.h"
 // MotionVersion::V2 (every format: only its synthesis, v2_morph / v2_morph_s / v2_qmorph / v2_qmorph_s, has format variants, below)
 #include "v2_medhist_spv.h"
+#include "v2_medhist_wide_spv.h"
 #include "v2_search_spv.h"
 #include "v2_search_wide_spv.h"
 #include "v2_qfield_spv.h"
 #include "v2_qown_spv.h"
+#include "v2_qown_wide_spv.h"
 #include "v2_qcov_spv.h"
+#include "v2_qcov_wide_spv.h"
 #include "v2_qmorph_spv.h"
 #include "v2_clean_spv.h"
 #include "v2_morph_spv.h"
@@ -355,6 +359,46 @@ static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum")
 static const int kSearchMaxR = 6;
 static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
+// The longest integer half-vector (flow pixels) the search can reach at level j (0 = finest) of an n-level pyramid: the top level's
+// radius Rt, then 2 x the parent's + R per level. Used to pick the wide median histogram and the wide Quality claims.
+static int64_t reachBound(int n, int j, int R, int Rt) {
+    const int64_t a = (int64_t)1 << (n - 1 - j);
+    return Rt * a + (int64_t)R * (a - 1);
+}
+// Are the reach settings off their defaults? The wide variants of the two clipping passes are used only then (default settings keep
+// the default shaders at every size, so their output never changes), and only where the bound below says they are needed.
+static bool reachNonDefault(const Settings& s) {
+    const Settings d;
+    return s.searchRadius != d.searchRadius || s.searchRadiusTop != d.searchRadiusTop || s.pyramidMinSide != d.pyramidMinSide;
+}
+// The median histogram of the finest-to-coarsest step whose parent is level `parent` (shaders/medhist.comp, v2_medhist.comp: 256 bins
+// of [-128, 127] parent pixels): -1 = the default shader, else the *_wide shader's bin shift SH (first-pass bins of 2^SH parent pixels,
+// the smallest that holds reachBound of the parent, then an exact second pass; pushed in pc.radius, which the pass does not read). FG_FORCE_WIDE (a test hook, set
+// with -Dcpp_args=-DFG_FORCE_WIDE) uses the wide shader everywhere, FG_NO_WIDE never (shifttest.py's counter-check).
+static int medhistShift(const Settings& s, int n, int parent) {
+    const int64_t b = reachBound(n, parent, s.searchRadius, s.searchRadiusTop);
+    int sh = 0;
+    while ((b >> sh) > 127) sh++;
+#if defined(FG_NO_WIDE)
+    return -1;
+#elif defined(FG_FORCE_WIDE)
+    return sh;
+#else
+    return reachNonDefault(s) && b > 127 ? sh : -1;
+#endif
+}
+// V2 Quality's claims (shaders/v2_qown.comp, v2_qcov.comp): the *_wide pair when the finest half-vector can leave qQuant's
+// [-128, 127.75] flow px (integer bound + 1.25 of V2's fit and fractional steps > 127.75, i.e. bound > 126).
+static bool qualityWide(const Settings& s, int n) {
+#if defined(FG_NO_WIDE)
+    return false;
+#elif defined(FG_FORCE_WIDE)
+    return true;
+#else
+    return reachNonDefault(s) && reachBound(n, 0, s.searchRadius, s.searchRadiusTop) > 126;
+#endif
+}
+
 // Must match the push-constant block in shaders/v2_motion.glsl (V2 Performance's synthesis passes; V2's estimate pushes PC). Pushed
 // over the same range of the same pipeline layout as PC.
 struct V2PC {
@@ -454,8 +498,8 @@ struct UiEntry {
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
 // P_ML_*: MotionVersion::Learned's (its group has V1's luma and synthesis, none of V1's search); the convs are one pipeline per layer
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised. P_ML_PLANES / P_ML_FEAT: the colour and features variants' per-frame planes and the features extractor.
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_SEARCH_WIDE, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2_MEDHIST, P_V2_SEARCH, P_V2_SEARCH_WIDE, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
+            P_V2_MEDHIST, P_V2_MEDHIST_WIDE, P_V2_SEARCH, P_V2_SEARCH_WIDE, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QOWN_WIDE, P_V2_QCOV, P_V2_QCOV_WIDE, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
             P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD, P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
 // variant (ML_EXT); the conv pipelines per activation storage too; convs per
@@ -1554,13 +1598,14 @@ bool Interpolator::Impl::motionEnsure() {
     // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
     // slots are skipped.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
-        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(search_wide), nullptr}, {SPV(median3), nullptr},
+        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(medhist_wide), nullptr}, {SPV(search), nullptr}, {SPV(search_wide), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
         {SPV(lookup), nullptr}};
     if (set.motionVersion == MotionVersion::V2) {
         // V1's luma and pyramid; the rest is V2's own: its faster passes of V1's block field, then each mode's field and synthesis
         for (int i = P_MEDHIST; i <= P_LOOKUP; i++) spv[i].sp = Spv{};
         spv[P_V2_MEDHIST].sp = SPV(v2_medhist);
+        spv[P_V2_MEDHIST_WIDE].sp = SPV(v2_medhist_wide);
         spv[P_V2_SEARCH].sp = SPV(v2_search);
         spv[P_V2_SEARCH_WIDE].sp = SPV(v2_search_wide);
         spv[P_V2_CLEAN].sp = SPV(v2_clean);
@@ -1568,7 +1613,9 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_REPICK].sp = SPV(v2_repick);
         spv[P_V2_QFIELD].sp = SPV(v2_qfield);
         spv[P_V2_QOWN].sp = SPV(v2_qown);
+        spv[P_V2_QOWN_WIDE].sp = SPV(v2_qown_wide);
         spv[P_V2_QCOV].sp = SPV(v2_qcov);
+        spv[P_V2_QCOV_WIDE].sp = SPV(v2_qcov_wide);
         spv[P_V2_QMORPH] = {cs.v2QMorph, spec};
         spv[P_V2_STATIC].sp = SPV(v2_static);
         spv[P_V2_ENCLOSE].sp = SPV(v2_enclose);
@@ -2448,7 +2495,14 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
                 pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fS;   // the parent's RAW search output
                 pc.medIdx = 4 + 2 * i;
                 pc.radius = I.set.searchRadius;
-                r.run(P_V2_MEDHIST, 1, 1);
+                const int sh = medhistShift(I.set, n, i + 1);
+                if (sh >= 0) {
+                    pc.radius = sh;   // (the wide histogram's bin shift; the search below needs the radius again)
+                    r.run(P_V2_MEDHIST_WIDE, 1, 1);
+                    pc.radius = I.set.searchRadius;
+                } else {
+                    r.run(P_V2_MEDHIST, 1, 1);
+                }
                 r.cbar();
             }
             pc.fOut = l.fS;
@@ -2475,7 +2529,14 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fM;
             pc.medIdx = 4 + 2 * i;
             pc.radius = I.set.searchRadius;
-            r.run(P_MEDHIST, 1, 1);
+            const int sh = medhistShift(I.set, n, i + 1);
+            if (sh >= 0) {
+                pc.radius = sh;   // (the wide histogram's bin shift; the search below needs the radius again)
+                r.run(P_MEDHIST_WIDE, 1, 1);
+                pc.radius = I.set.searchRadius;
+            } else {
+                r.run(P_MEDHIST, 1, 1);
+            }
             r.cbar();
         }
         pc.fOut = l.fS;
@@ -2665,10 +2726,17 @@ void Interpolator::Impl::v2Tail(VkCommandBuffer cb) {
     r.runV2(P_V2_QFIELD, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
     r.stamp("pixel field");
-    r.runV2(P_V2_QOWN, v, divUp(fw, 8), divUp(fh, 8));
+    const bool wide = qualityWide(set, (int)lv.size());
+    if (wide) {   // the claims are key | location index (IB bits, at least 1: ceil(log2(N))), KS low key bits dropped to fit
+        int ib = 1;
+        while (((int64_t)1 << ib) < (int64_t)fw * fh) ib++;
+        v.cnt = ib;
+        v.fix = std::max(0, 11 - (32 - ib));
+    }
+    r.runV2(wide ? P_V2_QOWN_WIDE : P_V2_QOWN, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
     r.stamp("splat");
-    r.runV2(P_V2_QCOV, v, divUp(fw, 8), divUp(fh, 8));
+    r.runV2(wide ? P_V2_QCOV_WIDE : P_V2_QCOV, v, divUp(fw, 8), divUp(fh, 8));
     r.cbar();
     r.stamp("coverage");
     v2Cov = true;

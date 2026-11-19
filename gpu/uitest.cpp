@@ -1659,13 +1659,13 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
     return vkGetDeviceProcAddr(d, name);
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : v == MotionVersion::Learned ? "Learned" : "V1"; }
-// The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes + the wide search (radius above 6, created with the search).
+// The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes + the wide search (radius above 6, created with the search) + the wide median histogram.
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11, plus the wide search.
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 16 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 15; }
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 16; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1764,7 +1764,7 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 15, V2: 16, each with its wide search)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 16, V2: 19, each with its wide variants)");
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");

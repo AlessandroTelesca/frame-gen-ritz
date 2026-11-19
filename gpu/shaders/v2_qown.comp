@@ -17,13 +17,21 @@ void main() {
     vec2 h = qF(m);
     vec2 pa = vec2(m) - h, pc_ = vec2(m) + h;
     float k = abs(qLuma(0, pa) - qLuma(N, pc_));
+#ifdef FG_WIDE
+    uint w = qPackW(uint(k * Q_KEY + 0.5), me);
+#else
     uint w = qPack(uint(k * Q_KEY + 0.5), qQuant(h));
+#endif
     qb[2 * N + me] = w;
     int ia = qPix(pa), ic = qPix(pc_);
     if (ia >= 0) atomicMin(qb[ia], w);
     if (ic >= 0) atomicMin(qb[N + ic], w);
     if (uintBitsToFloat(qb[3 * N + me]) >= 0.5) {
+#ifdef FG_WIDE
+        uint z = qPackW(0u, me);   // (v2_qfield set h = 0 on this pixel: its own index reads the zero vector)
+#else
         uint z = qPack(0u, ivec2(0));
+#endif
         atomicMin(qb[me], z);
         atomicMin(qb[N + me], z);
     }

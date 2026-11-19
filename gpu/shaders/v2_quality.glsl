@@ -20,6 +20,7 @@
 // maps: the content at output q, time t comes from the midpoint location q - (2t - 1) g.
 //
 // Binding 14: V2's Quality buffer (MotionGroup::bufs[V2B_QUAL]), uint words, N = fw * fh:
+//   (the *_wide build of v2_qown / v2_qcov: key | index of the claiming location, see qPackW)
 //   [0, N) prev's claims, [N, 2N) curr's claims (key << 20 | (vx + 512) << 10 | (vy + 512), v in quarter flow px, key in 1/Q_KEY
 //   luma levels; reset to 0xFFFFFFFF before the splat), [2N, 3N) each location's own claim, [3N, 4N) the coverage word: cP, cC
 //   (11 bits each), z (10 bits) (v2_qfield writes z there as a float first, v2_qcov packs it).
@@ -78,6 +79,16 @@ float qLuma(int off, vec2 p) {
 ivec2 qQuant(vec2 h) { return clamp(ivec2(roundEven(h * 4.0)), ivec2(-512), ivec2(511)); }
 uint qPack(uint key, ivec2 v) { return (min(key, 4095u) << 20) | (uint(v.x + 512) << 10) | uint(v.y + 512); }
 vec2 qVec(uint w) { return vec2(ivec2(int((w >> 10) & 1023u), int(w & 1023u)) - 512) * 0.25; }
+#ifdef FG_WIDE
+// The *_wide claims of v2_qown / v2_qcov (meson.build -DFG_WIDE=1; framegen.cpp uses them only when a reach setting is not at its
+// default and the half-vector can leave qQuant's [-128, 127.75] flow px): key | index of the claiming location, the vector read
+// exactly from the per-pixel field. IB = pc.cnt index bits (ceil(log2(N)), at least 1), KS = pc.fix low key bits dropped so the key
+// fits the other 32 - IB bits (0 up to 2^21 flow pixels; the key is at most 255 * Q_KEY = 2040 < 2^11). Both are unread by these passes.
+uint qKeyW(uint key) { return min(key >> uint(pc.fix), (1u << uint(32 - pc.cnt)) - 1u); }
+uint qPackW(uint key, int idx) { return (qKeyW(key) << uint(pc.cnt)) | uint(idx); }
+uint qKeyOf(uint w) { return w >> uint(pc.cnt); }
+vec2 qVecW(uint w) { return vf[qPF() + int(w & ((1u << uint(pc.cnt)) - 1u))]; }
+#endif
 uint qPackCov(vec2 c, float z) {
     uvec2 q = uvec2(roundEven(clamp(c, 0.0, 1.0) * 2047.0));
     return q.x | (q.y << 11) | (uint(roundEven(clamp(z, 0.0, 1.0) * 1023.0)) << 22);

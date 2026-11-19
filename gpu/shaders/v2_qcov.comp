@@ -12,12 +12,24 @@ layout(local_size_x = 8, local_size_y = 8) in;
 const int TS = 8, TT = TS + 2 * Q_R;
 shared vec2 vis[TT * TT];
 
+#ifdef FG_WIDE
+// (*_wide: the claims hold key | index, the winner's vector comes exactly from the per-pixel field; the key thresholds follow the
+// dropped key bits)
+bool sees(int off, int pix, uint own, vec2 hq) {
+    if (pix < 0) return false;
+    uint w = qb[off + pix];
+    uint ks = uint(pc.fix), kw = qKeyOf(w);
+    return qKeyOf(own) <= kw + (uint(Q_MARGIN * Q_KEY) >> ks) || kw > (uint(Q_WIN * Q_KEY) >> ks) ||
+           all(lessThanEqual(abs(qVecW(w) - hq), vec2(Q_TOL)));
+}
+#else
 bool sees(int off, int pix, uint own, vec2 hq) {
     if (pix < 0) return false;
     uint w = qb[off + pix];
     return (own >> 20) <= (w >> 20) + uint(Q_MARGIN * Q_KEY) || (w >> 20) > uint(Q_WIN * Q_KEY) ||
            all(lessThanEqual(abs(qVec(w) - hq), vec2(Q_TOL)));
 }
+#endif
 
 void main() {
     int lid = int(gl_LocalInvocationIndex);
@@ -26,8 +38,13 @@ void main() {
     for (int i = lid; i < TT * TT; i += TS * TS) {
         ivec2 m = clamp(t0 + ivec2(i % TT, i / TT), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
         uint own = qb[2 * N + m.y * pc.fw + m.x];
+#ifdef FG_WIDE
+        vec2 h = qF(m);
+        vec2 hq = h;   // the vector m splatted with
+#else
         vec2 hq = qVec(own);   // the vector m splatted with (quantized)
         vec2 h = qF(m);
+#endif
         vis[i] = vec2(sees(0, qPix(vec2(m) - h), own, hq) ? 1.0 : 0.0, sees(N, qPix(vec2(m) + h), own, hq) ? 1.0 : 0.0);
     }
     barrier();

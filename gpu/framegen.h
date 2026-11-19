@@ -176,7 +176,9 @@ struct Settings {
     // +-searchRadiusTop of zero on the coarsest. [1, 12]; default 2 and 6. Larger = follows faster motion, costs more per
     // block (a radius above 6 runs a wider search shader: its window is (2R+1)^2 candidates) and finds more false matches.
     // With n pyramid levels the finest level reaches searchRadiusTop * 2^(n-1) + searchRadius * (2^(n-1) - 1) flow pixels.
-    // Very long vectors are still limited in two places (the per-level median, V2 Quality's coverage step).
+    // Two passes clip long vectors (the per-level median: parent vectors beyond +-127 px; V2 Quality's coverage: half-vectors
+    // beyond +-127.75 flow px). With any of the three reach settings off its default they switch to wide variants where the
+    // reach above needs it; with the defaults they never do, at any frame size.
     uint32_t searchRadius = 2;
     uint32_t searchRadiusTop = 6;
     // Sub-pixel (1/2 then 1/4 px) refinement of the block vectors. Off = ~0.05 ms cheaper per real pair,

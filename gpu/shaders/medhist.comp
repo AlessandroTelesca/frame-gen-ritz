@@ -6,6 +6,72 @@
 #include "common.glsl"
 #include "motion_v1.glsl"
 layout(local_size_x = 256) in;
+#ifdef FG_WIDE
+// The *_wide build (meson.build, -DFG_WIDE=1; framegen.cpp picks it only when a reach setting is not at its default and the parent
+// level's vectors can leave [-128, 127]): the same exact median for vectors of any size the settings allow, in two passes. Pass 1: the
+// 256 bins hold SH = pc.radius (unread by this pass: it carries the shift) low bits less: bin = (v >> SH) + 128, which holds every
+// vector up to 128 * 2^SH. The four values the median needs (the k1-th and k2-th, per axis) each lie in one bin. Pass 2: a second
+// histogram of the low SH bits of only the vectors in those bins gives the exact value. SH = 0: the plain build's result.
+shared uint hx[256], hy[256];
+shared uint fine[4][256];
+shared int tb[4];
+shared uint tbase[4], tk[4];
+shared float tv[4];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    const int sh = pc.radius;
+    const int mask = (1 << sh) - 1;
+    hx[t] = 0u; hy[t] = 0u;
+    fine[0][t] = 0u; fine[1][t] = 0u; fine[2][t] = 0u; fine[3][t] = 0u;
+    barrier();
+    int n = pc.bw * pc.bh;
+    for (int i = int(t); i < n; i += 256) {
+        int ix = i % pc.bw, iy = i / pc.bw;
+        int px = min(ix / 2, pc.pw - 1), py = min(iy / 2, pc.ph - 1);
+        ivec2 v = ivec2(roundEven(field[pc.fPar + py * pc.pw + px]));
+        atomicAdd(hx[clamp((v.x >> sh) + 128, 0, 255)], 1u);
+        atomicAdd(hy[clamp((v.y >> sh) + 128, 0, 255)], 1u);
+    }
+    barrier();
+    if (t < 4u) {   // target t: axis t / 2, order statistic k1 (t even) or k2
+        uint k = t % 2u == 0u ? uint(n - 1) / 2u : uint(n) / 2u;
+        bool isX = t < 2u;
+        uint acc = 0u;
+        int b = 255;
+        uint base = 0u;
+        for (int c = 0; c < 256; c++) {
+            uint h = isX ? hx[c] : hy[c];
+            if (acc + h > k) { b = c; base = acc; break; }
+            acc += h;
+        }
+        tb[t] = b; tbase[t] = base; tk[t] = k;
+    }
+    barrier();
+    for (int i = int(t); i < n; i += 256) {
+        int ix = i % pc.bw, iy = i / pc.bw;
+        int px = min(ix / 2, pc.pw - 1), py = min(iy / 2, pc.ph - 1);
+        ivec2 v = ivec2(roundEven(field[pc.fPar + py * pc.pw + px]));
+        for (int j = 0; j < 4; j++) {
+            int c = j < 2 ? v.x : v.y;
+            if (clamp((c >> sh) + 128, 0, 255) == tb[j]) atomicAdd(fine[j][c & mask], 1u);
+        }
+    }
+    barrier();
+    if (t < 4u) {
+        uint acc = tbase[t];
+        int f = 0;
+        for (; f < mask; f++) {
+            acc += fine[t][f];
+            if (acc > tk[t]) break;
+        }
+        tv[t] = float(((tb[t] - 128) << sh) + f);
+    }
+    barrier();
+    if (t < 2u) u[pc.medIdx + int(t)] = floatBitsToUint(2.0 * (0.5 * (tv[2u * t] + tv[2u * t + 1u])));
+}
+#else
+layout(local_size_x = 256) in;
 shared uint hx[256], hy[256];
 
 float kth(bool isX, uint k) {
@@ -37,3 +103,4 @@ void main() {
         u[pc.medIdx + int(t)] = floatBitsToUint(2.0 * m);
     }
 }
+#endif
