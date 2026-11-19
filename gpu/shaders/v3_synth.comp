@@ -35,7 +35,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 // A tap outside the frame reads the clamped edge: where content enters or leaves the view only the other frame shows it, so the tap takes its partner
 // (softly over V3_OUT px past the edge; both outside: as is). As v2_morph.glsl's outside() / edgeReject().
 const float V3_OUT = 2.0;
-const float V3_LAT = 6.0, V3_LAT0 = 0.5, V3_LAT1 = 1.0;   // (tuning 3) lateral radius (px) of the smear sets, and the smear value it ramps over
+const float V3_LAT = 3.0, V3_LAT0 = 0.5, V3_LAT1 = 1.0;   // (tuning 3) lateral radius (px) of the smear sets (3: 6 broke uitest's CrosshairV2 checks, 13 artifact px instead of 1), and the smear value it ramps over
 float outside(vec2 p) {
     const vec2 o = max(-0.5 - p, p - vec2(pc.W, pc.H) + 0.5);
     return clamp(max(o.x, o.y) * (1.0 / V3_OUT), 0.0, 1.0);
