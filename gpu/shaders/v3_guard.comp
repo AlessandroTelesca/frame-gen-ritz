@@ -6,7 +6,8 @@
 //   V2's vector: v3_anchor's re-anchoring of V2 Quality's per-pixel field (the FF region of V3B_FLOW, vec2 per pixel and direction, free until v3_fill).
 //   The rule (task 102's "b1", in 8-bit luma levels at flow resolution, which is what buf[0] holds): per pixel the matching cost of a vector v is the
 //   7x7 box mean of |L_src(x) - gm L_dst(x + v) + K| (bilinear; (K, gm) = the pair's lighting change as v3_dense uses it, v3DMu); the indicator is (c2 + G_DC < c3) && |v3 - v2| > G_DIS; a pixel is replaced where the 5x5 box mean
-//   of the indicator is above G_VOTE. Mode bit 0 = V2Motion: every pixel is replaced. Mode bit 1 = hook (j): the cost of the new vector is weighted like
+//   of the indicator is above G_VOTE, except where V3's own vector is nearly zero against V2's (|v3| <= G_ZV + G_ZF |v2|: V3 holds the pixel still, task 105's static HUD
+//   protection; Guard only, V2Motion replaces them too). Mode bit 0 = V2Motion: every pixel is replaced. Mode bit 1 = hook (j): the cost of the new vector is weighted like
 //   v3_dense_j's. Mode bit 3 = debug, rule forced false (the control of the tests: the pass runs, nothing is written).
 //   A replaced pixel gets FD = the re-anchored vector and the cost byte of MAP[dir] = V3's own matching cost of that vector (the 5x5 feature window of
 //   v3_dense's winCost, the pair's dMu), so what v3_occl, the unsure measure and the fill read stays in V3's cost units.
@@ -23,6 +24,8 @@ layout(local_size_x = 16, local_size_y = 16) in;
 const float G_DC = 3.0;     // levels: V2's vector must explain the two frames better than V3's by more than this (7x7 box mean of the luma difference)
 const float G_DIS = 2.5;    // flow px: ... and differ from V3's vector by more than this
 const float G_VOTE = 0.5;   // the 5x5 box mean of the indicator above which a pixel is replaced
+const float G_ZV = 0.5;     // flow px: the exemption from replacement: V3's vector is shorter than G_ZV + G_ZF x |V2's vector| (V3 holds the pixel (nearly) still while V2 moves it). A pixel-matches-at-zero test was tried and dropped: the HUD bonus's still zone reaches several px into the textured background, where the zero vector does not match
+const float G_ZF = 0.3;     // ... fraction of V2's vector length
 const float BAD = 255.0;
 const int M_V2MOTION = 1, M_J = 2, M_APPLY = 4, M_NEVER = 8, M_PARTNER = 16;
 
@@ -143,7 +146,11 @@ void main() {
                 s += sInd[q.y * 20 + q.x];
             }
         replace = s * (1.0 / 25.0) > G_VOTE;
-        okBit = sOk[(lp.y + 2) * 20 + lp.x + 2] > 0.5;
+        // the exemption: V3's vector here is (nearly) zero against V2's, i.e. V3 holds the pixel still (task 105's static HUD protection, or a true still pixel): never replaced
+        const int a0 = pc.fdOff + dir * 2 * N + 2 * (min(p.y, pc.fh - 1) * pc.fw + min(p.x, pc.fw - 1));
+        const bool exempt = inFrame && length(vec2(fl[a0], fl[a0 + 1])) <= G_ZV + G_ZF * length(v2Vec(dir, p));
+        if (exempt) replace = false;
+        okBit = !exempt && sOk[(lp.y + 2) * 20 + lp.x + 2] > 0.5;
     }
     if ((pc.mode & M_NEVER) != 0) replace = false;
     if (!apply) {   // first dispatch: the mark
