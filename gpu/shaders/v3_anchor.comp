@@ -1,0 +1,57 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3 with Settings::v3Guard (task 104, gpu/V3.md "As built (motion guard, task 104)"): V2 Quality's per-pixel field re-anchored to V3's
+// two grids. Dispatch ceil(fw / 8) x ceil(fh / 8) x 2 (z = direction), workgroup 8x8, one flow px per thread.
+//   Binding 16 holds V2's V2B_FIELD (the layout V2 has: the cleaned block field, the fitted block field, then Quality's per-pixel field pf at vec2 index
+//   2 bw bh: a half-vector in flow px on the midpoint grid: "the content at m - h in prev is at m + h in curr"). V3 wants F01 on prev's grid (vector 2 h
+//   of the midpoint m that lands on the pixel: m - h = x) and F10 on curr's grid (-2 h of the m with m + h = x). The result goes into the FF region of
+//   V3B_FLOW (the filled field, free until v3_fill writes it): vec2 per pixel, [fdOff + 4 N + dir 2 N + 2 pix], the layout of FD.
+//   A gather: the pixel's own pf gives a first h, two bilinear fixed-point steps h <- pf(x + s h) (s = +1 for F01, -1 for F10) a seed m0 = x + s h, and the
+//   candidates are the midpoints m in the (2 A_R + 1)^2 window around m0: the one whose landing m - s h(m) falls on the pixel (Chebyshev distance <= 0.5,
+//   as a forward splat to the nearest pixel would have) wins, the larger |h| first (a conflict: the faster content wins, as task 102's splat did); with no
+//   exact hit the candidate landing nearest the pixel wins (what the splat's hole fill, the nearest splatted vector, gives). A plain fixed-point gather
+//   alone agrees with the splat on about 55 % of the pixels in the occlusion strips of bf900's gun (45 % of the vectors differ by more than 1 px, they are holes
+//   there), the window on 83 %.
+#include "common.glsl"
+#include "v3_common.glsl"
+layout(set = 0, binding = 16, std430) readonly buffer GuardField { vec2 gf[]; };
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const int A_R = 4;   // the window radius around the seed (flow px)
+
+vec2 pfAt(ivec2 m) {
+    m = clamp(m, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return gf[2 * pc.bw * pc.bh + m.y * pc.fw + m.x];
+}
+vec2 pfBil(vec2 q) {
+    q = clamp(q, vec2(0.0), vec2(float(pc.fw - 1), float(pc.fh - 1)));
+    const ivec2 i0 = ivec2(floor(q));
+    const vec2 a = q - vec2(i0);
+    const ivec2 i1 = min(i0 + 1, ivec2(pc.fw - 1, pc.fh - 1));
+    return mix(mix(pfAt(i0), pfAt(ivec2(i1.x, i0.y)), a.x), mix(pfAt(ivec2(i0.x, i1.y)), pfAt(i1), a.x), a.y);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.fw || p.y >= pc.fh) return;
+    const int dir = int(gl_WorkGroupID.z);
+    const float s = dir == 0 ? 1.0 : -1.0;
+    vec2 h = pfAt(p);
+    h = pfBil(vec2(p) + s * h);
+    h = pfBil(vec2(p) + s * h);
+    const ivec2 m0 = ivec2(floor(vec2(p) + s * h + 0.5));
+    float bestKey = 1e9;
+    vec2 best = h;
+    for (int dy = -A_R; dy <= A_R; dy++)
+        for (int dx = -A_R; dx <= A_R; dx++) {
+            const ivec2 m = clamp(m0 + ivec2(dx, dy), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+            const vec2 hh = pfAt(m);
+            const vec2 dl = vec2(m) - s * hh - vec2(p);
+            const float key = max(abs(dl.x), abs(dl.y)) <= 0.5 ? -length(hh) - 1000.0 : length(dl);
+            if (key < bestKey) { bestKey = key; best = hh; }
+        }
+    const int N = pc.fw * pc.fh;
+    const int a = pc.fdOff + 4 * N + dir * 2 * N + 2 * (p.y * pc.fw + p.x);
+    const vec2 f = 2.0 * s * best;
+    fl[a] = f.x; fl[a + 1] = f.y;
+}

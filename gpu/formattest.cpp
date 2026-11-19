@@ -40,6 +40,7 @@ static bool separatePlanes = false;
 static bool hashOut = false;   // --hash
 #ifndef FORMATTEST_NO_MOTION   // define it to build against a library without Settings::motionVersion
 static MotionVersion gAlgo = MotionVersion::V1;   // --algo
+static V3Guard gV3Guard = V3Guard::Off;           // --v3-guard: Settings::v3Guard (task 104)
 static V2Mode gMode = V2Mode::Quality;             // --mode
 static bool gZt = true, gGuard = false;            // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
@@ -489,6 +490,7 @@ static InitInfo baseInfo(Enc e, int W, int H, const Settings& s) {
     info.settings = s;
 #ifndef FORMATTEST_NO_MOTION
     info.settings.motionVersion = gAlgo;
+    info.settings.v3Guard = gV3Guard;
     info.settings.v2Mode = gMode;
     info.settings.learnedZeroTest = gZt;
     info.settings.learnedStaticGuard = gGuard;
@@ -1294,6 +1296,13 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--separate-planes")) separatePlanes = true;
         else if (!strcmp(argv[i], "--hash")) hashOut = true;
 #ifndef FORMATTEST_NO_MOTION
+        else if (!strcmp(argv[i], "--v3-guard") && i + 1 < argc) {   // Settings::v3Guard (task 104): off | guard | v2motion (--guard is the Learned static guard)
+            const char* g = argv[++i];
+            if (!strcmp(g, "off") || !strcmp(g, "0")) gV3Guard = V3Guard::Off;
+            else if (!strcmp(g, "guard") || !strcmp(g, "1")) gV3Guard = V3Guard::Guard;
+            else if (!strcmp(g, "v2motion") || !strcmp(g, "2")) gV3Guard = V3Guard::V2Motion;
+            else { fprintf(stderr, "--v3-guard off|guard|v2motion\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;

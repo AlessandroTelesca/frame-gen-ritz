@@ -248,11 +248,12 @@ static uint64_t fnv(const std::vector<uint8_t>& v) {
 static MotionVersion gAlgo = MotionVersion::V1;
 static bool gDetailSplit = false;   // --detail-split: Settings::v3DetailSplit (V3 hook (l)) on in every instance
 static bool gColourWindow = false;   // --colour-window: Settings::v3ColourWindow (V3 hook (j)) on in every instance
+static V3Guard gV3Guard = V3Guard::Off;   // --v3-guard: Settings::v3Guard (task 104) in every instance
 static V2Mode gMode = V2Mode::Quality;   // --mode: Settings::v2Mode (V1 ignores it)
 static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZeroTest / learnedStaticGuard (Learned only)
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
-static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; s.v3ColourWindow = gColourWindow; s.v3DetailSplit = gDetailSplit; return s; }
+static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; s.v3ColourWindow = gColourWindow; s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; return s; }
 #else
 static Settings algo(Settings s) { return s; }
 #endif
@@ -1020,6 +1021,13 @@ int main(int argc, char** argv) {
         }
         else if (!strcmp(argv[i], "--colour-window")) gColourWindow = true;
         else if (!strcmp(argv[i], "--detail-split")) gDetailSplit = true;
+        else if (!strcmp(argv[i], "--v3-guard") && i + 1 < argc) {   // Settings::v3Guard (task 104): off | guard | v2motion (--guard is the Learned static guard)
+            const char* g = argv[++i];
+            if (!strcmp(g, "off") || !strcmp(g, "0")) gV3Guard = V3Guard::Off;
+            else if (!strcmp(g, "guard") || !strcmp(g, "1")) gV3Guard = V3Guard::Guard;
+            else if (!strcmp(g, "v2motion") || !strcmp(g, "2")) gV3Guard = V3Guard::V2Motion;
+            else { fprintf(stderr, "--v3-guard off|guard|v2motion\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--zt") && i + 1 < argc) gZt = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--guard") && i + 1 < argc) gGuard = atoi(argv[++i]) != 0;
         else if (!strcmp(argv[i], "--net") && i + 1 < argc) { if (!parseNet(argv[++i])) { fprintf(stderr, "--net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3\n"); return 2; } }

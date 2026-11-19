@@ -71,6 +71,9 @@
 // (Y2: the static-structure enclosure and the pair's decisions; the static mask itself is V2's v2_static)
 #include "v3_enclose_spv.h"
 #include "v3_decide_spv.h"
+// (task 104, Settings::v3Guard: V2 Quality's vectors correct V3's dense field; V2's own estimate passes above are reused)
+#include "v3_anchor_spv.h"
+#include "v3_guard_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -591,6 +594,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_V3_SYNTH_L,   // (hook (l) v3DetailSplit: the synthesis built with -DV3L=1)
             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
+            P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
             P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
 // variant (ML_EXT); the conv pipelines per activation storage too; convs per
@@ -625,6 +629,9 @@ enum { MLB_STATE, MLB_ACT, MLB_COUNT };
 // all levels (uvec2 texels), the static layout + maps + the pair's state G (uint words), the block records / dense and filled fields /
 // T-field (floats)
 enum { V3B_PYR, V3B_AUX, V3B_FLOW, V3B_COUNT };
+// Settings::v3Guard: V2's two estimate buffers (the V2B_FIELD and V2B_QUAL layouts of V2's group), held in V3's own group beside the three above
+// while the setting has been on (appended to V3's MotionGroup::bufs: 5 buffers then, 3 before)
+enum { V3B_GFIELD = V3B_COUNT, V3B_GQUAL, V3B_GCOUNT };
 struct MotionGroup {
     VkPipeline pipes[P_COUNT]{};
     VkPipeline blurPipes[B_COUNT_]{};
@@ -812,6 +819,7 @@ struct Interpolator::Impl {
     MotionGroup mo[kMotionVersions];
     MotionGroup& mg() { return mo[(int)set.motionVersion]; }
     bool motionEnsure();
+    bool guardEnsure();   // Settings::v3Guard: V2's estimate pipelines + buffers in V3's group
     bool motionSized(MotionGroup& g);
     void motionFree(MotionGroup& g);
     // motion blur (recordSynthBlur): own push-constant layout over the same set layout, 3 pipelines (per motion version, in
@@ -942,7 +950,7 @@ struct Interpolator::Impl {
     std::vector<const char*> qnames;
     uint32_t qcount = 0;
 
-    VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false, RejPair rej = {});
+    VkDescriptorSet takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur = false, RejPair rej = {}, bool guardView = false);   // guardView (V3 + Settings::v3Guard): bindings 13 / 14 are V2's estimate buffers (V2's passes run in it)
     bool framesOk(const Frame& a) const { return a.view && (!yuv || a.chroma); }
     bool createSizeDependent();
     bool rebuild(uint32_t w, uint32_t h, VkFormat fmt, bool force);
@@ -1410,6 +1418,7 @@ bool Interpolator::init(const InitInfo& ii) {
     }
     if (const char* e = sizeLimitError(ii.width, ii.height, ii.settings, lim)) { err_ = e; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
+    if (ii.settings.motionVersion == MotionVersion::V3 && ii.settings.v3Guard != V3Guard::Off && v2Why) { err_ = v2Why; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && !cs.v2Morph.code) { err_ = kV2NotBuilt; return false; }
     if (ii.settings.motionVersion == MotionVersion::Learned && !cs.mlDup.code) { err_ = kMlNotBuilt; return false; }
     if (ii.settings.motionVersion == MotionVersion::V3 && (!cs.v3Synth.code || !cs.v3Planes.code)) { err_ = kV3NotBuilt; return false; }
@@ -1450,9 +1459,9 @@ bool Interpolator::init(const InitInfo& ii) {
     // YUV: 8-9 the CbCr planes of prev/curr, 10 the CbCr plane of out; 11-12 (synth sets): the V2 masks of prev / curr (ui_reject.glsl);
     // 13: MotionVersion::V2's cleaned block field, 14: V2 Quality's claims and coverage (written only to V2's sets,
     // shaders/v2_motion.glsl, v2_quality.glsl); MotionVersion::Learned's sets: 13 the net's state, 14 its activations, 15 its weights
-    // (shaders/ml_common.glsl)
+    // (shaders/ml_common.glsl); 16: V3's sets with Settings::v3Guard on only, V2's estimate buffer (V2B_FIELD layout) that v3_guard reads
     uint32_t nb = m->yuv ? 11 : 8;
-    VkDescriptorSetLayoutBinding b[16]{};
+    VkDescriptorSetLayoutBinding b[17]{};
     VkDescriptorType types[11] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -1466,7 +1475,7 @@ bool Interpolator::init(const InitInfo& ii) {
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         if (i == 3 || i == 4 || i == 8 || i == 9) b[i].pImmutableSamplers = &m->sampler;
     }
-    for (uint32_t k = 11; k <= 15; k++, nb++) {
+    for (uint32_t k = 11; k <= 16; k++, nb++) {
         b[nb].binding = k;
         b[nb].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         b[nb].descriptorCount = 1;
@@ -1665,7 +1674,7 @@ bool Interpolator::validate(const Settings& s) {
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
@@ -1689,6 +1698,7 @@ const char* Interpolator::settingsError(const Settings& s, Format f) {
 const char* Interpolator::settingsError(const Settings& s) const {
     if (const char* e = settingsError(s, m ? m->fmt : Format::Rgba8)) return e;
     if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
+    if (m && s.motionVersion == MotionVersion::V3 && s.v3Guard != V3Guard::Off && m->v2Why) return m->v2Why;   // (the guard runs V2's estimate: the same device requirement)
     if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
     if (m && s.motionVersion == MotionVersion::Learned && !m->cs.mlDup.code) return kMlNotBuilt;
     if (m && s.motionVersion == MotionVersion::V3 && (!m->cs.v3Synth.code || !m->cs.v3Planes.code)) return kV3NotBuilt;
@@ -1739,13 +1749,23 @@ void Interpolator::releaseUnusedMotion() {
     if (!m) return;
     for (int v = 0; v < kMotionVersions; v++)
         if (v != (int)m->set.motionVersion && m->mo[v].live) m->motionFree(m->mo[v]);
+    // Settings::v3Guard back to Off: V2's two estimate buffers held for the guard go (the host promises no work in flight, as for the rest of this call)
+    MotionGroup& g3 = m->mo[(int)MotionVersion::V3];
+    if (m->set.v3Guard == V3Guard::Off && g3.bufs.size() == V3B_GCOUNT) {
+        m->freeBuf(g3.bufs[V3B_GFIELD]);
+        m->freeBuf(g3.bufs[V3B_GQUAL]);
+        g3.bufs.resize(V3B_COUNT);
+    }
 }
 
 // Creates the resources of the selected motion version if it has none yet (see MotionGroup); never frees another version's.
 // False = a creation failed: what this call created is freed again and the caller refuses the settings.
 bool Interpolator::Impl::motionEnsure() {
     MotionGroup& g = mg();
-    if (g.live) return !W || !mlearned() || mlSized();   // (Learned: a wider net than before grows the activations)
+    if (g.live) {
+        if (mv3() && set.v3Guard != V3Guard::Off && !guardEnsure()) return false;   // (Settings::v3Guard turned on: V2's estimate passes and buffers)
+        return !W || !mlearned() || mlSized();   // (Learned: a wider net than before grows the activations)
+    }
     // V1: the motion estimate is the same code for every format; the four colour passes of the estimate/synth set are the format's,
     // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
     // slots are skipped.
@@ -1851,7 +1871,22 @@ bool Interpolator::Impl::motionEnsure() {
     ok = ok && (!W || motionSized(g));
     if (!ok) { motionFree(g); return false; }
     g.live = true;
+    if (mv3() && set.v3Guard != V3Guard::Off && !guardEnsure()) { motionFree(g); return false; }
     return true;
+}
+
+// Settings::v3Guard on (V3 selected, its group live): the pipelines of V2's estimate (V1's pyramid pass, V2's median histograms and searches, the re-pick,
+// the clean-up and Quality's per-pixel field; V2's synthesis and coverage passes are not needed) and v3_guard in V3's group, and, while a size is held, V2's two
+// estimate buffers beside V3's three. Creates what is missing, never frees (releaseUnusedMotion does). False: a creation failed, nothing is half-used
+// (a pipeline that exists stays; the buffers are all or none).
+bool Interpolator::Impl::guardEnsure() {
+    MotionGroup& g = mo[(int)MotionVersion::V3];
+    const struct { Pipe p; Spv sp; } list[] = {{P_DOWN, SPV(down)}, {P_V2_MEDHIST, SPV(v2_medhist)}, {P_V2_MEDHIST_WIDE, SPV(v2_medhist_wide)}, {P_V2_SEARCH, SPV(v2_search)},
+                                               {P_V2_SEARCH_WIDE, SPV(v2_search_wide)}, {P_V2_REPICK, SPV(v2_repick)}, {P_V2_CLEAN, SPV(v2_clean)}, {P_V2_QFIELD, SPV(v2_qfield)},
+                                               {P_V3_ANCHOR, SPV(v3_anchor)}, {P_V3_GUARD, SPV(v3_guard)}};
+    for (const auto& e : list)
+        if (!g.pipes[e.p] && !makePipe(e.sp, layout, g.pipes[e.p], nullptr)) return false;
+    return !W || motionSized(g);
 }
 
 // The size-dependent buffers of one motion version, beside the shared buf[] (called while a size is held: by motionEnsure and
@@ -1859,19 +1894,31 @@ bool Interpolator::Impl::motionEnsure() {
 bool Interpolator::Impl::motionSized(MotionGroup& g) {
     if (&g == &mo[(int)MotionVersion::Learned]) return mlSized();
     if (&g == &mo[(int)MotionVersion::V3]) {
-        if (!g.bufs.empty()) return true;
-        // gpu/V3.md section 4; all three are copied out by recordDebugV3. The T-field part of V3B_FLOW is held for one interior sample (ns = 1)
-        const V3Layout V = v3Layout(W, H, set.flowScale);
-        g.bufs.resize(V3B_COUNT);
-        if (allocBuf(g.bufs[V3B_PYR], V.pyrBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && allocBuf(g.bufs[V3B_AUX], V.auxBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
-            allocBuf(g.bufs[V3B_FLOW], V.flowBytes(1), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
-            v3Fresh = true;
-            v3Ns = 1;
-            return true;
+        if (g.bufs.empty()) {
+            // gpu/V3.md section 4; all three are copied out by recordDebugV3. The T-field part of V3B_FLOW is held for one interior sample (ns = 1)
+            const V3Layout V = v3Layout(W, H, set.flowScale);
+            g.bufs.resize(V3B_COUNT);
+            if (allocBuf(g.bufs[V3B_PYR], V.pyrBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && allocBuf(g.bufs[V3B_AUX], V.auxBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
+                allocBuf(g.bufs[V3B_FLOW], V.flowBytes(1), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+                v3Fresh = true;
+                v3Ns = 1;
+            } else {
+                for (UiBuf& b : g.bufs) freeBuf(b);
+                g.bufs.clear();
+                return false;
+            }
         }
-        for (UiBuf& b : g.bufs) freeBuf(b);
-        g.bufs.clear();
-        return false;
+        if (set.v3Guard != V3Guard::Off && g.bufs.size() == V3B_COUNT) {   // Settings::v3Guard: V2's estimate buffers (the sizes of V2's own, below)
+            g.bufs.resize(V3B_GCOUNT);
+            if (!allocBuf(g.bufs[V3B_GFIELD], ((VkDeviceSize)lv[0].bw * lv[0].bh * 2 + (VkDeviceSize)fw * fh) * 8) ||
+                !allocBuf(g.bufs[V3B_GQUAL], ((VkDeviceSize)fw * fh * 5 + (VkDeviceSize)3 * ((fw + 7) / 8) * ((fh + 7) / 8)) * 4)) {
+                freeBuf(g.bufs[V3B_GFIELD]);
+                freeBuf(g.bufs[V3B_GQUAL]);
+                g.bufs.resize(V3B_COUNT);
+                return false;
+            }
+        }
+        return true;
     }
     if (&g != &mo[(int)MotionVersion::V2] || !g.bufs.empty()) return true;
     g.bufs.resize(V2B_COUNT);
@@ -2225,7 +2272,7 @@ bool Interpolator::recordDebugLearned(VkCommandBuffer cb, VkBuffer dst, VkDevice
     return true;
 }
 
-VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur, RejPair rej) {
+VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Frame out, bool blur, RejPair rej, bool guardView) {
     VkDescriptorSet set = sets[ring][setIdx[ring]];
     setIdx[ring] = (setIdx[ring] + 1) % kSetRing;
     frameSets[ring]++;
@@ -2238,13 +2285,19 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
                                    {VK_NULL_HANDLE, out.chroma, VK_IMAGE_LAYOUT_GENERAL}};
     VkDescriptorBufferInfo rj[2] = {{rej.a ? rej.a : rejNone.b, 0, VK_WHOLE_SIZE}, {rej.c ? rej.c : rejNone.b, 0, VK_WHOLE_SIZE}};
     const MotionGroup& v2g = mo[(int)MotionVersion::V2];
+    const MotionGroup& v3gb = mo[(int)MotionVersion::V3];
+    const bool gbufs = v3gb.bufs.size() == V3B_GCOUNT;   // V3's group holds V2's estimate buffers (Settings::v3Guard has been on)
     VkDescriptorBufferInfo vb = {v2g.bufs.empty() ? VK_NULL_HANDLE : v2g.bufs[V2B_FIELD].b, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo qb = {v2g.bufs.empty() ? VK_NULL_HANDLE : v2g.bufs[V2B_QUAL].b, 0, VK_WHOLE_SIZE};
+    if (guardView && gbufs) {
+        vb.buffer = v3gb.bufs[V3B_GFIELD].b;
+        qb.buffer = v3gb.bufs[V3B_GQUAL].b;
+    }
     const MotionGroup& mlg = mo[(int)MotionVersion::Learned];
     VkDescriptorBufferInfo mb[3] = {{mlg.bufs.empty() ? VK_NULL_HANDLE : mlg.bufs[MLB_STATE].b, 0, VK_WHOLE_SIZE},
                                     {mlg.bufs.empty() ? VK_NULL_HANDLE : mlg.bufs[MLB_ACT].b, 0, VK_WHOLE_SIZE},
                                     {mlWeights.b, 0, VK_WHOLE_SIZE}};
-    VkWriteDescriptorSet wr[16]{};
+    VkWriteDescriptorSet wr[17]{};
     uint32_t n = 0;
     auto add = [&](uint32_t binding, VkDescriptorType t) -> VkWriteDescriptorSet& {
         VkWriteDescriptorSet& w = wr[n++];
@@ -2278,17 +2331,19 @@ VkDescriptorSet Interpolator::Impl::takeSet(int ring, Frame prev, Frame curr, Fr
         add(11, BUF).pBufferInfo = &rj[0];
         add(12, BUF).pBufferInfo = &rj[1];
     }
-    if (this->set.motionVersion == MotionVersion::V2 && vb.buffer) {   // V2's sets only (V1's stay as they were)
+    if ((this->set.motionVersion == MotionVersion::V2 || (guardView && gbufs)) && vb.buffer) {   // V2's sets (and V3's guard view of them) only (V1's stay as they were)
         add(13, BUF).pBufferInfo = &vb;
         add(14, BUF).pBufferInfo = &qb;
     }
     const MotionGroup& v3g = mo[(int)MotionVersion::V3];
     VkDescriptorBufferInfo v3b[3];
-    if (mv3() && !v3g.bufs.empty()) {   // V3's sets only
+    VkDescriptorBufferInfo gb = {gbufs ? v3g.bufs[V3B_GFIELD].b : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+    if (mv3() && !v3g.bufs.empty() && !guardView) {   // V3's sets only
         for (uint32_t i = 0; i < 3; i++) {
             v3b[i] = {v3g.bufs[V3B_PYR + i].b, 0, VK_WHOLE_SIZE};
             add(13 + i, BUF).pBufferInfo = &v3b[i];
         }
+        if (gbufs && this->set.v3Guard != V3Guard::Off) add(16, BUF).pBufferInfo = &gb;   // v3_guard: V2's per-pixel field
     }
     if (mlearned() && mb[0].buffer && mb[1].buffer && mb[2].buffer)   // Learned's sets only
         for (uint32_t i = 0; i < 3; i++) add(13 + i, BUF).pBufferInfo = &mb[i];
@@ -2381,6 +2436,82 @@ struct Rec {
         return v;
     }
 };
+}  // namespace
+
+namespace {
+// V2's block search of the estimate (v2_est.glsl; MotionVersion::V2 and, with Settings::v3Guard, V3's estimate): V1's block field, faster: no median3
+// passes, each consumer takes the 3x3 median of the raw search output itself; medhist's histogram is weighted per parent and scanned in parallel.
+// The luma pyramid (P_DOWN) is recorded before it.
+void recordV2Search(Rec& r) {
+    Interpolator::Impl& I = r.I;
+    PC& pc = r.pc;
+    static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
+    const int n = (int)I.lv.size();
+    // V1's block field, faster (shaders/v2_est.glsl): no median3 passes, each consumer takes the 3x3 median of the raw search
+    // output itself; medhist's histogram is weighted per parent and scanned in parallel
+    for (int i = n - 1; i >= 0; i--) {
+        const Level& l = I.lv[i];
+        pc.w = l.w; pc.h = l.h; pc.bw = l.bw; pc.bh = l.bh;
+        pc.offA = l.offA; pc.offC = l.offC;
+        if (i == n - 1) {
+            pc.medIdx = -1;
+            pc.radius = I.set.searchRadiusTop;
+        } else {
+            const Level& p = I.lv[i + 1];
+            pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fS;   // the parent's RAW search output
+            pc.medIdx = 4 + 2 * i;
+            pc.radius = I.set.searchRadius;
+            const int sh = medhistShift(I.set, n, i + 1);
+            if (sh >= 0) {
+                pc.radius = sh;   // (the wide histogram's bin shift; the search below needs the radius again)
+                r.run(P_V2_MEDHIST_WIDE, 1, 1);
+                pc.radius = I.set.searchRadius;
+            } else {
+                r.run(P_V2_MEDHIST, 1, 1);
+            }
+            r.cbar();
+        }
+        pc.fOut = l.fS;
+        // finest level (bits): 1 = V1's scene-cut sum (sub-pixel refinement off: the search's SAD is final), 2 = Performance's
+        // block field (V2B_FIELD at bw * bh) and its own scene-cut sum, 4 = with the equiangular sub-pixel fit
+        pc.sadAcc = i == 0 ? (!I.set.subpixel ? 1 : 0) | 2 | (I.set.subpixel ? 4 : 0) : 0;
+        r.run(pc.radius > kSearchMaxR ? P_V2_SEARCH_WIDE : P_V2_SEARCH, l.bw, l.bh);
+        r.cbar();
+        r.stamp(lvNames[std::min(i, 7)]);
+    }
+}
+// Settings::v3Guard: what V2 Quality's estimate gives the guard, recorded in a set whose bindings 13 / 14 are V2's buffers: the luma pyramid, the block
+// search, the re-pick and clean-up of the finest block field and Quality's per-pixel field pf (V2B_FIELD at vec2 2 bw bh). Not recorded: V2's static mask and
+// enclosure (the field does not read them), the coverage splat (the guard does not read it) and everything of the synthesis. The same calls V2's estimate and
+// v2Tail make for them, in the same order.
+void recordV2Estimate(Rec& r, const std::vector<Level>& lv) {
+    Interpolator::Impl& I = r.I;
+    PC& pc = r.pc;
+    for (size_t i = 1; i < lv.size(); i++) {
+        const Level &s = lv[i - 1], &t = lv[i];
+        pc.w = t.w; pc.h = t.h; pc.pw = s.w; pc.ph = s.h;
+        pc.offA = t.offA; pc.offC = t.offC; pc.srcA = s.offA; pc.srcC = s.offC;
+        r.run(P_DOWN, divUp(t.w, 8), divUp(t.h, 8));
+        r.cbar();
+    }
+    r.stamp("v2 pyramid");
+    recordV2Search(r);
+    Rec t(I, r.cb);
+    const Level& l0 = lv[0];
+    PC& tp = t.pc;
+    tp.w = l0.w; tp.h = l0.h; tp.bw = l0.bw; tp.bh = l0.bh; tp.offA = l0.offA; tp.offC = l0.offC;
+    V2PC v = t.v2pc();
+    tp.fIn = l0.bw * l0.bh; tp.fOut = l0.fM;
+    t.run(P_V2_REPICK, divUp(l0.bw, 2), divUp(l0.bh, 2));   // 2x2 blocks per workgroup
+    t.cbar();
+    v.fIn = l0.fM;
+    t.runV2(P_V2_CLEAN, v, divUp(l0.bw, 8), divUp(l0.bh, 8));
+    t.cbar();
+    t.stamp("v2 field clean");
+    t.runV2(P_V2_QFIELD, v, divUp(I.fw, 8), divUp(I.fh, 8));
+    t.cbar();
+    t.stamp("v2 pixel field");
+}
 }  // namespace
 
 // The masks the synth passes of the latest estimate's pair reject warp taps with (CrosshairV2: the entries' own V2 masks). The first
@@ -2712,8 +2843,10 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     Impl& I = *m;
     if (!I.framesOk(prev) || !I.framesOk(curr)) return false;
     // The next set in the ring may still be referenced by an earlier record of this submission.
-    assert(I.frameSets[Impl::R_EST] < kSetRing && "framegen: more than kSetRing recordEstimate() since beginFrame()");
-    if (I.frameSets[Impl::R_EST] >= kSetRing) return false;
+    // Settings::v3Guard: V2's estimate passes run in a second set (V2's buffers at 13 / 14), the estimate takes two
+    const bool guard = I.mv3() && I.set.v3Guard != V3Guard::Off && !I.v3inj && I.mo[(int)MotionVersion::V3].bufs.size() == V3B_GCOUNT && I.mo[(int)MotionVersion::V3].pipes[P_V3_GUARD] && I.mo[(int)MotionVersion::V3].pipes[P_V3_ANCHOR];
+    assert(I.frameSets[Impl::R_EST] + (guard ? 1u : 0u) < kSetRing && "framegen: more than kSetRing recordEstimate() since beginFrame() (two sets each with Settings::v3Guard)");
+    if (I.frameSets[Impl::R_EST] + (guard ? 1u : 0u) >= kSetRing) return false;
     // Static-UI protection: the estimate runs on the clean copies of the pair. A host that never calls recordObserve
     // gets the implicit observes here (prev if unseen, curr unless it is the newest observed view).
     // With explicit observing, a pair whose views the library has not both observed (protection was just switched on,
@@ -2814,6 +2947,16 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         const MotionGroup& g = I.mo[(int)MotionVersion::V3];
         const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
         const bool inj = I.v3inj != nullptr;
+        if (guard) {   // Settings::v3Guard: V2 Quality's per-pixel field of this pair (V2's own passes, in a set whose bindings 13 / 14 are V2's buffers)
+            const VkDescriptorSet gset = I.takeSet(Impl::R_EST, estP, estC, Frame(), false, RejPair(), true);
+            I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &gset, 0, nullptr);
+            recordV2Estimate(r, I.lv);
+            I.CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, I.layout, 0, 1, &set, 0, nullptr);
+            // V2's field re-anchored to V3's grids (into the FF region of V3B_FLOW, free until v3_fill)
+            r.runV3(P_V3_ANCHOR, r.v3pc(), divUp(I.fw, 8), divUp(I.fh, 8), 2);
+            r.cbar();
+            r.stamp("anchor");
+        }
         const int hookJ = I.set.v3ColourWindow ? 1 : 0;   // hook (j): the search and dense passes of the colour-window build (P_V3_*_J); mode bit 0 stays set for them (they do not read it)
         V3PC v = r.v3pc();
         r.runV3(P_V3_PLANES, v, divUp(V.fw, I.set.flowScale == 4 ? 4 : 8), divUp(V.fh, I.set.flowScale == 4 ? 4 : 8));
@@ -2872,6 +3015,31 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.runV3(hookJ ? P_V3_DENSE_J : P_V3_DENSE, dv, divUp(V.fw + 4, 8), divUp(V.fh + 4, 8), 2);
         r.cbar();
         r.stamp("dense");
+        if (guard) {   // Settings::v3Guard (gpu/V3.md "As built (motion guard, task 104)"): V2's vector where it explains the frames better (Guard) or everywhere (V2Motion)
+            V3PC gv = v;
+            const int gj = hookJ ? 2 : 0;
+#ifdef FG_GUARD_NEVER
+            const int gn = 8;   // (the control build: the pass runs, the rule is false: nothing is replaced)
+#else
+            const int gn = 0;
+#endif
+            if (I.set.v3Guard == V3Guard::V2Motion) {
+                gv.mode = 1 | gj | gn;
+                r.runV3(P_V3_GUARD, gv, divUp(V.fw, 16), divUp(V.fh, 16), 2);
+                r.cbar();
+            } else {
+                gv.mode = gj | gn;
+                r.runV3(P_V3_GUARD, gv, divUp(V.fw, 16), divUp(V.fh, 16), 2);   // the mark (reads FD only)
+                r.cbar();
+                gv.mode = 16 | gj | gn;
+                r.runV3(P_V3_GUARD, gv, divUp(V.fw, 16), divUp(V.fh, 16), 2);   // the partner marks
+                r.cbar();
+                gv.mode = 4 | gj | gn;
+                r.runV3(P_V3_GUARD, gv, divUp(V.fw, 16), divUp(V.fh, 16), 2);   // the replacement
+                r.cbar();
+            }
+            r.stamp("guard");
+        }
         // Y1: forward-backward consistency, the garbage measure and the MAP word (e8, amb8, g8), then the vector fill into FF (section 3.9, 3.10)
         V3PC ov = v;
         ov.mode = inj ? 4 : 0;   // occl: bit 2 = inject (the block records are stale: amb = 0)
@@ -2907,38 +3075,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
     static const char* lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7"};
     int n = (int)I.lv.size();
     if (I.set.motionVersion == MotionVersion::V2) {
-        // V1's block field, faster (shaders/v2_est.glsl): no median3 passes, each consumer takes the 3x3 median of the raw search
-        // output itself; medhist's histogram is weighted per parent and scanned in parallel
-        for (int i = n - 1; i >= 0; i--) {
-            const Level& l = I.lv[i];
-            pc.w = l.w; pc.h = l.h; pc.bw = l.bw; pc.bh = l.bh;
-            pc.offA = l.offA; pc.offC = l.offC;
-            if (i == n - 1) {
-                pc.medIdx = -1;
-                pc.radius = I.set.searchRadiusTop;
-            } else {
-                const Level& p = I.lv[i + 1];
-                pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fS;   // the parent's RAW search output
-                pc.medIdx = 4 + 2 * i;
-                pc.radius = I.set.searchRadius;
-                const int sh = medhistShift(I.set, n, i + 1);
-                if (sh >= 0) {
-                    pc.radius = sh;   // (the wide histogram's bin shift; the search below needs the radius again)
-                    r.run(P_V2_MEDHIST_WIDE, 1, 1);
-                    pc.radius = I.set.searchRadius;
-                } else {
-                    r.run(P_V2_MEDHIST, 1, 1);
-                }
-                r.cbar();
-            }
-            pc.fOut = l.fS;
-            // finest level (bits): 1 = V1's scene-cut sum (sub-pixel refinement off: the search's SAD is final), 2 = Performance's
-            // block field (V2B_FIELD at bw * bh) and its own scene-cut sum, 4 = with the equiangular sub-pixel fit
-            pc.sadAcc = i == 0 ? (!I.set.subpixel ? 1 : 0) | 2 | (I.set.subpixel ? 4 : 0) : 0;
-            r.run(pc.radius > kSearchMaxR ? P_V2_SEARCH_WIDE : P_V2_SEARCH, l.bw, l.bh);
-            r.cbar();
-            r.stamp(lvNames[std::min(i, 7)]);
-        }
+        recordV2Search(r);   // V1's block field, faster (shaders/v2_est.glsl): the same passes Settings::v3Guard runs in V3's estimate
         // the rest is each mode's: the re-pick and clean-up, and Quality's coverage (v2Tail)
         I.v2Tail(cb);
         return true;

@@ -110,6 +110,17 @@ enum class V2Mode : uint32_t {
                        // for HUD text and static overlays). No per-pixel trust or hold. RX 7900 XTX, 1080p 2x: ~0.15 ms per pair.
 };
 
+// Settings::v3Guard (MotionVersion::V3 only): lets V2 Quality's motion estimate correct or replace V3's motion. Values are append-only and
+// never renumbered. Runtime: setSettings() at any time (see Settings::v3Guard).
+enum class V3Guard : uint32_t {
+    Off = 0,        // the default: V3 exactly as without the setting (byte-identical output; no pass recorded, no memory held)
+    Guard = 1,      // V2 Quality's estimate also runs on every pair; where its vector explains the two real frames clearly better than V3's
+                    // (and differs from it by more than 2.5 flow px) it replaces V3's dense vector, in both directions, before V3's
+                    // occlusion, fill, projection and synthesis. V3 keeps its own motion where it is right (fast motion, long reach).
+    V2Motion = 2,   // V2 Quality's vector replaces V3's dense vector everywhere: V3's occlusion handling, fill, projection and synthesis on
+                    // V2's motion (for comparing by eye; it gives up V3's advantage on fast motion).
+};
+
 // Weights of the sub-frames of one motion-blurred output (Settings::blurWeights, recordSynthBlur()).
 enum class BlurWeights : uint32_t {
     Even = 0,       // every sub-frame 1/N: a plain box shutter
@@ -342,6 +353,15 @@ struct Settings {
     float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
+    // v3Guard (see V3Guard): V2 Quality's motion estimate also runs on each pair and corrects (Guard) or replaces (V2Motion) V3's dense motion field
+    // before V3's occlusion / fill / synthesis; Off = the default, V3 exactly as without it. Needs V2's subgroup requirements (a device that cannot
+    // run MotionVersion::V2, Interpolator::settingsError, refuses it with the reason V2 gets). While on, searchRadius, searchRadiusTop,
+    // pyramidMinSide, subpixel and searchPenalty apply to V2's estimate exactly as they do under MotionVersion::V2 (V3 itself still ignores them).
+    // Runtime: setSettings() at any time, from the next recordEstimate; the first time it is on, setSettings creates V2's estimate pipelines inside V3's
+    // group and allocates V2's two estimate buffers (no GPU wait, false if that fails: nothing changed); they stay until releaseUnusedMotion() (called with
+    // it Off) or a resize / destroy frees them. Cost on top of V3 (RX 7900 XTX, 1080p flowScale 2, 2x, whole pair): see INTEGRATION.md "Motion version 3".
+    // Other versions ignore it. Does not drop the current estimate.
+    V3Guard v3Guard = V3Guard::Off;
     // MotionVersion::Learned: the net (see LearnedNet). E2v5 = the default (E2v4, E2v3 before it); E1v5 = the small net, the recommended
     // fallback when E2v5 is too expensive (~2.4x cheaper at 1080p). Other versions ignore it (any valid value,
     // no effect). Runtime: setSettings() at any time, no GPU wait; the next recordEstimate runs the new net (the current estimate is

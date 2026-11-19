@@ -265,7 +265,8 @@ static bool gZt = true, gGuard = false;   // --zt, --guard: Settings::learnedZer
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static bool gDetailSplit = false;   // --detail-split: Settings::v3DetailSplit (V3 hook (l)) on in every instance
-static Settings algo(Settings s) { s.v3DetailSplit = gDetailSplit; s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
+static V3Guard gV3Guard = V3Guard::Off;   // --v3-guard: Settings::v3Guard (task 104) in every instance
+static Settings algo(Settings s) { s.v3DetailSplit = gDetailSplit; s.v3Guard = gV3Guard; s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
 static bool algoV3() { return gAlgo == MotionVersion::V3; }   // the skeleton of V3 (gpu/V3.md step S): a plain time-weighted blend, no motion
@@ -1902,6 +1903,13 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
 #ifndef UITEST_NO_MOTION
         else if (!strcmp(argv[i], "--detail-split")) gDetailSplit = true;
+        else if (!strcmp(argv[i], "--v3-guard") && i + 1 < argc) {   // Settings::v3Guard (task 104): off | guard | v2motion (--guard is the Learned static guard)
+            const char* g = argv[++i];
+            if (!strcmp(g, "off") || !strcmp(g, "0")) gV3Guard = V3Guard::Off;
+            else if (!strcmp(g, "guard") || !strcmp(g, "1")) gV3Guard = V3Guard::Guard;
+            else if (!strcmp(g, "v2motion") || !strcmp(g, "2")) gV3Guard = V3Guard::V2Motion;
+            else { fprintf(stderr, "--v3-guard off|guard|v2motion\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--algo") && i + 1 < argc) {
             const char* a = argv[++i];
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;

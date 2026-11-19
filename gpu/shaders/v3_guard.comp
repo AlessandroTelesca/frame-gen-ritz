@@ -1,0 +1,163 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3 with Settings::v3Guard (task 104, gpu/V3.md "As built (motion guard, task 104)"): V2 Quality's vectors correct V3's dense field.
+// Runs after v3_dense and before v3_occl / v3_fill, so the consistency measure, the garbage measure and the fill see the corrected field.
+// Dispatch ceil(fw / 16) x ceil(fh / 16) x 2 (z = direction), workgroup 16x16, one flow px per thread.
+//   V2's vector: v3_anchor's re-anchoring of V2 Quality's per-pixel field (the FF region of V3B_FLOW, vec2 per pixel and direction, free until v3_fill).
+//   The rule (task 102's "b1", in 8-bit luma levels at flow resolution, which is what buf[0] holds): per pixel the matching cost of a vector v is the
+//   7x7 box mean of |L_src(x) - L_dst(x + v)| (bilinear); the indicator is (c2 + G_DC < c3) && |v3 - v2| > G_DIS; a pixel is replaced where the 5x5 box mean
+//   of the indicator is above G_VOTE. Mode bit 0 = V2Motion: every pixel is replaced. Mode bit 1 = hook (j): the cost of the new vector is weighted like
+//   v3_dense_j's. Mode bit 3 = debug, rule forced false (the control of the tests: the pass runs, nothing is written).
+//   A replaced pixel gets FD = the re-anchored vector and the cost byte of MAP[dir] = V3's own matching cost of that vector (the 5x5 feature window of
+//   v3_dense's winCost, the pair's dMu), so what v3_occl, the unsure measure and the fill read stays in V3's cost units.
+//   Two dispatches (Guard): the first (no mode bit 4) only reads FD and marks the pixels to replace (bit 8 of their MAP word, which holds the cost byte
+//   alone until v3_occl), the second (mode bit 4) replaces the marked pixels: a pass that replaced in place would have a workgroup's apron read the neighbour's
+//   already replaced vectors. V2Motion needs no neighbours and is one dispatch.
+//   Nothing else is written: BLK (the next pair's search candidates) is V3's own. (The replaced share is counted offline, from the dumped FD against an Off run's.)
+#define V3J 1
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const float G_DC = 3.0;     // levels: V2's vector must explain the two frames better than V3's by more than this (7x7 box mean of the luma difference)
+const float G_DIS = 2.5;    // flow px: ... and differ from V3's vector by more than this
+const float G_VOTE = 0.5;   // the 5x5 box mean of the indicator above which a pixel is replaced
+const float BAD = 255.0;
+const int M_V2MOTION = 1, M_J = 2, M_APPLY = 4, M_NEVER = 8, M_PARTNER = 16;
+
+const int AP = 5, TW = 16 + 2 * AP;   // 26 x 26: the 7x7 box (3) of the 5x5 vote (2)
+shared float sD3[TW * TW], sD2[TW * TW], sDis[TW * TW];
+shared float sH3[TW * 20], sH2[TW * 20];   // horizontal 7-sums for the 20 columns of the indicator window (tile columns 3 .. 22)
+shared float sInd[20 * 20];
+shared float sOk[20 * 20];   // V2's vector explains the frames at least as well as V3's here (c2 <= c3): the pixels a marked partner may pull along
+
+// V2's vector of the pixel p of direction dir, on that direction's grid: v3_anchor's re-anchored field, in the FF region of V3B_FLOW
+vec2 v2Vec(int dir, ivec2 p) {
+    const int a = pc.fdOff + 4 * pc.fw * pc.fh + dir * 2 * pc.fw * pc.fh + 2 * (p.y * pc.fw + p.x);
+    return vec2(fl[a], fl[a + 1]);
+}
+float lumaAt(int off, ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    return luma[off + p.y * pc.fw + p.x];
+}
+float lumaBil(int off, vec2 q) {
+    q = clamp(q, vec2(0.0), vec2(float(pc.fw - 1), float(pc.fh - 1)));
+    const ivec2 i0 = ivec2(floor(q));
+    const vec2 a = q - vec2(i0);
+    return mix(mix(lumaAt(off, i0), lumaAt(off, i0 + ivec2(1, 0)), a.x), mix(lumaAt(off, i0 + ivec2(0, 1)), lumaAt(off, i0 + 1), a.x), a.y);
+}
+
+// v3_dense's winCost (the same window, terms and validity rule), with hook (j)'s colour weights when jw
+float winCost(const V3Lv L, int fOff, int dir, vec2 dMu, ivec2 p, vec2 v, bool jw) {
+    const vec2 vf = floor(v), fr = v - vf;
+    const ivec2 vi = ivec2(vf);
+    const ivec2 mx = ivec2(L.w - 1, L.h - 1);
+    const vec3 cen = jw ? v3RawAt(L, dir, p) : vec3(0.0);
+    float s = 0.0, n = 0.0, ws = 0.0;
+    vec4 prow[6];
+    {
+        const int ty = clamp(p.y - 2 + vi.y, 0, mx.y);
+        for (int i = 0; i < 6; i++) prow[i] = v3FeatAt(L, fOff, 1 - dir, ivec2(clamp(p.x - 2 + vi.x + i, 0, mx.x), ty));
+    }
+    for (int j = -2; j <= 2; j++) {
+        vec4 nrow[6];
+        const int ty = clamp(p.y + j + 1 + vi.y, 0, mx.y);
+        for (int i = 0; i < 6; i++) nrow[i] = v3FeatAt(L, fOff, 1 - dir, ivec2(clamp(p.x - 2 + vi.x + i, 0, mx.x), ty));
+        for (int i = -2; i <= 2; i++) {
+            const ivec2 x = p + ivec2(i, j);
+            if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
+            const vec2 tq = vec2(x) + v;
+            if (tq.x < 0.0 || tq.y < 0.0 || tq.x > float(L.w - 1) || tq.y > float(L.h - 1)) continue;
+            const vec4 b = mix(mix(prow[i + 2], prow[i + 3], fr.x), mix(nrow[i + 2], nrow[i + 3], fr.x), fr.y);
+            const float t = v3Term(v3FeatAt(L, fOff, dir, x), b, dMu);
+            const float w = jw ? v3ColourWgt(v3RawAt(L, dir, x), cen) : 1.0;
+            s += w * t;
+            ws += w;
+            n += 1.0;
+        }
+        prow = nrow;
+    }
+    return (n >= 12.5 && ws > 0.0) ? min(s / ws, BAD) : BAD;
+}
+
+void main() {
+    const int dir = int(gl_WorkGroupID.z);
+    const int lid = int(gl_LocalInvocationIndex);
+    const ivec2 lp = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
+    const ivec2 p = org + lp;
+    const bool inFrame = p.x < pc.fw && p.y < pc.fh;
+    const int N = pc.fw * pc.fh;
+    const int offS = dir == 0 ? 0 : N, offD = dir == 0 ? N : 0;   // luma of the pixel's own frame, of the other frame (buf[0]: prev, then curr)
+    const bool all = (pc.mode & M_V2MOTION) != 0, apply = all || (pc.mode & M_APPLY) != 0;
+    bool replace = all, okBit = false;
+    if ((pc.mode & M_PARTNER) != 0) {   // second dispatch: a pixel whose V2 landing pixel in the other frame was marked is replaced too (bit 9), so the two directions stay consistent
+        if (inFrame) {
+            const int mi = mapOff(dir) + p.y * pc.fw + p.x;
+            const uint w = ax[mi];
+            const ivec2 q = clamp(ivec2(floor(vec2(p) + v2Vec(dir, p) + 0.5)), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+            const bool partner = (ax[mapOff(1 - dir) + q.y * pc.fw + q.x] & 0x100u) != 0u;
+            ax[mi] = (w & 0x5FFu) | ((((w & 0x100u) != 0u) || (partner && (w & 0x400u) != 0u)) && (pc.mode & M_NEVER) == 0 ? 0x200u : 0u);
+        }
+        return;
+    }
+    if (apply && !all) replace = inFrame && (ax[mapOff(dir) + p.y * pc.fw + p.x] & 0x200u) != 0u;
+    if (!apply) {
+        // 1. per tile pixel (clamped into the frame): |L_src(x) - L_dst(x + v)| for V3's and V2's vector, and their distance
+        for (int i = lid; i < TW * TW; i += 256) {
+            const ivec2 q = clamp(org - AP + ivec2(i % TW, i / TW), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+            const int a = pc.fdOff + dir * 2 * N + 2 * (q.y * pc.fw + q.x);
+            const vec2 v3 = vec2(fl[a], fl[a + 1]);
+            const vec2 v2 = v2Vec(dir, q);
+            const float ls = lumaAt(offS, q);
+            sD3[i] = abs(ls - lumaBil(offD, vec2(q) + v3));
+            sD2[i] = abs(ls - lumaBil(offD, vec2(q) + v2));
+            sDis[i] = length(v3 - v2);
+        }
+        barrier();
+        // 2. horizontal 7-sums (tile rows 0..25, columns 3..22)
+        for (int i = lid; i < TW * 20; i += 256) {
+            const int y = i / 20, x = 3 + i % 20;
+            float s3 = 0.0, s2 = 0.0;
+            for (int k = -3; k <= 3; k++) { s3 += sD3[y * TW + x + k]; s2 += sD2[y * TW + x + k]; }
+            sH3[i] = s3;
+            sH2[i] = s2;
+        }
+        barrier();
+        // 3. vertical 7-sums (rows 3..22) and the indicator
+        for (int i = lid; i < 400; i += 256) {
+            const int y = 3 + i / 20, x = i % 20;
+            float s3 = 0.0, s2 = 0.0;
+            for (int k = -3; k <= 3; k++) { s3 += sH3[(y + k) * 20 + x]; s2 += sH2[(y + k) * 20 + x]; }
+            sOk[i] = s2 <= s3 ? 1.0 : 0.0;
+            sInd[i] = (s2 * (1.0 / 49.0) + G_DC < s3 * (1.0 / 49.0) && sDis[y * TW + x + 3] > G_DIS) ? 1.0 : 0.0;
+        }
+        barrier();
+        // 4. the vote: the 5x5 mean of the indicator, edge pixels replicated (the position is clamped into the frame)
+        float s = 0.0;
+        for (int j = -2; j <= 2; j++)
+            for (int i = -2; i <= 2; i++) {
+                const ivec2 q = clamp(p + ivec2(i, j), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1)) - (org - 2);
+                s += sInd[q.y * 20 + q.x];
+            }
+        replace = s * (1.0 / 25.0) > G_VOTE;
+        okBit = sOk[(lp.y + 2) * 20 + lp.x + 2] > 0.5;
+    }
+    if ((pc.mode & M_NEVER) != 0) replace = false;
+    if (!apply) {   // first dispatch: the mark
+        if (inFrame) ax[mapOff(dir) + p.y * pc.fw + p.x] = (ax[mapOff(dir) + p.y * pc.fw + p.x] & 0xFFu) | (replace ? 0x100u : 0u) | (okBit ? 0x400u : 0u);
+        return;
+    }
+    if (inFrame && replace) {
+        // the replacement: V2's vector and its cost in V3's units
+        const vec2 v2 = v2Vec(dir, p);
+        int P, Bw, nLev;
+        v3Totals(P, Bw, nLev);
+        const V3Lv L = v3Lv(0);
+        const float c = winCost(L, 2 * P, dir, v3DMu(dir), p, v2, (pc.mode & M_J) != 0);
+        const int a = pc.fdOff + dir * 2 * N + 2 * (p.y * pc.fw + p.x);
+        fl[a] = v2.x; fl[a + 1] = v2.y;
+        ax[mapOff(dir) + p.y * pc.fw + p.x] = uint(min(255.0, floor(8.0 * c + 0.5)));
+    }
+}
