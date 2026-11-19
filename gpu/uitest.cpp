@@ -1667,7 +1667,7 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
-// V3 (skeleton, gpu/V3.md step S) = V1's luma and its own synthesis: 2; no motion-blur passes. Its final group has 15 (gpu/V3.md section 7:
+// V3 (gpu/V3.md): V1's luma and its own passes: 13 after step Y1; no motion-blur passes. Its final group has 15 (gpu/V3.md section 7:
 // luma, v2_static and 13 v3_*); raise this with the steps that add the passes.
 static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 13 : 16; }
 
@@ -1875,12 +1875,12 @@ static void motionCheck(const Scene& sc) {
         expect(gLivePipes - q0 == versionPipes(MotionVersion::V3), "V3: the first switch to V3 creates its pipelines (versionPipes(V3))");
         expect(!run(f, false, nullptr) && blurRefused(f), "V3: after the switch the old estimate is gone");
         expect(run(f, true, &o3), "V3: estimate + synth");
-        {   // the skeleton's output: the time-weighted blend at t = 0.5, (prev + curr + 1) >> 1 per channel
+        {   // (Y1) the synthesis moves content: the output at t = 0.5 is not the plain time-weighted blend (prev + curr + 1) >> 1 of the panning scene
             const std::vector<uint8_t> p = sc.frame(10), c = sc.frame(11);
             size_t bad = 0;
             for (size_t i = 0; i < o3.size() && i < p.size(); i++)
                 if ((i & 3) != 3 && o3[i] != (uint8_t)((p[i] + c[i] + 1) >> 1)) bad++;
-            expect(bad == 0, "V3: the skeleton's output is the time-weighted blend (prev + curr + 1) >> 1");
+            expect(bad > 0, "V3: the output is not the plain time-weighted blend (the synthesis follows the motion)");
         }
         expect(f.setSettings(sFrom) && !run(f, false, nullptr), "V3: switching back drops the V3 estimate");
         expect(run(f, true, &o4) && o4 == o0, "V3: switching back gives the start version's output again");
