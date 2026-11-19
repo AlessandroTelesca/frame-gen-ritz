@@ -258,5 +258,13 @@ void main() {
         accA += w * a;
         ws += w;
     }
+#if defined(FG_YUV)
+    // the Y plane at p; the CbCr plane by the even-even pixel of each 2x2 block (as v2_morph.glsl: its taps sit at the block centre)
+    imageStore(outImg, p, vec4(fgOut(acc.x / ws), 0.0, 0.0, 1.0));
+    if (((p.x | p.y) & 1) == 0) imageStore(outImgC, p >> 1, vec4(fgOut2(acc.yz / ws), 0.0, 1.0));
+#elif defined(FG_FORMAT_F16)
+    imageStore(outImg, p, FG_STORE(v3Half(acc / ws), accA / ws));   // rounded to the nearest half here, as the sub-frames' V3_QUANT
+#else
     imageStore(outImg, p, FG_STORE(acc / ws, accA / ws));
+#endif
 }

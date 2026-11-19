@@ -909,32 +909,18 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     printf("\n== %s ==\n", encName(e));
     if (!formatSupported(e)) { printf("    SKIP: the device cannot sample + store this format\n"); return; }
 #ifndef FORMATTEST_NO_MOTION
-    if (algoV3() && e != Enc::Rgba8) {   // V3's skeleton (gpu/V3.md step S) has Rgba8 only: every other format must refuse it with a reason (step F re-enables the checks below)
-        InitInfo info = baseInfo(e, W, H, Settings{});
-        Interpolator fg;
-        expect(!fg.init(info) && fg.initError() && *fg.initError(), "V3 skeleton: init refuses this format with a reason (no V3 variants yet)");
-        printf("    initError: %s\n", fg.initError() ? fg.initError() : "(none)");
-        InitInfo i1 = info;
-        i1.settings.motionVersion = MotionVersion::V1;
-        Settings s3 = i1.settings;
-        s3.motionVersion = MotionVersion::V3;
-        Interpolator f1;
-        expect(f1.init(i1) && f1.settingsError(s3) && !f1.setSettings(s3) && f1.settings().motionVersion == MotionVersion::V1,
-               "V3 skeleton: a V1 instance of this format refuses the switch to V3 (settingsError, setSettings false, nothing changed)");
-        f1.destroy();
-        printf("    SKIP: the V3 checks of this format (step F)\n");
-        return;
-    }
-    if (algoV2()) {   // V2 runs every format: no Format rule, and a V1 instance of this format switches to V2 at runtime
+    if (algoV2() || algoV3()) {   // V2 and V3 run every format: no Format rule, and a V1 instance of this format switches to them at runtime
+        const MotionVersion mv = algoV3() ? MotionVersion::V3 : MotionVersion::V2;
         InitInfo info = baseInfo(e, W, H, Settings{});
         Format f;
         formatOf(info.viewFormat, &f);
-        expect(!Interpolator::settingsError(info.settings, f), "settingsError: MotionVersion::V2 is valid for this format");
+        info.settings.motionVersion = mv;
+        expect(!Interpolator::settingsError(info.settings, f), algoV3() ? "settingsError: MotionVersion::V3 is valid for this format" : "settingsError: MotionVersion::V2 is valid for this format");
         Interpolator fg;
         info.settings.motionVersion = MotionVersion::V1;
-        Settings v2 = info.settings;
-        v2.motionVersion = MotionVersion::V2;
-        expect(fg.init(info) && fg.setSettings(v2) && fg.settings().motionVersion == MotionVersion::V2, "a V1 instance of this format switches to V2 (setSettings)");
+        Settings sv = info.settings;
+        sv.motionVersion = mv;
+        expect(fg.init(info) && fg.setSettings(sv) && fg.settings().motionVersion == mv, algoV3() ? "a V1 instance of this format switches to V3 (setSettings)" : "a V1 instance of this format switches to V2 (setSettings)");
         fg.destroy();
     }
 #endif
@@ -1116,8 +1102,10 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
                off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
         expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
-        const size_t lim = algoV3() ? 56 : 8;   // V3 (Y2 measured 64 / 12, tuning 50 / 9, against Off 239 / 125): its own ceiling; the V2 limit is 8
-        expect(v2.art05 <= lim && v2.artBlur <= lim, algoV3() ? "CrosshairV2 leaves at most 56 artifact px around the plus, t = 0.5 and blurred (V3: Off 239 / 125)" : "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
+        // V3 (Y2 measured 64 / 12, tuning 50 / 9 in Rgba8, against Off 239 / 125): its own ceiling; the V2 limit is 8. The other formats count the
+        // same pixels against their own thresholds and land a little higher (step F, measured 56..62 / 8..10, F16 linear light 93 / 8 against Off 274 / 206)
+        const size_t lim = algoV3() ? (e == Enc::Rgba8 ? 56 : e == Enc::F16Lin ? 100 : 64) : 8;
+        expect(v2.art05 <= lim && v2.artBlur <= lim, algoV3() ? "CrosshairV2 leaves few artifact px around the plus, t = 0.5 and blurred (V3: at most 56 in Rgba8, 64 in the other formats, 100 in F16 linear light; Off 239 / 125 and more)" : "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
         expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
     double pw = psnr(w05, truth, &near, false);
@@ -1403,12 +1391,6 @@ int main(int argc, char** argv) {
     double p8 = psnr(dec8, truth8, &near, false);
     for (Enc e : {Enc::Rgba8, Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::Nv12, Enc::P010})
         checkFormat(e, sc, p8, dec8);
-    if (algoV3()) {   // V3's skeleton has Rgba8 only: the HDR / precision checks (formats other than Rgba8) come with step F of gpu/V3.md
-        printf("\n== HDR and precision checks: SKIPPED for V3 (Rgba8 only in the skeleton, step F re-enables them) ==\n");
-        printf("\nRESULT: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
-        vkDeviceWaitIdle(dev);
-        return fails ? 1 : 0;
-    }
     checkHdr(sc);
     for (Enc e : {Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::P010}) checkHdrMotion(e, sc);
     printf("\n== precision (a smooth 0.2..0.3 gradient moving 2 px; distinct values on one output row) ==\n");

@@ -3,7 +3,7 @@
 // value itself, YUV (Y, Cb, Cr) levels) and every threshold is in 8-bit levels, compared on V3_LV of working values. V3_D: the per-channel
 // distance of two working values, V3_G their difference, V3_TAP a bilinear tap (position rounded to 1/32 px), V3_PX a texel (YUV: Y at p,
 // CbCr of p's 2x2 block), V3_UIP the position whose CrosshairV2 footprint covers both, V3_QUANT a sub-frame exactly as the store gives
-// it. Only the Rgba8 spelling is built so far (the other formats are step F of gpu/V3.md); the rest is the verbatim copy for it.
+// it. Built once per format (v3_planes.comp, v3_synth.comp; gpu/meson.build v3_colour_srcs).
 vec4 tapRaw(sampler2D t, vec2 p) {
     p = roundEven(p * 32.0) * (1.0 / 32.0);
     return textureLod(t, (p + 0.5) / vec2(pc.W, pc.H), 0.0);

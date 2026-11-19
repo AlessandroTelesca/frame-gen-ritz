@@ -68,6 +68,9 @@ wide2_shaders = wide2_gen.process('shaders/medhist.comp', 'shaders/v2_medhist.co
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
 # MotionVersion::Learned: only its duplicate test, its static guard and the colour variant's chroma planes read colour; the net and the zero test read the luma
 ml_colour_srcs = ['shaders/ml_dup.comp', 'shaders/ml_guard.comp', 'shaders/ml_planes.comp']
+# MotionVersion::V3: its raw planes (the colour of both frames -> its level-0 planes) and its synthesis read colour (YUV: both planes); its other
+# passes work on those planes and the luma. The static-structure mask (v2_static.comp) is V2's plain build: it reads the luma only.
+v3_colour_srcs = ['shaders/v3_planes.comp', 'shaders/v3_synth.comp']
 variant_shaders = []
 foreach f : get_option('formats')
   g = generator(glslang,
@@ -75,7 +78,7 @@ foreach f : get_option('formats')
     depfile : '@BASENAME@_' + f + '_spv.h.d',
     arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
                  '-DFG_FORMAT_' + f.to_upper() + '=1', '--vn', '@BASENAME@_' + f + '_spv', '-o', '@OUTPUT@', '@INPUT@'])
-  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs), g.process(ml_colour_srcs)]
+  variant_shaders += [g.process(colour_srcs), g.process(v2_colour_srcs), g.process(ml_colour_srcs), g.process(v3_colour_srcs)]
   if f == 'nv12' or f == 'p010'
     variant_shaders += [g.process(chroma_srcs)]
   endif

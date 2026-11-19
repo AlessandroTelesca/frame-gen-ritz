@@ -49,9 +49,9 @@
 #include "v2_enclose_spv.h"
 #include "v2_morph_s_spv.h"
 #include "v2_qmorph_s_spv.h"
-// MotionVersion::V3 (gpu/V3.md; skeleton: only its synthesis, which has a variant per format once step F adds them: Rgba8 so far)
+// MotionVersion::V3 (gpu/V3.md): its raw planes (v3_planes) and its synthesis (v3_synth) read colour and have a variant per format (probed per format below)
 #include "v3_synth_spv.h"
-// (E1: the estimate's passes, plain builds; v3_planes gets its per-format variants with the synthesis in step F)
+// (the estimate's other passes: plain builds, they work on V3's own planes and the luma)
 #include "v3_planes_spv.h"
 #include "v3_pyr_spv.h"
 #include "v3_hist_spv.h"
@@ -118,6 +118,12 @@
 #include "ml_guard_rgb10_spv.h"
 #include "ml_planes_rgb10_spv.h"
 #endif
+// ... and MotionVersion::V3's colour passes of rgb10, its raw planes and its synthesis (probed on their own, like V2's synthesis)
+#if __has_include("v3_synth_rgb10_spv.h") && __has_include("v3_planes_rgb10_spv.h") && defined(FG_HAVE_RGB10)
+#define FG_HAVE_V3_RGB10 1
+#include "v3_synth_rgb10_spv.h"
+#include "v3_planes_rgb10_spv.h"
+#endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_f16_spv.h")
 #define FG_HAVE_F16 1
@@ -148,6 +154,12 @@
 #include "ml_dup_f16_spv.h"
 #include "ml_guard_f16_spv.h"
 #include "ml_planes_f16_spv.h"
+#endif
+// ... and MotionVersion::V3's colour passes of f16, its raw planes and its synthesis (probed on their own, like V2's synthesis)
+#if __has_include("v3_synth_f16_spv.h") && __has_include("v3_planes_f16_spv.h") && defined(FG_HAVE_F16)
+#define FG_HAVE_V3_F16 1
+#include "v3_synth_f16_spv.h"
+#include "v3_planes_f16_spv.h"
 #endif
 // nv12: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_nv12_spv.h")
@@ -182,6 +194,12 @@
 #include "ml_guard_nv12_spv.h"
 #include "ml_planes_nv12_spv.h"
 #endif
+// ... and MotionVersion::V3's colour passes of nv12, its raw planes and its synthesis (probed on their own, like V2's synthesis)
+#if __has_include("v3_synth_nv12_spv.h") && __has_include("v3_planes_nv12_spv.h") && defined(FG_HAVE_NV12)
+#define FG_HAVE_V3_NV12 1
+#include "v3_synth_nv12_spv.h"
+#include "v3_planes_nv12_spv.h"
+#endif
 // p010: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
 #if __has_include("luma_p010_spv.h")
 #define FG_HAVE_P010 1
@@ -215,6 +233,12 @@
 #include "ml_guard_p010_spv.h"
 #include "ml_planes_p010_spv.h"
 #endif
+// ... and MotionVersion::V3's colour passes of p010, its raw planes and its synthesis (probed on their own, like V2's synthesis)
+#if __has_include("v3_synth_p010_spv.h") && __has_include("v3_planes_p010_spv.h") && defined(FG_HAVE_P010)
+#define FG_HAVE_V3_P010 1
+#include "v3_synth_p010_spv.h"
+#include "v3_planes_p010_spv.h"
+#endif
 
 namespace framegen {
 
@@ -237,12 +261,12 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
 #define V2_SET(c, f) (c.v2Morph = SPV(v2_morph##f), c.v2MorphS = SPV(v2_morph_s##f), c.v2QMorph = SPV(v2_qmorph##f), c.v2QMorphS = SPV(v2_qmorph_s##f))
-#define V3_SET(c, f) (c.v3Synth = SPV(v3_synth##f))   // (V3: Rgba8 only so far; the other formats' variants come with step F of gpu/V3.md)
+#define V3_SET(c, f) (c.v3Synth = SPV(v3_synth##f), c.v3Planes = SPV(v3_planes##f))   // (V3's two colour passes: the raw planes and the synthesis)
 #define ML_SET(c, f) (c.mlDup = SPV(ml_dup##f), c.mlGuard = SPV(ml_guard##f), c.mlPlanes = SPV(ml_planes##f))
 // false = this format's variants were not built into the library (meson option `formats`)
 bool colourSpv(Format f, ColourSpv& c) {
@@ -262,6 +286,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #ifdef FG_HAVE_ML_RGB10
         ML_SET(c, _rgb10);
 #endif
+#ifdef FG_HAVE_V3_RGB10
+        V3_SET(c, _rgb10);
+#endif
         return true;
 #endif
 #ifdef FG_HAVE_F16
@@ -272,6 +299,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #endif
 #ifdef FG_HAVE_ML_F16
         ML_SET(c, _f16);
+#endif
+#ifdef FG_HAVE_V3_F16
+        V3_SET(c, _f16);
 #endif
         return true;
 #endif
@@ -284,6 +314,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #ifdef FG_HAVE_ML_NV12
         ML_SET(c, _nv12);
 #endif
+#ifdef FG_HAVE_V3_NV12
+        V3_SET(c, _nv12);
+#endif
         return true;
 #endif
 #ifdef FG_HAVE_P010
@@ -295,6 +328,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #ifdef FG_HAVE_ML_P010
         ML_SET(c, _p010);
 #endif
+#ifdef FG_HAVE_V3_P010
+        V3_SET(c, _p010);
+#endif
         return true;
 #endif
     default: return false;
@@ -302,7 +338,7 @@ bool colourSpv(Format f, ColourSpv& c) {
 }
 inline bool isYuv(Format f) { return f == Format::Nv12 || f == Format::P010; }
 const char* const kV2NotBuilt = "the MotionVersion::V2 shader variants of this format (v2_morph, v2_morph_s, v2_qmorph, v2_qmorph_s) are not built into the library";
-const char* const kV3NotBuilt = "MotionVersion::V3 has no shader variants for this format yet (only Rgba8 so far); use MotionVersion::V1 or V2";
+const char* const kV3NotBuilt = "the MotionVersion::V3 shader variants of this format (v3_planes, v3_synth) are not built into the library";
 const char* const kMlNotBuilt = "the MotionVersion::Learned shaders of this format (ml_dup, ml_reduce, ml_pyr, ml_match, ml_conv, ml_out, ml_zero, ml_guard, ml_planes) or its weights (ml_weights.h, gpu/ml/embed_weights.py) are not built into the library";
 const char* const kMlFlowScale = "MotionVersion::Learned needs flowScale 2 (its nets were trained at 2)";
 // The input variants of the learned nets (ml-fg export/SPEC.md sections 10.7, 11; the manifest's `variant`, read by gpu/ml/embed_weights.py,
@@ -1362,7 +1398,7 @@ bool Interpolator::init(const InitInfo& ii) {
     if (ii.settings.motionVersion == MotionVersion::V2 && v2Why) { err_ = v2Why; return false; }
     if (ii.settings.motionVersion == MotionVersion::V2 && !cs.v2Morph.code) { err_ = kV2NotBuilt; return false; }
     if (ii.settings.motionVersion == MotionVersion::Learned && !cs.mlDup.code) { err_ = kMlNotBuilt; return false; }
-    if (ii.settings.motionVersion == MotionVersion::V3 && !cs.v3Synth.code) { err_ = kV3NotBuilt; return false; }
+    if (ii.settings.motionVersion == MotionVersion::V3 && (!cs.v3Synth.code || !cs.v3Planes.code)) { err_ = kV3NotBuilt; return false; }
     if (fmt == Format::RgbaF16 && ii.transfer == Transfer::Linear && !(ii.linearWhiteNits > 0.0f && ii.linearWhiteNits <= 10000.0f)) {
         err_ = "linearWhiteNits must be in (0, 10000]";
         return false;
@@ -1641,7 +1677,7 @@ const char* Interpolator::settingsError(const Settings& s) const {
     if (m && s.motionVersion == MotionVersion::V2 && m->v2Why) return m->v2Why;
     if (m && s.motionVersion == MotionVersion::V2 && !m->cs.v2Morph.code) return kV2NotBuilt;
     if (m && s.motionVersion == MotionVersion::Learned && !m->cs.mlDup.code) return kMlNotBuilt;
-    if (m && s.motionVersion == MotionVersion::V3 && !m->cs.v3Synth.code) return kV3NotBuilt;
+    if (m && s.motionVersion == MotionVersion::V3 && (!m->cs.v3Synth.code || !m->cs.v3Planes.code)) return kV3NotBuilt;
     return m && m->W ? sizeLimitError(m->W, m->H, s, m->lim) : nullptr;   // the held size under these settings
 }
 
@@ -1728,7 +1764,7 @@ bool Interpolator::Impl::motionEnsure() {
         // V1's luma only (the format's); the rest is V3's own. Built so far: the synthesis (skeleton) and the estimate's planes, pyramid,
         // histograms, search and dense pass (E1); the other P_V3_* slots are reserved for the later steps
         for (int i = P_DOWN; i <= P_LOOKUP; i++) spv[i].sp = Spv{};
-        spv[P_V3_PLANES].sp = SPV(v3_planes);
+        spv[P_V3_PLANES] = {cs.v3Planes, spec};   // (reads colour: the format's own variant)
         spv[P_V3_PYR].sp = SPV(v3_pyr);
         spv[P_V3_HIST].sp = SPV(v3_hist);
         spv[P_V3_SEARCH].sp = SPV(v3_search);

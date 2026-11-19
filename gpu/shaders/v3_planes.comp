@@ -3,8 +3,8 @@
 // MotionVersion::V3, build step E1 (gpu/V3.md section 3.2): the full-resolution colour of both frames -> the raw planes of level 0 at flow
 // resolution, texel (Y, Cb, Cr) per flow pixel of prev and curr (b13 raw[0], V3B_PYR texels [0, 2 N): frame f at f N + y fw + x), as
 // packHalf2x16(Y, Cb), packHalf2x16(Cr, 0). Y is read from the luma buffer (buf[0], luma.comp's level 0, after the CrosshairV2 fill), Cb / Cr
-// = 0.564 (B - Y), 0.713 (R - Y) from the mean R, G, B levels of the fscale x fscale cell and that cell's own mean Y. RGB formats only so far:
-// every colour access goes through the V3_* macros of v3_format.glsl (Rgba8 spelling; the YUV / F16 / Rgb10 variants are step F). fscale 4:
+// = 0.564 (B - Y), 0.713 (R - Y) from the mean R, G, B levels of the fscale x fscale cell and that cell's own mean Y. Built once per format (step F, gpu/V3.md):
+// every colour access is a V3_* macro of v3_format.glsl or rgbL below (F16: the perceptual levels of fgMetric; YUV: the R'G'B' of the codes). fscale 4:
 // the quad scheme of luma.comp (a 2x2 thread quad per flow pixel, each thread sums a 2x2 of the 4x4 cell), 4x4 flow pixels per workgroup.
 #include "common.glsl"
 #include "v3_common.glsl"
@@ -12,9 +12,16 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 #if defined(FG_YUV)
-#error "v3_planes.comp: the YUV variant is not built yet (gpu/V3.md step F)"
+// YUV: the R'G'B' (full-range levels) the (Y, Cb, Cr) of a pixel stand for (its Y, the CbCr of its 2x2 block), so that the cell's mean R, G, B
+// (and with it Cb / Cr below) is what the RGB formats give for the same picture; the matrix is the format's (format.glsl YU_*)
+vec3 rgbL(sampler2D ty, sampler2D tc, ivec2 p) {
+    const float y = (texelFetch(ty, p, 0).r * YU_SCALE - YU_BLACK) * YU_YS;
+    const vec2 c = texelFetch(tc, p >> 1, 0).rg * YU_SCALE - 128.0;
+    return clamp(vec3(y + YU_RCR * c.y, y + YU_GCB * c.x + YU_GCR * c.y, y + YU_BCB * c.x), 0.0, 255.0);
+}
+#else
+#define rgbL(t, tc, p) V3_LV(V3_LEVELS(V3_PX(t, tc, p).rgb))   // levels of a perceptually encoded 8-bit picture (F16: fgMetric; texPrevC / texCurrC exist only in the YUV builds)
 #endif
-#define rgbL(t, tc, p) V3_LEVELS(V3_PX(t, tc, p).rgb)   // (a macro: texPrevC / texCurrC exist only in the YUV builds)
 
 shared vec3 sA[64], sC[64];
 shared int sN[64];
