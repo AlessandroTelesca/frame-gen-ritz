@@ -9,7 +9,7 @@
 // --format rgba8|rgb10|f16|f16lin|nv12|p010: the image format of inputs and outputs (files stay RGBA8, converted on upload and
 // readback; rgb10 / f16 / p010 as PQ HDR, f16lin as scRGB, see Fmt below).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
-// smoothBonus searchPenalty subpixel flowScale v2StaticMask; algo=v1|v2|learned = motionVersion; v2Mode=quality|performance;
+// smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask; algo=v1|v2|learned = motionVersion; v2Mode=quality|performance;
 // learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
@@ -80,12 +80,15 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "hudBonus") s.hudBonus = (float)v;
         else if (k == "smoothBonus") s.smoothBonus = (float)v;
         else if (k == "searchPenalty") s.searchPenalty = (float)v;
+        else if (k == "searchRadius") s.searchRadius = (uint32_t)v;
+        else if (k == "searchRadiusTop") s.searchRadiusTop = (uint32_t)v;
         else if (k == "subpixel") s.subpixel = v != 0;
         else if (k == "v2StaticMask") s.v2StaticMask = v != 0;
         else if (k == "learnedHalf") s.learnedHalf = v != 0;
         else if (k == "learnedZeroTest") s.learnedZeroTest = v != 0;
         else if (k == "learnedStaticGuard") s.learnedStaticGuard = v != 0;
         else if (k == "flowScale") s.flowScale = (uint32_t)v;
+        else if (k == "pyramidMinSide") s.pyramidMinSide = (uint32_t)v;
         else if (k == "ui") {   // Settings::uiProtection: off | crosshair | wholescreen | crosshairv2
             std::string a = eq + 1;
             if (a == "off") s.uiProtection = framegen::UiProtection::Off;

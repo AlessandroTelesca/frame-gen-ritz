@@ -1659,13 +1659,13 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
     return vkGetDeviceProcAddr(d, name);
 }
 static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : v == MotionVersion::Learned ? "Learned" : "V1"; }
-// The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes.
+// The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes + the wide search (radius above 6, created with the search).
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
-// modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11.
+// modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11, plus the wide search.
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 15 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 14; }
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 16 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 15; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1695,6 +1695,23 @@ static void motionCheck(const Scene& sc) {
         expect(Interpolator::validate(mq) && Interpolator::validate(mp) && !Interpolator::validate(mb) && Interpolator::validate(m1),
                "validate: v2Mode Quality / Performance accepted (also with V1, which ignores it), an unknown mode rejected");
         expect(Settings{}.v2Mode == V2Mode::Quality, "v2Mode defaults to Quality");
+    }
+    {   // searchRadius / searchRadiusTop [1, 12] (defaults 2 / 6), pyramidMinSide [16, 256] (default 48)
+        Settings d, b;
+        expect(d.searchRadius == 2 && d.searchRadiusTop == 6 && d.pyramidMinSide == 48, "reach settings default to 2 / 6 / 48");
+        b = d; b.searchRadius = 0; expect(!Interpolator::validate(b), "validate rejects searchRadius 0");
+        b = d; b.searchRadius = 13; expect(!Interpolator::validate(b), "validate rejects searchRadius 13");
+        b = d; b.searchRadius = 1; expect(Interpolator::validate(b), "validate accepts searchRadius 1");
+        b = d; b.searchRadius = 12; expect(Interpolator::validate(b), "validate accepts searchRadius 12");
+        b = d; b.searchRadiusTop = 0; expect(!Interpolator::validate(b), "validate rejects searchRadiusTop 0");
+        b = d; b.searchRadiusTop = 13; expect(!Interpolator::validate(b), "validate rejects searchRadiusTop 13");
+        b = d; b.searchRadiusTop = 1; expect(Interpolator::validate(b), "validate accepts searchRadiusTop 1");
+        b = d; b.searchRadiusTop = 12; expect(Interpolator::validate(b), "validate accepts searchRadiusTop 12");
+        b = d; b.pyramidMinSide = 15; expect(!Interpolator::validate(b), "validate rejects pyramidMinSide 15");
+        b = d; b.pyramidMinSide = 257; expect(!Interpolator::validate(b), "validate rejects pyramidMinSide 257");
+        b = d; b.pyramidMinSide = 16; expect(Interpolator::validate(b), "validate accepts pyramidMinSide 16");
+        b = d; b.pyramidMinSide = 256; expect(Interpolator::validate(b), "validate accepts pyramidMinSide 256");
+        b = d; b.searchRadius = 13; expect(Interpolator::settingsError(b, Format::Rgba8) != nullptr, "settingsError refuses searchRadius 13");
     }
 
     Img a = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -1747,7 +1764,7 @@ static void motionCheck(const Scene& sc) {
     expect(fg.setSettings(sTo), "switch accepted");
     const int64_t k = gLivePipes - p0;
     printf("    pipelines: %lld after init, +%lld for the first switch to %s\n", (long long)p0, (long long)k, algoName(to));
-    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 14, V2: 15)");
+    expect(k == versionPipes(to), "the first switch creates the new version's pipelines (V1: 15, V2: 16, each with its wide search)");
     expect(!run(fg, false, nullptr) && blurRefused(fg), "after the switch the old estimate is gone: recordSynth and recordSynthBlur return false");
     expect(fg.setSettings(sFrom) && gLivePipes == p0 + k, "switching back creates nothing (the start version kept its pipelines)");
     expect(!run(fg, false, nullptr), "switching straight back does not revive the dropped estimate");
@@ -1769,6 +1786,26 @@ static void motionCheck(const Scene& sc) {
     expect(gLivePipes == p0, "release after switching back: the other version freed");
     fg.destroy();
     expect(gLivePipes == 0, "destroy frees every pipeline");
+
+    {   // searchRadius / searchRadiusTop are runtime (a raise above 6 after init uses the wide search, created with the group);
+        // pyramidMinSide is structural: setSettings refuses a change, reconfigure applies it
+        Settings d = sFrom, w = sFrom, ms = sFrom;
+        w.searchRadius = 12; w.searchRadiusTop = 12; ms.pyramidMinSide = 32;
+        Interpolator f;
+        InitInfo inf;
+        inf.phys = phys; inf.device = dev; inf.gdpa = vkGetDeviceProcAddr; inf.width = W; inf.height = H;
+        inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.getProps2 = vkGetPhysicalDeviceProperties2; inf.settings = d;
+        std::vector<uint8_t> o0, o1, o2;
+        expect(f.init(inf) && run(f, true, &o0), "reach: estimate + synth at the defaults");
+        expect(f.setSettings(w) && f.settings().searchRadius == 12 && f.settings().searchRadiusTop == 12, "reach: setSettings applies searchRadius / searchRadiusTop 12 at runtime");
+        expect(run(f, true, &o1), "reach: estimate + synth with the wide search");
+        expect(f.setSettings(d) && run(f, true, &o2) && o2 == o0, "reach: back at the defaults gives the default output again");
+        expect(!f.setSettings(ms) && f.settings().pyramidMinSide == 48, "reach: setSettings refuses a pyramidMinSide change and changes nothing");
+        expect(f.reconfigure(ms) && f.settings().pyramidMinSide == 32 && run(f, true, &o1), "reach: reconfigure applies pyramidMinSide and the pair runs");
+        expect(f.setSettings(ms), "reach: setSettings accepts the settings when pyramidMinSide is unchanged");
+        vkDeviceWaitIdle(dev);
+        f.destroy();
+    }
 
     {   // Settings::v2Mode: runtime (no pipelines created, no rebuild), a switch of the mode alone keeps the estimate (the other mode's
         // part is derived from it by its first synth: the same output as with that mode's own estimate); a switch of the version still

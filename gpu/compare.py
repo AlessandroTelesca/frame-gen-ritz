@@ -41,6 +41,12 @@ def apply_settings(spec):
             interp.SUBPIX = (0.5, 0.25) if v else ()
         elif k == "flowScale":
             interp.FLOW_SCALE = int(v)
+        elif k == "searchRadius":
+            interp.RADIUS = int(v)
+        elif k == "searchRadiusTop":
+            interp.TOP_RADIUS = int(v)
+        elif k == "pyramidMinSide":
+            interp.MIN_SIDE = int(v)
         else:
             name = {"globalFallback": "GLOBAL_FRAC", "sceneCutSad": "CUT_SAD", "hudBonus": "ZERO_BONUS",
                     "smoothBonus": "SMOOTH_BONUS", "searchPenalty": "LAMBDA"}[k]

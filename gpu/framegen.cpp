@@ -10,6 +10,7 @@
 #include "down_spv.h"
 #include "medhist_spv.h"
 #include "search_spv.h"
+#include "search_wide_spv.h"
 #include "median3_spv.h"
 #include "subpix_spv.h"
 #include "pixfield_spv.h"
@@ -32,6 +33,7 @@
 // MotionVersion::V2 (every format: only its synthesis, v2_morph / v2_morph_s / v2_qmorph / v2_qmorph_s, has format variants, below)
 #include "v2_medhist_spv.h"
 #include "v2_search_spv.h"
+#include "v2_search_wide_spv.h"
 #include "v2_qfield_spv.h"
 #include "v2_qown_spv.h"
 #include "v2_qcov_spv.h"
@@ -348,6 +350,9 @@ struct PC {
     float lambda, smoothBonus, zeroBonus, cutSad, trust0, trustScale, globalFrac;
 };
 static_assert(sizeof(PC) <= 128, "push constants beyond the guaranteed minimum");
+// The default search shaders hold windows up to +-6 (FG_MAXR in search.comp / v2_search.comp); a radius above it takes the
+// *_wide build (FG_MAXR 12, the largest that fits the guaranteed 16 KiB of shared memory). Chosen from the settings only.
+static const int kSearchMaxR = 6;
 static const int kEOff = 64;   // == E_OFF in motion_v1.glsl
 
 // Must match the push-constant block in shaders/v2_motion.glsl (V2 Performance's synthesis passes; V2's estimate pushes PC). Pushed
@@ -449,8 +454,8 @@ struct UiEntry {
 // P_V2_*: MotionVersion::V2's own passes (empty in V1's group; V2's group leaves V1's P_MEDHIST / P_SEARCH / P_SUBPIX empty instead).
 // P_ML_*: MotionVersion::Learned's (its group has V1's luma and synthesis, none of V1's search); the convs are one pipeline per layer
 // shape (first / hidden / last) and net (LearnedNet), shaders/ml_conv.comp specialised. P_ML_PLANES / P_ML_FEAT: the colour and features variants' per-frame planes and the features extractor.
-enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
-            P_V2_MEDHIST, P_V2_SEARCH, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
+enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_SEARCH, P_SEARCH_WIDE, P_MEDIAN3, P_SUBPIX, P_PIXFIELD, P_ERROR, P_RESOLVE, P_FALLBACK, P_LOOKUP,
+            P_V2_MEDHIST, P_V2_SEARCH, P_V2_SEARCH_WIDE, P_V2_CLEAN, P_V2_MORPH, P_V2_REPICK, P_V2_QFIELD, P_V2_QOWN, P_V2_QCOV, P_V2_QMORPH, P_V2_STATIC, P_V2_ENCLOSE, P_V2_MORPH_S, P_V2_QMORPH_S,
             P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD, P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
 // variant (ML_EXT); the conv pipelines per activation storage too; convs per
@@ -497,14 +502,14 @@ struct DevLimits {
     uint32_t wg[3] = {65535u, 65535u, 65535u};   // maxComputeWorkGroupCount
 };
 // The motion estimate's layout of a size: the flow resolution, its pyramid (interp.flow(): luma at 1/flowScale, cv2 rounding, down to
-// MIN_SIDE), the luma words and the field entries (vec2) of the shared buffers. createSizeDependent and sizeLimitError use it.
+// minSide = Settings::pyramidMinSide, 48 by default), the luma words and the field entries (vec2) of the shared buffers. createSizeDependent and sizeLimitError use it.
 struct SizeLayout {
     int fw = 0, fh = 0;
     std::vector<Level> lv;
     int lumaWords = 0, fieldSub = 0, fieldPF = 0, fieldT = 0, fieldEntries = 0;
 };
 static int rintHalfEven(double v) { return (int)std::nearbyint(v); }   // == cv2 saturate_cast<int>
-static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
+static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale, uint32_t minSide) {
     SizeLayout L;
     L.fw = rintHalfEven(W * (1.0 / flowScale));
     L.fh = rintHalfEven(H * (1.0 / flowScale));
@@ -518,7 +523,7 @@ static SizeLayout sizeLayout(uint32_t W, uint32_t H, uint32_t flowScale) {
         l.fS = fieldOff; l.fM = fieldOff + l.bw * l.bh;
         fieldOff += 2 * l.bw * l.bh;
         L.lv.push_back(l);
-        if (std::min(w, h) / 2 < 48) break;
+        if ((uint32_t)(std::min(w, h) / 2) < minSide) break;
         w = rintHalfEven(w * 0.5);
         h = rintHalfEven(h * 0.5);
     }
@@ -576,7 +581,7 @@ static const char* sizeLimitError(uint32_t W, uint32_t H, const Settings& s, con
     if (W < Interpolator::kMinSize || H < Interpolator::kMinSize) return "the frame size is below Interpolator::kMinSize (16 pixels) in width or height";
     if (lim.img2D && (W > lim.img2D || H > lim.img2D)) return "the frame size exceeds the device's maxImageDimension2D";
     if ((uint64_t)W * H > (1ull << 30)) return "the frame size exceeds 2^30 pixels (32-bit indexing of the library's buffers)";
-    const SizeLayout L = sizeLayout(W, H, s.flowScale);
+    const SizeLayout L = sizeLayout(W, H, s.flowScale, s.pyramidMinSide);
     const uint64_t fwh = (uint64_t)L.fw * L.fh, cells = (uint64_t)((L.fw + 7) / 8) * ((L.fh + 7) / 8);
     uint64_t big = std::max({(uint64_t)L.lumaWords * 4, (uint64_t)L.fieldEntries * 8, (uint64_t)(64 + (W + 3) / 4 * (uint64_t)H) * 4});
     uint64_t gx = (W + 7) / 8, gy = (H + 7) / 8;
@@ -776,8 +781,8 @@ bool Interpolator::Impl::makeBuffer(int i, VkDeviceSize size) {
 }
 
 bool Interpolator::Impl::createSizeDependent() {
-    // interp.flow(): luma at 1/FLOW_SCALE (cv2 rounds the size), pyramid down to MIN_SIDE (sizeLayout).
-    SizeLayout L = sizeLayout(W, H, set.flowScale);
+    // interp.flow(): luma at 1/FLOW_SCALE (cv2 rounds the size), pyramid down to Settings::pyramidMinSide (sizeLayout).
+    SizeLayout L = sizeLayout(W, H, set.flowScale, set.pyramidMinSide);
     fw = L.fw; fh = L.fh;
     lv = L.lv;
     fieldSub = L.fieldSub;
@@ -1463,7 +1468,8 @@ bool Interpolator::validate(const Settings& s) {
            in(s.globalFallback, 0.0f, 1.0f) && s.globalFallback > 0.0f &&
            in(s.sceneCutSad, 0.0f, 255.0f) && s.sceneCutSad > 0.0f &&
            in(s.hudBonus, 0.0f, 255.0f) && in(s.smoothBonus, 0.0f, 255.0f) && in(s.searchPenalty, 0.0f, 255.0f) &&
-           (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) &&
+           s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
+           (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::Learned &&
            (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
@@ -1499,7 +1505,7 @@ const char* Interpolator::sizeError(uint32_t w, uint32_t h) const {
 }
 
 bool Interpolator::setSettings(const Settings& s) {
-    if (!m || settingsError(s) || s.flowScale != m->set.flowScale) return false;
+    if (!m || settingsError(s) || s.flowScale != m->set.flowScale || s.pyramidMinSide != m->set.pyramidMinSide) return false;
     // UI protection, and a motion version selected for the first time: creating what the new settings need is allowed here (it
     // frees nothing, so no GPU wait); false = the creation failed and nothing changed (a version created before a later failure
     // is kept, unused, for releaseUnusedMotion()).
@@ -1515,7 +1521,7 @@ bool Interpolator::setSettings(const Settings& s) {
 
 bool Interpolator::reconfigure(const Settings& s) {
     if (!m || settingsError(s)) return false;
-    bool structural = s.flowScale != m->set.flowScale;
+    bool structural = s.flowScale != m->set.flowScale || s.pyramidMinSide != m->set.pyramidMinSide;
     Settings old = m->set;
     m->set = s;
     if (!m->motionEnsure()) { m->set = old; return false; }
@@ -1548,7 +1554,7 @@ bool Interpolator::Impl::motionEnsure() {
     // as are the two colour passes of the blur. V2: both modes' pipelines (see MotionGroup), the format's luma and synthesis; empty
     // slots are skipped.
     struct { Spv sp; const VkSpecializationInfo* sc; } spv[P_COUNT] = {
-        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(median3), nullptr},
+        {cs.luma, spec}, {SPV(down), nullptr}, {SPV(medhist), nullptr}, {SPV(search), nullptr}, {SPV(search_wide), nullptr}, {SPV(median3), nullptr},
         {SPV(subpix), nullptr}, {SPV(pixfield), nullptr}, {cs.error, spec}, {cs.resolve, spec}, {cs.fallback, spec},
         {SPV(lookup), nullptr}};
     if (set.motionVersion == MotionVersion::V2) {
@@ -1556,6 +1562,7 @@ bool Interpolator::Impl::motionEnsure() {
         for (int i = P_MEDHIST; i <= P_LOOKUP; i++) spv[i].sp = Spv{};
         spv[P_V2_MEDHIST].sp = SPV(v2_medhist);
         spv[P_V2_SEARCH].sp = SPV(v2_search);
+        spv[P_V2_SEARCH_WIDE].sp = SPV(v2_search_wide);
         spv[P_V2_CLEAN].sp = SPV(v2_clean);
         spv[P_V2_MORPH] = {cs.v2Morph, spec};   // (the synthesis: the format's own variant)
         spv[P_V2_REPICK].sp = SPV(v2_repick);
@@ -2435,12 +2442,12 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             pc.offA = l.offA; pc.offC = l.offC;
             if (i == n - 1) {
                 pc.medIdx = -1;
-                pc.radius = 6;   // TOP_RADIUS
+                pc.radius = I.set.searchRadiusTop;
             } else {
                 const Level& p = I.lv[i + 1];
                 pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fS;   // the parent's RAW search output
                 pc.medIdx = 4 + 2 * i;
-                pc.radius = 2;   // RADIUS
+                pc.radius = I.set.searchRadius;
                 r.run(P_V2_MEDHIST, 1, 1);
                 r.cbar();
             }
@@ -2448,7 +2455,7 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             // finest level (bits): 1 = V1's scene-cut sum (sub-pixel refinement off: the search's SAD is final), 2 = Performance's
             // block field (V2B_FIELD at bw * bh) and its own scene-cut sum, 4 = with the equiangular sub-pixel fit
             pc.sadAcc = i == 0 ? (!I.set.subpixel ? 1 : 0) | 2 | (I.set.subpixel ? 4 : 0) : 0;
-            r.run(P_V2_SEARCH, l.bw, l.bh);
+            r.run(pc.radius > kSearchMaxR ? P_V2_SEARCH_WIDE : P_V2_SEARCH, l.bw, l.bh);
             r.cbar();
             r.stamp(lvNames[std::min(i, 7)]);
         }
@@ -2462,18 +2469,18 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         pc.offA = l.offA; pc.offC = l.offC;
         if (i == n - 1) {
             pc.medIdx = -1;
-            pc.radius = 6;   // TOP_RADIUS
+            pc.radius = I.set.searchRadiusTop;
         } else {
             const Level& p = I.lv[i + 1];
             pc.pw = p.bw; pc.ph = p.bh; pc.fPar = p.fM;
             pc.medIdx = 4 + 2 * i;
-            pc.radius = 2;   // RADIUS
+            pc.radius = I.set.searchRadius;
             r.run(P_MEDHIST, 1, 1);
             r.cbar();
         }
         pc.fOut = l.fS;
         pc.sadAcc = i == 0 && !I.set.subpixel;   // without sub-pixel refinement the search's SAD is final
-        r.run(P_SEARCH, l.bw, l.bh);
+        r.run(pc.radius > kSearchMaxR ? P_SEARCH_WIDE : P_SEARCH, l.bw, l.bh);
         r.cbar();
         pc.fIn = l.fS; pc.fOut = l.fM;
         r.run(P_MEDIAN3, divUp(l.bw, 8), divUp(l.bh, 8));

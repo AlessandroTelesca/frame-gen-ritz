@@ -141,7 +141,8 @@ struct Frame {
 };
 
 // Tuning knobs. The defaults are the tuned values of proto/interp.py (the approved look); with them the
-// output is byte-identical to the library without settings. Costs and mismatches are in 8-bit luma/RGB
+// output is byte-identical to the library without settings (this includes searchRadius, searchRadiusTop and
+// pyramidMinSide: at 2 / 6 / 48 the search is the one the library always had). Costs and mismatches are in 8-bit luma/RGB
 // levels (0-255) in EVERY format: 10-bit and float input is measured as the levels of an 8-bit picture of the same
 // content (10-bit codes / 4, PQ codes, YCbCr differences converted to R'G'B'), so a value means the same perceived
 // amount in all of them. Interpolator::validate() states the accepted ranges; anything else is rejected.
@@ -170,6 +171,14 @@ struct Settings {
     // vector). [0, 255]; useful 0.25-2. Higher = steadier vectors in flat/repetitive areas (less shimmer),
     // lower = follows small or fast detail more freely.
     float searchPenalty = 0.5f;
+    // Motion search reach (MotionVersion::V1 and V2, both V2 modes; Learned never runs the search and ignores both). The search
+    // tries every integer vector within +-searchRadius of its seed (the parent's vector) on each pyramid level, and within
+    // +-searchRadiusTop of zero on the coarsest. [1, 12]; default 2 and 6. Larger = follows faster motion, costs more per
+    // block (a radius above 6 runs a wider search shader: its window is (2R+1)^2 candidates) and finds more false matches.
+    // With n pyramid levels the finest level reaches searchRadiusTop * 2^(n-1) + searchRadius * (2^(n-1) - 1) flow pixels.
+    // Very long vectors are still limited in two places (the per-level median, V2 Quality's coverage step).
+    uint32_t searchRadius = 2;
+    uint32_t searchRadiusTop = 6;
     // Sub-pixel (1/2 then 1/4 px) refinement of the block vectors. Off = ~0.05 ms cheaper per real pair,
     // slightly softer/wobblier output on slow pans.
     bool subpixel = true;
@@ -340,6 +349,11 @@ struct Settings {
     // 4 = performance (1440p: ~40 % less total time at 2x, ~30 % at 4x; can miss thin/fine motion detail);
     // 1 = full res (1080p 2x: ~2.3x the time, not better on the test clips). MotionVersion::Learned takes 2 only.
     uint32_t flowScale = 2;
+    // Size of the motion pyramid's coarsest level: levels are added (each half the size) while the smaller side of the
+    // next one is at least pyramidMinSide. [16, 256]; default 48. Smaller = more levels = longer reach (see searchRadius),
+    // more cost and more risk of a wrong coarse match; larger = fewer levels. Applies to every MotionVersion (the buffers
+    // follow it; Learned does not use the pyramid).
+    uint32_t pyramidMinSide = 48;
 };
 
 struct InitInfo {
@@ -429,10 +443,10 @@ public:
     // Runtime change: applies the runtime fields (the UI-protection ones too) to every record*() recorded after this call (each record
     // copies them into its own push constants, so in-flight and already-recorded work keeps its values;
     // no retire needed). Returns false and changes nothing if the object is not initialised, the settings
-    // are invalid (settingsError() for the active format says why), or flowScale differs from the active one (that needs
+    // are invalid (settingsError() for the active format says why), or flowScale or pyramidMinSide differs from the active one (that needs
     // reconfigure()). Switching Settings::motionVersion drops the current estimate (see there).
     bool setSettings(const Settings&);
-    // Structural change (flowScale) plus the runtime fields. If flowScale changes it re-creates the
+    // Structural change (flowScale, pyramidMinSide) plus the runtime fields. If flowScale or pyramidMinSide changes it re-creates the
     // size-dependent buffers: same retire rule and failure behaviour as resize(), and the next synth needs a
     // new recordEstimate(). Returns false and changes nothing if the object is not initialised or the
     // settings are invalid (settingsError() for the active format).
@@ -615,7 +629,7 @@ public:
     // lowered, so a later raise costs nothing). Retire rule of resize()/destroy(): every earlier record must have
     // retired (the freed images may be in a submission still running), so call it where the host already waits for the
     // GPU, e.g. after the depth has stayed lower for a while. No-op if nothing is unused. resize()/reconfigure()
-    // with a new size/flowScale/destroy() free everything anyway.
+    // with a new size/flowScale/pyramidMinSide/destroy() free everything anyway.
     void releaseUnusedUi();
 
     // Frees the pipelines and buffers of the motion versions that Settings::motionVersion no longer selects (they stay

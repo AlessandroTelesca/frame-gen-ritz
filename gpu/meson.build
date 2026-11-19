@@ -44,6 +44,15 @@ colour_srcs = ['shaders/luma.comp', 'shaders/error.comp', 'shaders/resolve.comp'
                'shaders/ui_v2_update.comp', 'shaders/ui_v2_lumafill.comp',
                'shaders/blur_error.comp', 'shaders/blur_resolve.comp']
 chroma_srcs = ['shaders/ui_inpaint_chroma.comp', 'shaders/ui_patch_chroma.comp']   # YUV only: the half-resolution CbCr plane
+# The wide motion search (radius 7..12: Settings::searchRadius / searchRadiusTop above 6): the same sources with FG_MAXR 12, into
+# <name>_wide_spv. The plain builds above keep FG_MAXR 6 (their SPIR-V and shared-memory use are unchanged).
+wide_gen = generator(glslang,
+  output : '@BASENAME@_wide_spv.h',
+  depfile : '@BASENAME@_wide_spv.h.d',
+  arguments : ['-V', '--target-env', 'vulkan1.2', '--quiet', '--depfile', '@DEPFILE@',
+               '-DFG_MAXR=12', '--vn', '@BASENAME@_wide_spv', '-o', '@OUTPUT@', '@INPUT@'])
+wide_shaders = wide_gen.process('shaders/search.comp', 'shaders/v2_search.comp')
+
 # MotionVersion::V2: only its synthesis reads and writes colour (both modes, with and without the static-overlay tests; YUV: both
 # planes); its other passes read the luma, which luma.comp already gives per format
 v2_colour_srcs = ['shaders/v2_morph.comp', 'shaders/v2_morph_s.comp', 'shaders/v2_qmorph.comp', 'shaders/v2_qmorph_s.comp']
@@ -63,7 +72,7 @@ foreach f : get_option('formats')
 endforeach
 
 # The library only needs the Vulkan headers: every device function is loaded through gdpa.
-framegen_lib = static_library('framegen', 'framegen.cpp', shaders, variant_shaders, ml_weights,
+framegen_lib = static_library('framegen', 'framegen.cpp', shaders, wide_shaders, variant_shaders, ml_weights,
   dependencies : vulkan.partial_dependency(compile_args : true, includes : true))
 framegen_dep = declare_dependency(link_with : framegen_lib, include_directories : include_directories('.'))
 

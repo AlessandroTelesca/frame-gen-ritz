@@ -19,7 +19,7 @@ Motion is estimated on luma at half resolution (`flowScale` 2) over an image pyr
 Per real frame pair (`recordEstimate`, passes 1-8):
 
 1. Luma at flow resolution (`luma.comp`), then a 2x2-average pyramid (`down.comp`).
-2. Per level, coarse to fine: seed candidates per block (parents, zero vector, global median vector of the previous level; `medhist.comp`), then an integer search around the best seed, ±6 px at the coarsest level and ±2 px below it, with a penalty per step (`search.comp`).
+2. Per level, coarse to fine: seed candidates per block (parents, zero vector, global median vector of the previous level; `medhist.comp`), then an integer search around the best seed, ±6 px at the coarsest level and ±2 px below it (`searchRadiusTop`, `searchRadius`), with a penalty per step (`search.comp`).
 3. 3x3 median of the block vectors (`median3.comp`).
 4. Finest level: sub-pixel refinement at 1/2 and then 1/4 px (`subpix.comp`). A scene cut is detected when the mean block SAD is too high.
 5. Per-pixel vector choice from the smooth field, the pixel's own and neighbouring blocks, and the zero vector. A small bonus for the zero vector keeps static HUD elements in place (`pixfield.comp`).
@@ -316,11 +316,11 @@ for (int k = 1; k < N; ++k)
 - Every `record*()` returns `false` and records nothing if the object is not initialised, `t` is outside (0, 1), or more than `kSetRing` (32) estimates or synths were recorded since `beginFrame()`. `recordSynth()` also fails without a matching `recordEstimate()`. Present an output only if its call returned `true`.
 - Synths end with a compute-to-compute barrier only. Other consumers of `out` (fragment, transfer) need the caller's own barrier.
 - Not thread-safe. All records of one `Interpolator` must go to one queue, in recording order.
-- `resize()`, `destroy()`, re-`init()` and a `flowScale` change through `reconfigure()` free resources that earlier records use. Wait until those records have retired first.
+- `resize()`, `destroy()`, re-`init()` and a `flowScale` or `pyramidMinSide` change through `reconfigure()` free resources that earlier records use. Wait until those records have retired first.
 
 ## Settings
 
-`framegen::Settings` (in `gpu/framegen.h`) is passed through `InitInfo::settings`. The defaults are the tuned values that were reviewed visually, and with them the output is byte-identical to the library before settings existed. Runtime fields can be changed at any time with `setSettings()`. `flowScale` is structural and changes only through `init()` or `reconfigure()`. `Interpolator::validate()` checks the ranges.
+`framegen::Settings` (in `gpu/framegen.h`) is passed through `InitInfo::settings`. The defaults are the tuned values that were reviewed visually, and with them the output is byte-identical to the library before settings existed. Runtime fields can be changed at any time with `setSettings()`. `flowScale` and `pyramidMinSide` are structural and change only through `init()` or `reconfigure()`. `Interpolator::validate()` checks the ranges.
 
 | Field | Default | Effect |
 |---|---|---|
@@ -330,6 +330,8 @@ for (int k = 1; k < N; ++k)
 | `hudBonus` | 1.0 | Zero-vector bonus that keeps static HUD elements in place. Too high can freeze slow motion. 0 = off. |
 | `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
+| `searchRadius` | 2 | Motion search: integer vectors tried within ± this many pixels of the seed on every pyramid level below the coarsest. 1-12. V1 and V2 (both modes); `Learned` ignores it. Runtime. Above 6 it runs a wider search shader and costs more. |
+| `searchRadiusTop` | 6 | The same at the coarsest pyramid level (seed 0). 1-12. V1 and V2; `Learned` ignores it. Runtime. With n pyramid levels the finest level reaches `searchRadiusTop * 2^(n-1) + searchRadius * (2^(n-1) - 1)` flow pixels: at 1080p `flowScale` 2 the defaults give 4 levels and 62 flow pixels, about 250 px between the two real frames. Above 6 it uses the wider search shader for that level only. |
 | `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
 | `uiProtection` | Off | `Off`, `Crosshair`, `WholeScreen` or `CrosshairV2`: static-UI protection (see above). Runtime. |
 | `uiBoxHeightFrac` | 0.025 | Box = square of side round(frame height * frac), clamped to [8, min(w, h)]. [0, 1]; 0 = legacy area box. Runtime. |
@@ -351,6 +353,9 @@ for (int k = 1; k < N; ++k)
 | `learnedZeroTest`, `learnedStaticGuard` | true, false | Learned only: ml-fg's zero-motion test on the net's field (next estimate) and the opt-in static guard on the generated frames (next synth). Runtime. |
 | `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
+| `pyramidMinSide` | 48 | Pyramid stop: levels are added, each half the size, while the smaller side of the next one is at least this many flow pixels. 16-256. Smaller = more levels = longer reach, more cost, more risk of a wrong coarse match. Applies to every motion version (the buffers follow it). Structural: `reconfigure()`; `setSettings()` refuses a change. |
+
+The defaults of `searchRadius`, `searchRadiusTop` and `pyramidMinSide` reproduce the earlier output exactly. Very long vectors are currently limited in two places (the per-level median and V2 Quality's coverage step); the next change widens them.
 
 `INTEGRATION.md` lists the accepted ranges, the measured cost of each setting, and a suggested user-facing subset.
 

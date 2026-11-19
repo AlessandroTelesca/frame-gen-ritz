@@ -9,7 +9,12 @@
 #include "motion_v1.glsl"
 layout(local_size_x = 64) in;
 
-const int MAXR = 6, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);
+// Shared window arrays for radius <= FG_MAXR: 6 here; the *_wide build (meson.build, -DFG_MAXR=12) is used by the host
+// for a radius above 6 (never above FG_MAXR: framegen.cpp kSearchMaxR). 12 is the most that fits 16 KiB of shared memory.
+#ifndef FG_MAXR
+#define FG_MAXR 6
+#endif
+const int MAXR = FG_MAXR, MAXT = 8 + 2 * MAXR, MAXC = (2 * MAXR + 1) * (2 * MAXR + 1);
 shared float ta[MAXT * MAXT], tc[MAXT * MAXT];
 shared float red[6][64];
 shared float cost[MAXC], sadc[MAXC];
