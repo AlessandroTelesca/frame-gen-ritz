@@ -27,6 +27,76 @@ vec3 rawAt(int dir, int pix) {   // Y, Cb, Cr (levels) of the pixel's own frame,
     return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
 }
 
+// (task 103) the frame-edge band. Content that leaves the view (only in this pixel's frame) or comes into it has no partner in the other frame: its matching
+// cost compares against whatever looks alike (flat sky matches anywhere) and its forward-backward error is 31.9 by definition, so its vector and the
+// garbage measure g of v3_occl are noise in blocks (g goes 0 / 1 block by block with the spread of the noise vectors), and the synthesis alternated
+// between two wrong candidates in 16 px tiles. The band is where the pixel's own target (p + F) or the camera model's target (p + cam(p)) lies outside
+// the frame; there the vector is replaced, softly, by the smooth extrapolation of the interior flow: a walk from p straight inward (away from the edge
+// the target leaves through) to the first pixels whose own target stays inside and whose raw occlusion (AUX, v3_occl) is low, colour-weighted; none
+// found: the camera model. g is lowered there by the replacement when the walk found agreeing vectors, so the pixel is the one-sided occluded content
+// of its own frame (o stays as measured: the target is outside), drawn from the frame that shows it. (An extra hole in v3_project for a source outside
+// its frame was tried and dropped: the synthetic entering-edge rows of v3test got worse, the real edge bands no better.)
+const int EB_STEP = 4, EB_N = 48;   // walk: every 4 flow px, up to 192 flow px (384 px at flowScale 2)
+float outDist(vec2 t) { return max(max(-t.x, t.x - float(pc.fw - 1)), max(-t.y, t.y - float(pc.fh - 1))); }
+void edgeBand(int dir, ivec2 p, int pix, inout vec2 r) {
+    const vec2 pf = vec2(p);
+    vec2 cm = camModel(pf);
+    if (dir == 1) cm = -camModel(pf - cm);   // F10: the content at curr position p came from p - d(p)
+    const vec2 v0 = fdAt(dir, pix);
+    const vec2 tOwn = pf + v0, tCam = pf + cm;
+    const float oOwn = outDist(tOwn), oCam = outDist(tCam);
+    const uint w0 = ax[mapOff(dir) + pix];
+    const V3Map mp = v3MapUnpack(w0);
+    const float oRaw = v3Occ(mp.e, length(v0), 1.0);
+    // the exit side of the target that is farther outside; the walk goes the other way. A pixel whose own (unverifiable) vector leaves the frame counts only
+    // within reach of the edge (a garbage vector far inside is the ordinary fill's business): up to twice the camera motion plus a margin
+    const vec2 tt = oOwn > oCam ? tOwn : tCam;
+    const vec4 sides = vec4(tt.x - float(pc.fw - 1), -tt.x, tt.y - float(pc.fh - 1), -tt.y);
+    int side = 0;
+    for (int k = 1; k < 4; k++) if (sides[k] > sides[side]) side = k;
+    const ivec2 stp = side == 0 ? ivec2(-1, 0) : side == 1 ? ivec2(1, 0) : side == 2 ? ivec2(0, -1) : ivec2(0, 1);
+    const float dEdge = side == 0 ? float(pc.fw - 1 - p.x) : side == 1 ? float(p.x) : side == 2 ? float(pc.fh - 1 - p.y) : float(p.y);
+    const float lc = length(cm);
+    const float wOwn = smoothstep(-4.0, 4.0, oOwn) * (1.0 - smoothstep(1.5 * lc + 16.0, 2.0 * lc + 32.0, dEdge));
+    // the camera's band counts where the two frames differ at p (a static overlay at the edge, the HUD, looks the same in both and keeps its own vector;
+    // flat content looks the same under any vector, so nothing is lost there)
+    const vec3 z3 = abs(rawAt(0, pix) - rawAt(1, pix));
+    const float wb = max(wOwn, smoothstep(-4.0, 4.0, oCam) * smoothstep(4.0, 12.0, max(z3.x, max(z3.y, z3.z)))) * oRaw;
+    if (wb <= 0.0) return;
+    const vec3 col = rawAt(dir, pix);
+    vec2 acc = vec2(0.0);
+    float ws = 0.0, acc2 = 0.0, nh = 0.0;
+    for (int i = 1; i <= EB_N && nh < 3.0; i++) {
+        const ivec2 q = p + stp * (i * EB_STEP);
+        if (q.x < 0 || q.y < 0 || q.x >= pc.fw || q.y >= pc.fh) break;
+        const int qi = q.y * pc.fw + q.x;
+        const vec2 vq = fdAt(dir, qi);
+        if (outDist(vec2(q) + vq) > -2.0 || oEstAt(dir, qi) > 0.3) {   // (v3_occl's raw o: the MAP words are being rewritten by this pass)
+            if (nh > 0.0) break;   // the hits are consecutive: the first consistent stretch inward
+            continue;
+        }
+        const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 30.0));
+        if (w < 0.3) {   // another surface (a near post in front of the leaving sky): not this pixel's motion
+            if (nh > 0.0) break;
+            continue;
+        }
+        acc += w * vq;
+        acc2 += w * dot(vq, vq);
+        ws += w;
+        nh += 1.0;
+    }
+    vec2 ve = cm;
+    float conf = 0.0;
+    if (ws > 0.0) {
+        ve = acc / ws;
+        const float spread = sqrt(max(acc2 / ws - dot(ve, ve), 0.0));
+        conf = 1.0 - smoothstep(CONF0, CONF1, spread);
+    }
+    r = mix(r, ve, wb);
+    const uint g8 = uint(float(w0 >> 24) * (1.0 - wb * conf) + 0.5);
+    ax[mapOff(dir) + pix] = (w0 & 0x00ffffffu) | (g8 << 24);
+}
+
 void main() {
     const int dir = int(gl_GlobalInvocationID.z);
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -83,6 +153,7 @@ void main() {
         }
     }
     if (copy) r = fdAt(dir, pix);
+    if ((pc.mode & 4) == 0) edgeBand(dir, p, pix, r);
     const int ff = pc.fdOff + 4 * N + dir * 2 * N + 2 * pix;   // FF[2] follows FD[2] (2N floats per direction)
     fl[ff] = r.x;
     fl[ff + 1] = r.y;
