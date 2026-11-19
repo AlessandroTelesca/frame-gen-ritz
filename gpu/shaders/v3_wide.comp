@@ -14,7 +14,7 @@
 layout(local_size_x = 256) in;
 
 const float BAD = 1000.0;
-const float WIDE_MARGIN = 2.0, WIDE_COST = 7.0, WIDE_RATIO = 0.7;
+const float WIDE_MARGIN = 2.0, WIDE_COST = 7.0, WIDE_RATIO = 0.7, WIDE_LAMBDA = 0.06;
 
 shared vec4 sf[64];
 shared int sval[64];
@@ -43,7 +43,7 @@ float cost(ivec2 v) {
         s += ok * v3Term(sf[k], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
         n += ok;
     }
-    return (n * 2.0 >= float(nWin) && n > 0.0) ? s / n : BAD;
+    return (n * 4.0 >= 3.0 * float(nWin) && n > 0.0) ? s / n : BAD;
 }
 
 // the same on every second pixel in x and y (16 taps): stage A's coarse screening
@@ -56,7 +56,7 @@ float costSub(ivec2 v) {
         s += ok * v3Term(sf[p], v3FeatAt(L, fOff, f1, clamp(t, ivec2(0), ivec2(L.w - 1, L.h - 1))), dMu);
         n += ok;
     }
-    return (n * 8.0 >= float(nWin) && n > 0.0) ? s / n : BAD;
+    return (n * 16.0 >= 3.0 * float(nWin) && n > 0.0) ? s / n : BAD;
 }
 
 // c and its 8 neighbours at stride 1 with the full window: threads 0..8 evaluate one each; bestV / bestC become the best of them (c on a tie)
@@ -152,7 +152,7 @@ void main() {
     // stage B: two refinements of +-1
     refine(bestV);
     refine(bestV);
-    if (tid == 0 && bestC < c0 - WIDE_MARGIN && bestC < WIDE_RATIO * c0) {
+    if (tid == 0 && bestC + WIDE_LAMBDA * float(abs(int(bestV.x - round(v0.x))) + abs(int(bestV.y - round(v0.y)))) < c0 - WIDE_MARGIN && bestC < WIDE_RATIO * c0) {
         fl[ro] = float(bestV.x); fl[ro + 1] = float(bestV.y); fl[ro + 2] = min(bestC, 255.0); fl[ro + 3] = 0.5;
         atomicAdd(ax[gOff() + G_WIDE_REPLACED], 1u);
     }
