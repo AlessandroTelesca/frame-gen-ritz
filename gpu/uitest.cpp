@@ -267,10 +267,12 @@ static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static Settings algo(Settings s) { s.motionVersion = gAlgo; s.v2Mode = gMode; s.learnedZeroTest = gZt; s.learnedStaticGuard = gGuard; s.learnedNet = gNet; return s; }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
 static bool algoV2Quality() { return algoV2() && gMode == V2Mode::Quality; }
+static bool algoV3() { return gAlgo == MotionVersion::V3; }   // the skeleton of V3 (gpu/V3.md step S): a plain time-weighted blend, no motion
 #else
 static Settings algo(Settings s) { return s; }
 static bool algoV2() { return false; }
 static bool algoV2Quality() { return false; }
+static bool algoV3() { return false; }
 #endif
 static uint64_t fnv(const std::vector<uint8_t>& v) {
     uint64_t h = 1469598103934665603ull;
@@ -868,7 +870,7 @@ static void ghostCheck() {
                     snprintf(what, sizeof what, "%s: V2 leaves at most 1 artifact px (t = 0.5) and 2 (t = 0.25)", name);
                     expect(m2.art05 <= 1 && m2.art025 <= 2, what);
                     snprintf(what, sizeof what, "%s: control, Off shows the doubled crosshair (>= 15 px, V2 %zu)", name, m2.art05);
-                    expect(mo.art05 >= 15, what);
+                    if (!algoV3()) expect(mo.art05 >= 15, what);
                 }
             }
     kPanX = oldPanX; kPanY = oldPanY;
@@ -954,7 +956,7 @@ static int v2Check(int W, int H) {
         Result rl = runSequence(sc, lo, true, nullptr);
         size_t badLo = uiDiffers(sc, rl.out[0], real11, 1, all);
         printf(" contrast gate 255: crosshair wrong %zu; gate 0: %zu\n", badHi, badLo);
-        expect(badHi > 0, "V2: uiContrastThreshold 255 admits nothing: the crosshair is not protected");
+        if (!algoV3()) expect(badHi > 0, "V2: uiContrastThreshold 255 admits nothing: the crosshair is not protected");
         expect(badLo == 0, "V2: uiContrastThreshold 0 (no gate): crosshair pixel-exact");
     }
 
@@ -984,7 +986,7 @@ static int v2Check(int W, int H) {
                 if (d > reach) outside++; else inside++;
             }
         printf(" V2 vs Off (t = 0.5 and 0.25): %zu pixels differ within %d px of the %dx%d work rectangle, %zu beyond (farthest %d px)\n", inside, reach, wr[2], wr[3], outside, far);
-        expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off beyond the work rectangle plus the motion reach");
+        if (!algoV3()) expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off beyond the work rectangle plus the motion reach");
         for (int arm : {7, 16}) {
             Scene sh(W, H, 12, 0, 0, arm, 0);
             harshBackground(sh);
@@ -1134,7 +1136,7 @@ static int v2Check(int W, int H) {
         size_t bv1 = uiDiffers(sc, rv1.out[0], real, 1, all);
         printf(" hysteresis (2 changed frames, back at 16, pair 16-17): wrong px  leave 4: %zu   leave 1: %zu   V1: %zu   (of %zu)\n", b4, b1, bv1, n);
         expect(b4 == 0, "hysteresis: leave 4 keeps the arm masked through a 2-frame disturbance, exact on the first pair after it");
-        expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
+        if (!algoV3()) expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
         expect(bv1 > 0, "control: V1 loses the arm (needs 8 still frames again)");
         if (algoV2()) {   // the same with V2's static-structure mask on (the default): it must not break the state machine's result
             Settings h4s = h4; h4s.v2StaticMask = true;
@@ -1165,8 +1167,8 @@ static int v2Check(int W, int H) {
         printf(" fast re-entry (arm leaves at 17, back at 19): wrong arm px  re-entry 2: pair(19,20) %zu, pair(18,19) %zu | re-entry 0: pair(19,20) %zu, pair(25,26) %zu, pair(26,27) %zu\n", a, b, c, d, e);
         expect(a == 0, "fast re-entry 2: the arm is protected again on the pair 2 frames after it came back");
         expect(b > 0, "(the pair before it is not: one matching frame is not enough)");
-        expect(c > 0, "control: without re-entry the arm is still unprotected there");
-        expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
+        if (!algoV3()) expect(c > 0, "control: without re-entry the arm is still unprotected there");
+        if (!algoV3()) expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
         if (algoV2()) {   // the same with V2's static-structure mask on (the default)
             Settings re2s = re2; re2s.v2StaticMask = true;
             size_t as = runAt(21, re2s);
@@ -1658,14 +1660,16 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countingGdpa(VkDevice d, const c
     if (!strcmp(name, "vkDestroyPipeline")) return (PFN_vkVoidFunction)countDestroyPipe;
     return vkGetDeviceProcAddr(d, name);
 }
-static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : v == MotionVersion::Learned ? "Learned" : "V1"; }
+static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "V2" : v == MotionVersion::Learned ? "Learned" : v == MotionVersion::V3 ? "V3" : "V1"; }
 // The pipelines of one motion version's group (framegen.cpp MotionGroup): V1 = 11 estimate / synth passes + 3 motion-blur passes + the wide search (radius above 6, created with the search) + the wide median histogram.
 // V2 = both V2Modes: V1's luma / down, its 2 faster estimate passes (medhist, search), the block re-pick and field clean-up (both
 // modes), Performance's morph, Quality's per-pixel field, splat, coverage and morph; no motion-blur passes (its morphs blur): 11, plus the wide search.
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : 16; }
+// V3 (skeleton, gpu/V3.md step S) = V1's luma and its own synthesis: 2; no motion-blur passes. Its final group has 15 (gpu/V3.md section 7:
+// luma, v2_static and 13 v3_*); raise this with the steps that add the passes.
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 2 : 16; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.
@@ -1683,7 +1687,7 @@ static void motionCheck(const Scene& sc) {
     printf("\n== motion version: start %s, switch to %s ==\n", algoName(from), algoName(to));
     {   // every Format runs both versions
         Settings v1, v2; v2.motionVersion = MotionVersion::V2;
-        Settings bad; bad.motionVersion = (MotionVersion)3;   // (2 = MotionVersion::Learned)
+        Settings bad; bad.motionVersion = (MotionVersion)4;   // (2 = MotionVersion::Learned, 3 = V3)
         expect(Interpolator::validate(v2) && !Interpolator::validate(bad), "validate accepts V2 and rejects an unknown motion version");
         const Format all[5] = {Format::Rgba8, Format::Rgb10, Format::RgbaF16, Format::Nv12, Format::P010};
         Settings mq = v2, mp = v2, mb = v2, m1 = v1;
@@ -1856,6 +1860,36 @@ static void motionCheck(const Scene& sc) {
         f.destroy();
         expect(gLivePipes == 0, "v2Mode: destroy frees every pipeline");
     }
+    if (from != MotionVersion::V3) {   // V3 (skeleton): its group is versionPipes(V3) pipelines, selectable at runtime from any version, and back
+        Settings s3 = sFrom;
+        s3.motionVersion = MotionVersion::V3;
+        gLivePipes = 0;
+        Interpolator f;
+        InitInfo inf;
+        inf.phys = phys; inf.device = dev; inf.gdpa = countingGdpa; inf.width = W; inf.height = H;
+        inf.viewFormat = fmt(); inf.getMemProps = vkGetPhysicalDeviceMemoryProperties; inf.getProps2 = vkGetPhysicalDeviceProperties2; inf.settings = sFrom;
+        std::vector<uint8_t> o0, o3, o4;
+        expect(f.init(inf) && run(f, true, &o0), "V3: a start instance in the start version");
+        const int64_t q0 = gLivePipes;
+        expect(f.setSettings(s3), "V3: runtime switch to V3 accepted");
+        expect(gLivePipes - q0 == versionPipes(MotionVersion::V3), "V3: the first switch to V3 creates its pipelines (versionPipes(V3))");
+        expect(!run(f, false, nullptr) && blurRefused(f), "V3: after the switch the old estimate is gone");
+        expect(run(f, true, &o3), "V3: estimate + synth");
+        {   // the skeleton's output: the time-weighted blend at t = 0.5, (prev + curr + 1) >> 1 per channel
+            const std::vector<uint8_t> p = sc.frame(10), c = sc.frame(11);
+            size_t bad = 0;
+            for (size_t i = 0; i < o3.size() && i < p.size(); i++)
+                if ((i & 3) != 3 && o3[i] != (uint8_t)((p[i] + c[i] + 1) >> 1)) bad++;
+            expect(bad == 0, "V3: the skeleton's output is the time-weighted blend (prev + curr + 1) >> 1");
+        }
+        expect(f.setSettings(sFrom) && !run(f, false, nullptr), "V3: switching back drops the V3 estimate");
+        expect(run(f, true, &o4) && o4 == o0, "V3: switching back gives the start version's output again");
+        vkDeviceWaitIdle(dev);
+        f.releaseUnusedMotion();
+        expect(gLivePipes == q0, "V3: releaseUnusedMotion frees V3's pipelines");
+        f.destroy();
+        expect(gLivePipes == 0, "V3: destroy frees every pipeline");
+    }
     for (Img* i : {&a, &b, &o}) { vkDestroyImageView(dev, i->view, nullptr); vkDestroyImage(dev, i->img, nullptr); vkFreeMemory(dev, i->mem, nullptr); }
 }
 #endif
@@ -1871,7 +1905,8 @@ int main(int argc, char** argv) {
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
-            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
+            else if (!strcmp(a, "v3")) gAlgo = MotionVersion::V3;
+            else { fprintf(stderr, "--algo v1|v2|learned|v3\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1887,7 +1922,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

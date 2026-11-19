@@ -45,8 +45,10 @@ static bool gZt = true, gGuard = false;            // --zt, --guard: Settings::l
 static LearnedNet gNet = Settings{}.learnedNet;   // --net e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3: Settings::learnedNet (Learned only; default: the library's)
 static bool parseNet(const char* a) { return learnedNetFromName(a, &gNet); }
 static bool algoV2() { return gAlgo == MotionVersion::V2; }
+static bool algoV3() { return gAlgo == MotionVersion::V3; }   // the skeleton of V3 (gpu/V3.md step S): Rgba8 only, a plain blend
 #else
 static bool algoV2() { return false; }
+static bool algoV3() { return false; }
 #endif
 static uint64_t fnv(const std::vector<uint8_t>& v, uint64_t h = 1469598103934665603ull) {
     for (uint8_t b : v) { h ^= b; h *= 1099511628211ull; }
@@ -734,7 +736,7 @@ static void blurExact(Enc e, const Scene& sc) {
            bad, bl.size(), flt ? "relative" : "codes", worst, spread);
     // V1 (frozen) rounds each sub-frame of its blur to 8-bit levels in every RGB format (blur_resolve.comp) and not at all in YUV:
     // judged only in Rgba8 there
-    if (algoV2() || e == Enc::Rgba8)
+    if (algoV2() || algoV3() || e == Enc::Rgba8)
         expect(bad == 0 && spread > 0, "recordSynthBlur == the average of the recordSynth(t_k) sub-frames, rounded once as the format stores it");
     else
         printf("    INFO (V1, not judged: its blur rounds each sub-frame to 8-bit levels in Rgb10 / RgbaF16, not at all in Nv12 / P010)\n");
@@ -907,6 +909,22 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     printf("\n== %s ==\n", encName(e));
     if (!formatSupported(e)) { printf("    SKIP: the device cannot sample + store this format\n"); return; }
 #ifndef FORMATTEST_NO_MOTION
+    if (algoV3() && e != Enc::Rgba8) {   // V3's skeleton (gpu/V3.md step S) has Rgba8 only: every other format must refuse it with a reason (step F re-enables the checks below)
+        InitInfo info = baseInfo(e, W, H, Settings{});
+        Interpolator fg;
+        expect(!fg.init(info) && fg.initError() && *fg.initError(), "V3 skeleton: init refuses this format with a reason (no V3 variants yet)");
+        printf("    initError: %s\n", fg.initError() ? fg.initError() : "(none)");
+        InitInfo i1 = info;
+        i1.settings.motionVersion = MotionVersion::V1;
+        Settings s3 = i1.settings;
+        s3.motionVersion = MotionVersion::V3;
+        Interpolator f1;
+        expect(f1.init(i1) && f1.settingsError(s3) && !f1.setSettings(s3) && f1.settings().motionVersion == MotionVersion::V1,
+               "V3 skeleton: a V1 instance of this format refuses the switch to V3 (settingsError, setSettings false, nothing changed)");
+        f1.destroy();
+        printf("    SKIP: the V3 checks of this format (step F)\n");
+        return;
+    }
     if (algoV2()) {   // V2 runs every format: no Format rule, and a V1 instance of this format switches to V2 at runtime
         InitInfo info = baseInfo(e, W, H, Settings{});
         Format f;
@@ -1000,7 +1018,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     printf("    UI WholeScreen: crosshair wrong %zu/%zu (t=.25: %zu), hud wrong %zu/%zu (t=.25: %zu)\n", xh, xhN, xh2, hud, hudN, hud2);
     expect(xh == 0 && xh2 == 0, "crosshair pixels equal the real ones (WholeScreen, t = 0.5 and 0.25)");
     expect(hud == 0 && hud2 == 0, "HUD box pixels equal the real ones (WholeScreen)");
-    expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
+    if (!algoV3()) expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
     {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical
         Result rt = runSequence(e, sc, w, false, true);
         expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
@@ -1097,7 +1115,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         if (!off.ok || !v2.ok) { expect(false, "ghost scene init + sequence"); return; }
         printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
                off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
-        expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
+        if (!algoV3()) expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
         expect(v2.art05 <= 8 && v2.artBlur <= 8, "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
         expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
@@ -1239,12 +1257,12 @@ static void apiChecks(int W, int H) {
         printf("    sizeError at the device's limits (- = fits):\n");
         const uint32_t sz[][2] = {{7680, 4320}, {8192, 8192}, {12288, 12288}, {16384, 16384}, {16385, 16}};
         bool fits8k = true, refused = true;
-        for (int v = 0; v < 2; v++)
+        for (int v = 0; v < 3; v++)
             for (uint32_t fs : {1u, 2u, 4u}) {
                 Settings st;
                 st.flowScale = fs;
 #ifndef FORMATTEST_NO_MOTION
-                st.motionVersion = v ? MotionVersion::V2 : MotionVersion::V1;
+                st.motionVersion = v == 2 ? MotionVersion::V3 : v ? MotionVersion::V2 : MotionVersion::V1;
 #endif
                 Interpolator fg2;
                 InitInfo ii = baseInfo(Enc::Rgba8, 64, 64, st);
@@ -1252,7 +1270,7 @@ static void apiChecks(int W, int H) {
                 ii.settings.motionVersion = st.motionVersion;
 #endif
                 if (!fg2.init(ii)) { expect(false, "init 64 x 64"); continue; }
-                printf("      %s fs%u:", v ? "V2" : "V1", fs);
+                printf("      %s fs%u:", v == 2 ? "V3" : v ? "V2" : "V1", fs);
                 for (auto& z : sz) {
                     const char* e = fg2.sizeError(z[0], z[1]);
                     printf("  %ux%u %s", z[0], z[1], e ? (strstr(e, "maxImageDimension2D") ? "image" : strstr(e, "BufferRange") ? "buffer" : strstr(e, "WorkGroupCount") ? "dispatch" : "other") : "-");
@@ -1292,7 +1310,8 @@ int main(int argc, char** argv) {
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
-            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
+            else if (!strcmp(a, "v3")) gAlgo = MotionVersion::V3;
+            else { fprintf(stderr, "--algo v1|v2|learned|v3\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1306,7 +1325,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "time")) { fprintf(stderr, "usage: formattest check|time [--separate-planes] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1361,7 +1380,7 @@ int main(int argc, char** argv) {
 #else
     const char* v2ModeName = "-";
 #endif
-    printf("formattest %dx%d on %s, motion version %s, v2Mode %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : "V1",
+    printf("formattest %dx%d on %s, motion version %s, v2Mode %s (YUV: %s)\n", W, H, props.deviceName, algoV2() ? "V2" : algoV3() ? "V3" : "V1",
            v2ModeName, separatePlanes ? "separate plane images" : "multi-planar image + plane views, falling back to separate images");
     apiChecks(W, H);
     Scene sc(W, H, 12);
@@ -1383,6 +1402,12 @@ int main(int argc, char** argv) {
     double p8 = psnr(dec8, truth8, &near, false);
     for (Enc e : {Enc::Rgba8, Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::Nv12, Enc::P010})
         checkFormat(e, sc, p8, dec8);
+    if (algoV3()) {   // V3's skeleton has Rgba8 only: the HDR / precision checks (formats other than Rgba8) come with step F of gpu/V3.md
+        printf("\n== HDR and precision checks: SKIPPED for V3 (Rgba8 only in the skeleton, step F re-enables them) ==\n");
+        printf("\nRESULT: %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+        vkDeviceWaitIdle(dev);
+        return fails ? 1 : 0;
+    }
     checkHdr(sc);
     for (Enc e : {Enc::Rgb10, Enc::F16Enc, Enc::F16Lin, Enc::P010}) checkHdrMotion(e, sc);
     printf("\n== precision (a smooth 0.2..0.3 gradient moving 2 px; distinct values on one output row) ==\n");

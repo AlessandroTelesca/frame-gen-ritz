@@ -949,7 +949,7 @@ TEST_CASE("Learned settings", "[api]") {
     CHECK(byName == LearnedNet::E1v3);
     CHECK_FALSE(Interpolator::validate(bad));
     bad = s;
-    bad.motionVersion = (MotionVersion)3;
+    bad.motionVersion = (MotionVersion)4;
     CHECK_FALSE(Interpolator::validate(bad));
 
     // runtime: V1 -> Learned (drops the estimate) -> a net switch (keeps it) -> V1 (drops it); a size beyond the device refused

@@ -91,6 +91,9 @@ executable('uitest', 'uitest.cpp', dependencies : [framegen_dep, vulkan])
 
 executable('formattest', 'formattest.cpp', dependencies : [framegen_dep, vulkan])
 
+# MotionVersion::V3's known-motion test (procedural scenes with exact flows and in-between frames, gpu/V3.md section 11)
+executable('v3test', 'v3test.cpp', dependencies : [framegen_dep, vulkan, dependency('threads')])
+
 blend_bench = shader_gen.process('blendbench.comp')   # test only: the naive blend the benchmark compares against
 executable('blurtest', 'blurtest.cpp', blend_bench, dependencies : [framegen_dep, vulkan])
 

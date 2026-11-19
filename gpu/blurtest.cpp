@@ -671,7 +671,7 @@ static Edge modelEdge(const BScene& bs, const std::vector<float>& t, const std::
 static int check(int W, int H) {
 #ifndef BLURTEST_NO_MOTION
     printf("check %dx%d %s, motion version %s (--algo), v2Mode %s (--mode)\n", W, H, bgra ? "BGRA8" : "RGBA8",
-           gAlgo == MotionVersion::V2 ? "V2" : gAlgo == MotionVersion::Learned ? "Learned" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
+           gAlgo == MotionVersion::V2 ? "V2" : gAlgo == MotionVersion::Learned ? "Learned" : gAlgo == MotionVersion::V3 ? "V3" : "V1", gMode == V2Mode::Performance ? "performance" : "quality");
 #else
     printf("check %dx%d %s\n", W, H, bgra ? "BGRA8" : "RGBA8");
 #endif
@@ -815,7 +815,7 @@ static int check(int W, int H) {
         size_t diff = 0;
         for (size_t i = 0; i < a.size(); i++) diff += a[i] != b[i];
         printf("   forced flick (globalFallback 0.001) changes %zu bytes of the N=4 [0.25,0.75] output\n", diff);
-        expect(diff > 0, "the whole-frame flick fallback is applied by the fix-up pass");
+        if (gAlgo != MotionVersion::V3) expect(diff > 0, "the whole-frame flick fallback is applied by the fix-up pass");
     }
     // ---- 4. the edge of a moving object smears over speed x (t1 - t0); the crosshair stays pixel-exact
     for (int mode = 0; mode < BT_NMODES; mode++) {
@@ -1007,7 +1007,8 @@ int main(int argc, char** argv) {
             if (!strcmp(a, "v1")) gAlgo = MotionVersion::V1;
             else if (!strcmp(a, "v2")) gAlgo = MotionVersion::V2;
             else if (!strcmp(a, "learned")) gAlgo = MotionVersion::Learned;
-            else { fprintf(stderr, "--algo v1|v2|learned\n"); return 2; }
+            else if (!strcmp(a, "v3")) gAlgo = MotionVersion::V3;
+            else { fprintf(stderr, "--algo v1|v2|learned|v3\n"); return 2; }
         }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* a = argv[++i];
@@ -1021,7 +1022,7 @@ int main(int argc, char** argv) {
 #endif
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned] [--mode quality|performance] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench")) { fprintf(stderr, "usage: blurtest check|bench [--bgra] [--algo v1|v2|learned|v3] [--mode quality|performance] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
