@@ -869,15 +869,20 @@ int main(int argc, char** argv) {
     int selfFails = 0;
     if (which == "all" || which == "decide") {
         // the decisions on pairs that are not ordinary: a cut (two unrelated frames) is mode 1, noise against a picture is failMix 1; a lighting change (gamma) is neither
-        struct Case { const char* name; int expectMode; float expectFail; };
-        const Case cases[] = {{"cut", 1, -1}, {"noise", 0, 1}, {"gamma 0.5", 0, 0}};
+        // (task 103) the scene cut is off by default (Settings::v3SceneCut = 0, never): the cut rows set the old threshold 0.45 explicitly, and the row
+        // "cut (default)" runs the same unrelated pair with the default: no cut, a generated frame (finite, not a copy of either real frame)
+        struct Case { const char* name; int expectMode; float expectFail; float thresh; };
+        const Case cases[] = {{"cut", 1, -1, 0.45f}, {"noise", 0, 1, 0.45f}, {"gamma 0.5", 0, 0, 0.45f}, {"cut (default)", 0, -1, -1.0f}};
         for (const Case& cs : cases) {
+            framegen::Settings st = info.settings;
+            if (cs.thresh >= 0.0f) st.v3SceneCut = cs.thresh;
+            gFg.setSettings(st);
             Scene A, B;
             A.W = B.W = W; A.H = B.H = H;
             A.layers = {plane(1, 0.5 * W, 0.5 * H)};
             B.layers = {plane(9, 0.5 * W, 0.5 * H)};
             std::vector<uint8_t> pa = renderFrame(A, 0.0), pb = renderFrame(B, 0.0);
-            if (!strcmp(cs.name, "cut")) for (size_t i = 0; i < pb.size() / 4; i++) {   // another scene: big dark / bright blocks (the same generator with another seed, or an inverted copy, has the same level statistics: not a cut a histogram could see)
+            if (!strncmp(cs.name, "cut", 3)) for (size_t i = 0; i < pb.size() / 4; i++) {   // another scene: big dark / bright blocks (the same generator with another seed, or an inverted copy, has the same level statistics: not a cut a histogram could see)
                 const size_t x = i % W, y = i / W;
                 const uint8_t v = ((x / 240 + y / 135) & 1) ? 235 : 20;
                 pb[i * 4] = pb[i * 4 + 1] = pb[i * 4 + 2] = v;
@@ -889,8 +894,24 @@ int main(int argc, char** argv) {
             Run r;
             const bool rok = runV3(a, b, o, ts, nullptr, r);
             const bool ok = rok && r.mode == cs.expectMode && (cs.expectFail < 0 || r.failMix == cs.expectFail);
-            printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut 0.45)   %s (expected mode %d%s)\n", cs.name, r.mode, r.failMix, r.histD, ok ? "PASS" : "FAIL", cs.expectMode, cs.expectFail < 0 ? "" : ", failMix 1.00 (or 0.00 for the gamma pair)");
+            printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut %.2f)   %s (expected mode %d%s)\n", cs.name, r.mode, r.failMix, r.histD, st.v3SceneCut, ok ? "PASS" : "FAIL", cs.expectMode, cs.expectFail < 0 ? "" : ", failMix 1.00 (or 0.00 for the gamma pair)");
             verdict(ok, true);
+            if (rok && ts.size() && cs.thresh < 0.0f) {   // the default on a true cut: one generated frame per t, not a copy of either real frame
+                for (size_t k = 0; k < ts.size(); k++) {
+                    size_t same0 = 0, same1 = 0;
+                    double d0 = 0.0, d1 = 0.0;
+                    for (size_t i = 0; i < pa.size(); i++) {
+                        if (i % 4 == 3) continue;
+                        same0 += r.out[k][i] == pa[i]; same1 += r.out[k][i] == pb[i];
+                        d0 += std::abs((int)r.out[k][i] - (int)pa[i]); d1 += std::abs((int)r.out[k][i] - (int)pb[i]);
+                    }
+                    const double nv = pa.size() * 0.75;
+                    const bool okc = d0 / nv > 1.0 && d1 / nv > 1.0;
+                    printf("%-20s default output t=%.2f: mean |out - prev| %.1f, |out - curr| %.1f levels (identical values %.1f%% / %.1f%%)   %s (a generated frame, not a held real one)\n", cs.name, ts[k],
+                           d0 / nv, d1 / nv, 100.0 * same0 / nv, 100.0 * same1 / nv, okc ? "PASS" : "FAIL");
+                    verdict(okc, true);
+                }
+            }
             if (rok && ts.size() && r.mode == 1) {   // a cut: every generated frame is a real frame (prev for t <= 0.5, curr after)
                 for (size_t k = 0; k < ts.size(); k++) {
                     const std::vector<uint8_t>& want = ts[k] <= 0.5 ? pa : pb;
@@ -901,6 +922,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        gFg.setSettings(info.settings);
     }
     for (const Scene& sc : scenes) {
         const Flows F = exactFlows(sc, fs);
@@ -965,7 +987,7 @@ int main(int argc, char** argv) {
                 const double N2 = 2.0 * F.fw * F.fh, share = 100.0 * est.unsure / N2, shareE = 100.0 * G[31] / std::max((double)G[30], 0.25 * N2);
                 const bool ok = est.mode == 0 && est.failMix == 0.0f;
                 printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut %.2f)  unsure %.1f%% of flow px, %.1f%% of those that could find a partner (globalFallback 15%%)   %s (an ordinary pair: mode 0, failMix 0)\n", nm.c_str(),
-                       est.mode, est.failMix, est.histD, 0.45, share, shareE, ok ? "PASS" : "FAIL");
+                       est.mode, est.failMix, est.histD, info.settings.v3SceneCut, share, shareE, ok ? "PASS" : "FAIL");
                 verdict(ok, true);
             }
             if (gSShare) for (size_t k = 0; k < ts.size() && k < est.sShare.size(); k++) {

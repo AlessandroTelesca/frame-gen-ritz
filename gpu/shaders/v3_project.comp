@@ -32,6 +32,7 @@ vec2 ffBil(int dir, vec2 q) {
 // (tuning D3) a garbage region's vector is taken for the camera model's where it is far from it: a ramp over the vector difference (flow px)
 const float V3_GARB0 = 20.0, V3_GARB1 = 50.0;
 const float SM = 8.0;
+const float V3_XF0 = 1.5, V3_XF1 = 4.0;   // (task 103) the histogram distance D over which a failed pair becomes a cross-fade (fast pans: D <= 0.8; unrelated frames 2..14)
 const float V3_SM0 = 0.3, V3_SM1 = 0.7;   // (tuning 3) the unsure value over which the vector low-pass ramps in
 const float V3_INC0 = 8.0, V3_INC1 = 32.0, V3_INCU = 0.9, V3_INCP = 0.9;   // (tuning 3) incoherence ramp (mean vector distance, flow px), its unsure value and its pull toward the camera model
 
@@ -103,6 +104,15 @@ void main() {
     vec3 a, b;
     hyp(0, t, vec2(m), f, gA, a);
     hyp(1, 1.0 - t, vec2(m), f, gB, b);
+    {   // (task 103) a true scene cut with the cut decision off (v3SceneCut = 0, the default): a failed estimate (f) between two frames whose histograms are
+        // unrelated (D far above anything motion gives: fast real pans reach 0.8) becomes a plain time blend of the two frames (zero vectors, no occlusion,
+        // hole or smear): one cross-faded frame instead of a mosaic of garbage vectors, and never a held real frame. A ramp in D and f, uniform per pair.
+        const float xf = f * smoothstep(V3_XF0, V3_XF1, uintBitsToFloat(ax[g + G_HIST_D]));
+        if (xf > 0.0) {
+            gA *= 1.0 - xf; gB *= 1.0 - xf;
+            a *= 1.0 - xf; b *= 1.0 - xf;
+        }
+    }
     const int N = pc.fw * pc.fh;
     const int o = pc.fdOff + 8 * N + int(gz) * 4 * N + 4 * (m.y * pc.fw + m.x);
     fl[o] = uintBitsToFloat(packHalf2x16(gA));

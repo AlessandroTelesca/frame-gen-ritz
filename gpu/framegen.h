@@ -323,7 +323,9 @@ struct Settings {
     // v3Smear [0, 1]: smear strength, +- (this x the inter-frame motion) at full unsureness; 0 = no smear.
     // v3OcclSoft [0.25, 4]: width of the occlusion ramp (higher = softer one-sided transition). v3Unsure [0.25, 4]: scales the poor-match
     // ramp of the unsure measure (higher = trusts worse matches). Runtime, act in the synthesis, no re-estimate needed.
-    // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never), read by the estimate.
+    // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never, the default), read by the estimate. At a cut every
+    // generated frame of the pair is the nearer real frame (a repeated frame: on fast motion a false cut shows as a stutter, which is why it is off
+    // by default since task 103; with 0 the pair is always interpolated, a true cut then shows one smeared / blended in-between frame).
     // v3ColourWindow: hook (j), the matching windows of the block search and the dense pass weighted by colour similarity to the block's
     // centre (applies from the next estimate; costs about +0.06 ms at 1080p flowScale 2; gpu/V3.md 3.5 "As built (j)"); with it off the
     // output is byte-identical to V3 without the hook. v3DetailSplit: hook (l), fine detail from one frame only: in the synthesis the blend of
@@ -335,7 +337,7 @@ struct Settings {
     float v3Smear = 0.35f;
     float v3OcclSoft = 1.0f;
     float v3Unsure = 1.0f;
-    float v3SceneCut = 0.45f;
+    float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
     // MotionVersion::Learned: the net (see LearnedNet). E2v5 = the default (E2v4, E2v3 before it); E1v5 = the small net, the recommended
@@ -505,8 +507,10 @@ public:
     // Synths of one pair share internal scratch (field at t, mismatch, counter) and are serialised by
     // barriers, in recording order; each one's out is complete when its own record ends.
     //
-    // t in (0, 1). t == 0.5 is exactly the 2x midpoint path. Every fallback (per pixel, scene cut, more than
+    // t in (0, 1). t == 0.5 is exactly the 2x midpoint path. V1, V2, Learned: every fallback (per pixel, scene cut, more than
     // Settings::globalFallback untrusted, default 15 %) presents the nearer real frame: prev for t <= 0.5, curr for t > 0.5.
+    // MotionVersion::V3 never presents a real frame in place of an in-between, except at a scene cut when Settings::v3SceneCut > 0
+    // (default 0 = never): its failed-estimate fallback and its weak spots are smeared along the motion (gpu/V3.md 3.12, 3.14).
     //
     // Descriptor rings: recordEstimate takes the next of kSetRing estimate sets, recordSynth the next of
     // kSetRing synth sets; record() takes one of each. A call returns false and records nothing (out
