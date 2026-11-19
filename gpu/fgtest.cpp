@@ -8,6 +8,7 @@
 // inputs and output (the file data stays RGBA; channels are swizzled on upload/readback).
 // --format rgba8|rgb10|f16|f16lin|nv12|p010: the image format of inputs and outputs (files stay RGBA8, converted on upload and
 // readback; rgb10 / f16 / p010 as PQ HDR, f16lin as scRGB, see Fmt below).
+// --seq "S0;S1;..": live-toggle test: before pair i, setSettings(--set + state min(i, n-1)) and releaseUnusedMotion() (settingsError / setSettings failures end the run).
 // --set k=v[,k=v..]: framegen::Settings (keys = field names: trustLow trustHigh globalFallback sceneCutSad hudBonus
 // smoothBonus searchPenalty searchRadius searchRadiusTop subpixel flowScale pyramidMinSide v2StaticMask v3Smear v3OcclSoft v3Unsure v3SceneCut v3ColourWindow v3DetailSplit v3Guard=off|guard|v2motion (or 0|1|2); algo=v1|v2|learned|v3 = motionVersion; v2Mode=quality|performance;
 // learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
@@ -391,6 +392,7 @@ int main(int argc, char** argv) {
     std::vector<float> ts{0.5f};
     framegen::Settings setA;
     char* thenArg = nullptr;
+    std::vector<framegen::Settings> seq;   // --seq: per pair, the settings applied by setSettings() before it (live-toggle test)
     std::vector<std::string> pos;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--bgra")) bgra = true;
@@ -414,6 +416,18 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--v3wmax") && i + 1 < argc) wMax = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--set") && i + 1 < argc) { if (!parseSettings(argv[++i], setA)) return 2; }
         else if (!strcmp(argv[i], "--then") && i + 1 < argc) thenArg = argv[++i];
+        else if (!strcmp(argv[i], "--seq") && i + 1 < argc) {   // "k=v,..;k=v,..;..": each state is --set's settings with these on top; pair i uses state min(i, n-1)
+            std::string all = argv[++i];
+            for (size_t a = 0; a <= all.size();) {
+                size_t b = all.find(';', a);
+                if (b == std::string::npos) b = all.size();
+                std::string one = all.substr(a, b - a);
+                framegen::Settings st = setA;
+                if (!one.empty() && !parseSettings(one.data(), st)) return 2;
+                seq.push_back(st);
+                a = b + 1;
+            }
+        }
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
             ts.clear();
             for (char* tok = strtok(argv[++i], ","); tok; tok = strtok(nullptr, ",")) ts.push_back((float)atof(tok));
@@ -651,6 +665,13 @@ int main(int argc, char** argv) {
         }
         Img& prev = *P;
         Img& curr = *C;
+        if (!seq.empty()) {   // the live toggle: the GPU is idle between pairs (submit() waits); a switch of the motion version drops the estimate, record() makes a new one
+            const framegen::Settings& st = seq[std::min(pairIdx, seq.size() - 1)];
+            if (const char* why = fg.settingsError(st)) { fprintf(stderr, "pair %zu: settingsError: %s\n", pairIdx, why); return 1; }
+            if (!fg.setSettings(st)) { fprintf(stderr, "pair %zu: setSettings failed\n", pairIdx); return 1; }
+            fg.releaseUnusedMotion();   // frees the resources the state does not use (the guard's two buffers at Off, an unselected version's group); the next state may need them again
+            fprintf(stderr, "pair %zu: motionVersion %u v3Guard %u\n", pairIdx, (unsigned)st.motionVersion, (unsigned)st.v3Guard);
+        }
         begin();
         if (thenArg) {
             if (!fg.record(cb, prev.fr(), curr.fr(), outs[0].fr(), ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
