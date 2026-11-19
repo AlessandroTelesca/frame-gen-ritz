@@ -324,10 +324,11 @@ struct Settings {
     // v3OcclSoft [0.25, 4]: width of the occlusion ramp (higher = softer one-sided transition). v3Unsure [0.25, 4]: scales the poor-match
     // ramp of the unsure measure (higher = trusts worse matches). Runtime, act in the synthesis, no re-estimate needed.
     // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never), read by the estimate.
-    // v3ColourWindow: hook (j), matching windows weighted by colour similarity (from the next estimate); v3DetailSplit: hook (l), fine
-    // detail from one frame and the coarse picture blended. RESERVED: both are accepted and wired through and have no effect yet (output
-    // identical on and off); later tasks implement them. Both off = the default. Other versions ignore all six. Runtime: setSettings()
-    // at any time; changing one does not drop the current estimate.
+    // v3ColourWindow: hook (j), the matching windows of the block search and the dense pass weighted by colour similarity to the block's
+    // centre (from the next estimate; costs about +0.06 ms at 1080p flowScale 2; gpu/V3.md 3.5 "As built (j)"); with it off the output is
+    // byte-identical to V3 without the hook. v3DetailSplit: hook (l), fine detail from one frame and the coarse picture blended. RESERVED:
+    // accepted and wired through, no effect yet (output identical on and off); a later task implements it. Both off = the default.
+    // Other versions ignore all six. Runtime: setSettings() at any time; changing one does not drop the current estimate.
     float v3Smear = 0.35f;
     float v3OcclSoft = 1.0f;
     float v3Unsure = 1.0f;

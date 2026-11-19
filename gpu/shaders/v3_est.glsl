@@ -88,11 +88,14 @@ int v3BlkIdx(const V3Lv L, int dir, int slot, ivec2 b) {   // the vec4 record BL
 }
 
 #ifndef V3J_SCALE
-#define V3J_SCALE 24.0
+#define V3J_SCALE 24.0   // the colour distance (levels, L1 over Y Cb Cr) at which the weight is 1/e
+#endif
+#ifndef V3J_FLOOR
+#define V3J_FLOOR 0.0    // the page's formula has no floor; 0.3 was measured as a milder variant (V3.md A.21)
 #endif
 #if V3J
 // hook (j) (gpu/V3.md section 3.5): the raw (Y, Cb, Cr) texel of frame f at level L, pixel p (inside the level; v3RawC clamps), and the colour weight
-// exp(-|a - c|_1 / 24) of a window pixel of colour a around a centre of colour c
+// FLOOR + (1 - FLOOR) exp(-|a - c|_1 / SCALE) (page: 24, no floor) of a window pixel of colour a around a centre of colour c
 vec3 v3RawAt(const V3Lv L, int f, ivec2 p) {
     const uvec2 t = pyr[2 * L.off + f * L.w * L.h + p.y * L.w + p.x];
     return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
@@ -100,6 +103,6 @@ vec3 v3RawAt(const V3Lv L, int f, ivec2 p) {
 vec3 v3RawC(const V3Lv L, int f, ivec2 p) { return v3RawAt(L, f, clamp(p, ivec2(0), ivec2(L.w - 1, L.h - 1))); }
 float v3ColourWgt(vec3 a, vec3 c) {
     const vec3 d = abs(a - c);
-    return exp(-(d.x + d.y + d.z) * (1.0 / V3J_SCALE));
+    return V3J_FLOOR + (1.0 - V3J_FLOOR) * exp(-(d.x + d.y + d.z) * (1.0 / V3J_SCALE));
 }
 #endif
