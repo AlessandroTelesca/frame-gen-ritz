@@ -1,0 +1,41 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E1 (gpu/V3.md section 3.3): from the level-0 luma of both frames (buf[0]),
+//  - G.sum[f]: the sum of the luma of frame f over the flow grid (the search and the dense pass read it as the pair's mean-luma difference dMu). Deviation
+//    from the page: whole luma levels (a workgroup's sum, in 1/16 levels, rounded to a level), not luma x 16, so the word does not overflow at
+//    fscale 1 (2 M flow px x 255 x 16 > 2^32);
+//  - G.hist[f][tile][bin]: 9 tiles (3x3 equal tiles of the flow grid; a workgroup of 16x16 flow px belongs to the tile of its centre), 64 bins of
+//    luma, bin = min(63, int(Y / 4)) (the input of v3_decide's scene cut, step Y2).
+// Dispatch ceil(fw / 16) x ceil(fh / 16), workgroup 256. The state G is zeroed by every estimate (Rec::clearCounters -> v3Reset).
+#include "common.glsl"
+#include "v3_common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared uint sh[2 * 64];
+shared uint ssum[2];
+
+void main() {
+    const int lid = int(gl_LocalInvocationIndex);
+    if (lid < 128) sh[lid] = 0u;
+    if (lid < 2) ssum[lid] = 0u;
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < pc.fw && p.y < pc.fh) {
+        const int N = pc.fw * pc.fh;
+        for (int f = 0; f < 2; f++) {
+            const float y = luma[f * N + p.y * pc.fw + p.x];
+            atomicAdd(sh[f * 64 + min(63, int(y * 0.25))], 1u);
+            atomicAdd(ssum[f], uint(y * 16.0 + 0.5));
+        }
+    }
+    barrier();
+    const ivec2 g = ivec2(gl_WorkGroupID.xy);
+    const ivec2 tile = min(ivec2(2), (g * 16 + 8) * 3 / ivec2(pc.fw, pc.fh));
+    const int t = tile.y * 3 + tile.x;
+    const int G = gOff();
+    if (lid < 128) {
+        const uint c = sh[lid];
+        if (c != 0u) atomicAdd(ax[G + G_HIST + ((lid >> 6) * 9 + t) * 64 + (lid & 63)], c);
+    }
+    if (lid < 2) atomicAdd(ax[G + G_SUM + lid], (ssum[lid] + 8u) >> 4);
+}

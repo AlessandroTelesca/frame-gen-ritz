@@ -1,0 +1,104 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E1 (gpu/V3.md section 3.8): the soft per-pixel field from the level-0 block field. Dispatch: tiles of 8x8 flow px
+// offset by (-4, -4), so each tile lies between 4 block centres (blocks of 8x8: centres at 8 i + 3.5), ceil((fw + 4) / 8) x ceil((fh + 4) / 8) x 2
+// (z = direction), workgroup 64, one flow pixel per thread. Reads BLK[0][dir][0] (vx, vy, cost, amb) of the 4 surrounding blocks, feat[0], G.sum
+// (dMu); writes FD[dir] (vec2 per flow px), the cost byte of MAP[dir] and, with mode bit 1 (until step Y1 adds v3_fill, which writes FF), FF[dir] = FD.
+//  - the 4 block vectors within 0.5 flow px of each other (a branch uniform over the workgroup): v = the bilinear blend (position weights), cost =
+//    the bilinear blend of the block costs;
+//  - else per pixel: the cost of each of the 4 vectors over a 5x5 window of features (4 channels as in v3Term, bilinear taps at the sub-pixel
+//    vector, dMu), c_min = min; w_k = bil_k exp(-max(0, c_k - c_min) / TAU), v = sum w_k v_k / sum w_k, cost = c_min.
+//  - mode bit 2 (inject, tests only): FD already holds the caller's vector, the only candidate: its cost over the same window is written to MAP
+//    and nothing else changes.
+// mode bit 0 = hook (j) colour window (wired, a no-op).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float TAU = 1.5;
+const float BAD = 255.0;
+const int M_FF = 2, M_INJECT = 4;
+
+// mean cost of vector v at pixel p over the 5x5 window (invalid, 255, when fewer than half of the window's pixels have their target inside)
+float winCost(const V3Lv L, int fOff, int dir, float dMu, ivec2 p, vec2 v) {
+    float s = 0.0, n = 0.0;
+    for (int j = -2; j <= 2; j++)
+        for (int i = -2; i <= 2; i++) {
+            const ivec2 x = p + ivec2(i, j);
+            if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
+            const vec2 tq = vec2(x) + v;
+            if (tq.x < 0.0 || tq.y < 0.0 || tq.x > float(L.w - 1) || tq.y > float(L.h - 1)) continue;
+            s += v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, tq), dMu);
+            n += 1.0;
+        }
+    return n >= 12.5 ? min(s / n, BAD) : BAD;
+}
+
+void main() {
+    const int dir = int(gl_WorkGroupID.z);
+    const ivec2 p = ivec2(gl_WorkGroupID.xy) * 8 - 4 + ivec2(gl_LocalInvocationID.xy);
+    int P, Bw, nLev;
+    v3Totals(P, Bw, nLev);
+    const V3Lv L = v3Lv(0);
+    const int N = pc.fw * pc.fh;
+    const int fOff = 2 * P;
+    const float dMu = v3DMu(dir);
+    const bool inFrame = p.x >= 0 && p.y >= 0 && p.x < L.w && p.y < L.h;
+    const int pix = p.y * L.w + p.x;
+    const int fd = Bw + dir * 2 * N + 2 * pix, ff = Bw + 4 * N + dir * 2 * N + 2 * pix;
+    const int mapI = mapOff(dir) + pix;
+
+    if ((pc.mode & M_INJECT) != 0) {
+        if (!inFrame) return;
+        const float c = winCost(L, fOff, dir, dMu, p, vec2(fl[fd], fl[fd + 1]));
+        ax[mapI] = uint(min(255.0, floor(8.0 * c + 0.5)));
+        return;
+    }
+
+    // the 4 surrounding blocks: block k covers 8 px from 8 k, centre 8 k + 3.5
+    const ivec2 t0 = ivec2(gl_WorkGroupID.xy) - 1;   // the tile's left / upper block (uniform)
+    const vec2 u = (vec2(p) - 3.5) * 0.125;
+    const ivec2 i0 = ivec2(floor(u));
+    const vec2 a = u - vec2(i0);
+    const ivec2 ib[4] = ivec2[4](i0, i0 + ivec2(1, 0), i0 + ivec2(0, 1), i0 + ivec2(1, 1));
+    vec4 rec[4];
+    for (int k = 0; k < 4; k++) {
+        const int o = v3BlkIdx(L, dir, 0, ib[k]);
+        rec[k] = vec4(fl[o], fl[o + 1], fl[o + 2], 0.0);
+    }
+    const float bwt[4] = float[4]((1.0 - a.x) * (1.0 - a.y), a.x * (1.0 - a.y), (1.0 - a.x) * a.y, a.x * a.y);
+    // uniform branch: the tile's own 4 blocks
+    float spread = 0.0;
+    {
+        vec2 tv[4];
+        for (int k = 0; k < 4; k++) {
+            const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
+            tv[k] = vec2(fl[o], fl[o + 1]);
+        }
+        for (int i = 0; i < 4; i++)
+            for (int j = i + 1; j < 4; j++) spread = max(spread, length(tv[i] - tv[j]));
+    }
+    if (!inFrame) return;
+    vec2 v;
+    float cost;
+    if (spread < 0.5) {
+        v = vec2(0.0); cost = 0.0;
+        for (int k = 0; k < 4; k++) { v += bwt[k] * rec[k].xy; cost += bwt[k] * rec[k].z; }
+    } else {
+        float c[4], cmin = 1e9;
+        for (int k = 0; k < 4; k++) { c[k] = winCost(L, fOff, dir, dMu, p, rec[k].xy); cmin = min(cmin, c[k]); }
+        float ws = 0.0;
+        v = vec2(0.0);
+        for (int k = 0; k < 4; k++) {
+            const float w = bwt[k] * exp(-max(0.0, c[k] - cmin) * (1.0 / TAU));
+            v += w * rec[k].xy;
+            ws += w;
+        }
+        v /= ws;
+        cost = cmin;
+    }
+    fl[fd] = v.x; fl[fd + 1] = v.y;
+    if ((pc.mode & M_FF) != 0) { fl[ff] = v.x; fl[ff + 1] = v.y; }
+    ax[mapI] = uint(min(255.0, floor(8.0 * cost + 0.5)));
+}

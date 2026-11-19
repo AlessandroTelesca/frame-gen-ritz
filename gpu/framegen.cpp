@@ -51,6 +51,12 @@
 #include "v2_qmorph_s_spv.h"
 // MotionVersion::V3 (gpu/V3.md; skeleton: only its synthesis, which has a variant per format once step F adds them: Rgba8 so far)
 #include "v3_synth_spv.h"
+// (E1: the estimate's passes, plain builds; v3_planes gets its per-format variants with the synthesis in step F)
+#include "v3_planes_spv.h"
+#include "v3_pyr_spv.h"
+#include "v3_hist_spv.h"
+#include "v3_search_spv.h"
+#include "v3_dense_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -1704,8 +1710,14 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_QMORPH_S] = {cs.v2QMorphS, spec};
     }
     if (set.motionVersion == MotionVersion::V3) {
-        // V1's luma only (the format's); the rest is V3's own. Skeleton: the synthesis; the estimate's passes are reserved (P_V3_*)
+        // V1's luma only (the format's); the rest is V3's own. Built so far: the synthesis (skeleton) and the estimate's planes, pyramid,
+        // histograms, search and dense pass (E1); the other P_V3_* slots are reserved for the later steps
         for (int i = P_DOWN; i <= P_LOOKUP; i++) spv[i].sp = Spv{};
+        spv[P_V3_PLANES].sp = SPV(v3_planes);
+        spv[P_V3_PYR].sp = SPV(v3_pyr);
+        spv[P_V3_HIST].sp = SPV(v3_hist);
+        spv[P_V3_SEARCH].sp = SPV(v3_search);
+        spv[P_V3_DENSE].sp = SPV(v3_dense);
         spv[P_V3_SYNTH] = {cs.v3Synth, spec};
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
@@ -2663,17 +2675,50 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
         r.stamp("ui_fill");
     }
     if (I.mv3()) {
-        // MotionVersion::V3, SKELETON (gpu/V3.md step S): no estimate yet. The state G is zeroed (clearCounters -> v3Reset), the flow buffers hold
-        // zeros (or, for recordDebugV3Inject, the caller's flows), which is "no motion, no cut, no fallback". Step E1 records planes, histograms,
-        // the pyramid and the search here (E4..E8), E2 the stats and the wide search, Y1 occlusion / fill, Y2 enclose / decide (E9..E12);
-        // with v3inj set they take the injected flows in place of the search (E6..E7).
-        if (I.v3inj) {
-            const MotionGroup& g = I.mo[(int)MotionVersion::V3];
+        // MotionVersion::V3 (gpu/V3.md section 1, E4..E8; build step E1): planes, histograms, pyramid, the block search (top level exhaustive, two
+        // iterations on levels n-2 .. 1, one with Lucas-Kanade on level 0) and the dense field. The state G was zeroed by clearCounters
+        // (v3Reset). Later steps add, in order: the static mask (E2 of the page), the wide search and the stats (E2), occlusion, fill, enclosure,
+        // decision (Y1, Y2). With v3inj set (recordDebugV3Inject) the search and the pyramid above level 0 are replaced by the caller's flows:
+        // FD / FF are copied in and v3_dense runs in inject mode (it writes the injected flows' matching costs).
+        const MotionGroup& g = I.mo[(int)MotionVersion::V3];
+        const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
+        const bool inj = I.v3inj != nullptr;
+        const int hookJ = I.set.v3ColourWindow ? 1 : 0;   // (mode bit 0 of the search and dense passes: wired, a no-op until hook (j) is built)
+        V3PC v = r.v3pc();
+        r.runV3(P_V3_PLANES, v, divUp(V.fw, I.set.flowScale == 4 ? 4 : 8), divUp(V.fh, I.set.flowScale == 4 ? 4 : 8));
+        r.cbar();
+        r.stamp("planes");
+        r.runV3(P_V3_HIST, v, divUp(V.fw, 16), divUp(V.fh, 16));
+        r.cbar();
+        r.stamp("hist");
+        for (int l = 0; l < (inj ? 1 : V.n); l++) {
+            V3PC pv = v;
+            pv.lvl = l; pv.mode = l == 0 ? 1 : 0; pv.lw = V.w[l]; pv.lh = V.h[l];
+            r.runV3(P_V3_PYR, pv, divUp(V.w[l], 16), divUp(V.h[l], 16), 2);
+            r.cbar();
+        }
+        r.stamp("pyramid");
+        if (!inj) {
+            static const char* const lvNames[] = {"level 0 (finest)", "level 1", "level 2", "level 3", "level 4", "level 5", "level 6", "level 7", "level 8", "level 9",
+                                                  "level 10", "level 11", "level 12", "level 13", "level 14", "level 15"};
+            static const char* const topName = "level (top)";
+            for (int l = V.n - 1; l >= 0; l--) {
+                V3PC sv = v;
+                sv.lvl = l; sv.lw = V.w[l]; sv.lh = V.h[l]; sv.gw = V.gw[l]; sv.gh = V.gh[l];
+                sv.mode = hookJ | (l == V.n - 1 ? 2 : 0);   // search: bit 0 hook (j), bit 1 the top level (exhaustive)
+                const int its = (l >= 1 && l < V.n - 1) ? 2 : 1;
+                for (int it = 0; it < its; it++) {
+                    sv.iter = it;
+                    r.runV3(P_V3_SEARCH, sv, V.gw[l], V.gh[l], 2);
+                    r.cbar();
+                }
+                r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
+            }
+        } else {
             const VkDeviceSize n8 = (VkDeviceSize)I.fw * I.fh * 8;
-            const V3Layout V = v3Layout(I.W, I.H, I.set.flowScale);
             const VkDeviceSize fd = 64 * V.B, ff = fd + 2 * n8;   // V3B_FLOW: BLK, FD[2], FF[2], TF
             r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-            // (FD and FF: the skeleton has no fill pass, FF = FD)
+            // (FD and FF: until step Y1 there is no fill pass, FF = FD)
             VkBufferCopy c0[2] = {{I.v3inj->f01, fd, n8}, {I.v3inj->f01, ff, n8}}, c1[2] = {{I.v3inj->f10, fd + n8, n8}, {I.v3inj->f10, ff + n8, n8}};
             I.CmdCopyBuffer(cb, I.v3inj->buf, g.bufs[V3B_FLOW].b, 2, c0);
             I.CmdCopyBuffer(cb, I.v3inj->buf, g.bufs[V3B_FLOW].b, 2, c1);
@@ -2681,6 +2726,11 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             I.v3Dirty = true;
             r.stamp("inject");
         }
+        V3PC dv = v;
+        dv.mode = hookJ | (inj ? 4 : 2);   // dense: bit 0 hook (j), bit 1 also write FF (= FD until v3_fill, step Y1), bit 2 inject
+        r.runV3(P_V3_DENSE, dv, divUp(V.fw + 4, 8), divUp(V.fh + 4, 8), 2);
+        r.cbar();
+        r.stamp("dense");
         return true;
     }
     if (I.mlearned()) {   // the learned estimator instead of V1's pyramid and search (V1's luma above, V1's synthesis after it)

@@ -1,0 +1,69 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E1 (gpu/V3.md section 3.2): the full-resolution colour of both frames -> the raw planes of level 0 at flow
+// resolution, texel (Y, Cb, Cr) per flow pixel of prev and curr (b13 raw[0], V3B_PYR texels [0, 2 N): frame f at f N + y fw + x), as
+// packHalf2x16(Y, Cb), packHalf2x16(Cr, 0). Y is read from the luma buffer (buf[0], luma.comp's level 0, after the CrosshairV2 fill), Cb / Cr
+// = 0.564 (B - Y), 0.713 (R - Y) from the mean R, G, B levels of the fscale x fscale cell and that cell's own mean Y. RGB formats only so far:
+// every colour access goes through the V3_* macros of v3_format.glsl (Rgba8 spelling; the YUV / F16 / Rgb10 variants are step F). fscale 4:
+// the quad scheme of luma.comp (a 2x2 thread quad per flow pixel, each thread sums a 2x2 of the 4x4 cell), 4x4 flow pixels per workgroup.
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_format.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#if defined(FG_YUV)
+#error "v3_planes.comp: the YUV variant is not built yet (gpu/V3.md step F)"
+#endif
+#define rgbL(t, tc, p) V3_LEVELS(V3_PX(t, tc, p).rgb)   // (a macro: texPrevC / texCurrC exist only in the YUV builds)
+
+shared vec3 sA[64], sC[64];
+shared int sN[64];
+
+void store(ivec2 o, vec3 ma, vec3 mc) {
+    const int N = pc.fw * pc.fh;
+    const int i = o.y * pc.fw + o.x;
+    const vec3 wy = vec3(4899.0, 9617.0, 1868.0) * (1.0 / 16384.0);
+    const vec3 m[2] = vec3[2](ma, mc);
+    for (int f = 0; f < 2; f++) {
+        const float y = dot(m[f], wy);
+        const float cb = 0.564 * (m[f].b - y), cr = 0.713 * (m[f].r - y);
+        pyr[f * N + i] = uvec2(packHalf2x16(vec2(luma[f * N + i], cb)), packHalf2x16(vec2(cr, 0.0)));
+    }
+}
+
+void main4() {
+    const ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    const int lid = int(gl_LocalInvocationIndex);
+    const ivec2 o = ivec2(gl_WorkGroupID.xy) * 4 + (l >> 1);
+    const ivec2 b = 4 * o + 2 * (l & 1);
+    vec3 sa = vec3(0.0), sc = vec3(0.0);
+    int n = 0;
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            const ivec2 p = b + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H) { sa += rgbL(texPrev, texPrevC, p); sc += rgbL(texCurr, texCurrC, p); n++; }
+        }
+    sA[lid] = sa; sC[lid] = sc; sN[lid] = n;
+    barrier();
+    if ((l.x & 1) == 0 && (l.y & 1) == 0 && o.x < pc.fw && o.y < pc.fh) {
+        sa = sA[lid] + sA[lid + 1] + sA[lid + 8] + sA[lid + 9];
+        sc = sC[lid] + sC[lid + 1] + sC[lid + 8] + sC[lid + 9];
+        n = sN[lid] + sN[lid + 1] + sN[lid + 8] + sN[lid + 9];
+        store(o, sa / float(n), sc / float(n));
+    }
+}
+
+void main() {
+    const int S = pc.fscale;
+    if (S == 4) { main4(); return; }   // dynamically uniform: the barrier in main4 is allowed
+    const ivec2 o = ivec2(gl_GlobalInvocationID.xy);
+    if (o.x >= pc.fw || o.y >= pc.fh) return;
+    vec3 sa = vec3(0.0), sc = vec3(0.0);
+    int n = 0;
+    for (int j = 0; j < S; j++)
+        for (int i = 0; i < S; i++) {
+            const ivec2 p = S * o + ivec2(i, j);
+            if (p.x < pc.W && p.y < pc.H) { sa += rgbL(texPrev, texPrevC, p); sc += rgbL(texCurr, texCurrC, p); n++; }
+        }
+    store(o, sa / float(n), sc / float(n));
+}

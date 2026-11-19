@@ -1,0 +1,56 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E1 (gpu/V3.md section 3.4): the 2x2-mean pyramid of the raw planes and the high-pass features
+// c_h = c - mean_5x5(c) (box mean, clamp to edge) the search matches. Dispatch per level l: ceil(w_l / 16) x ceil(h_l / 16) x 2 (z = frame
+// f: both frames in one dispatch), workgroup 16x16.
+//  mode & 1 (level 0): only the features of level 0 from raw[0] (v3_planes wrote it).
+//  else (level l >= 1): per pixel of a 20x20 apron tile, raw[l] = the mean of the 2x2 raw texels of raw[l-1] (clamp at the border, so an odd size
+//  replicates its last row / column); the inner 16x16 is written as raw[l]; then feat[l] = raw - the 5x5 box mean (shared memory, clamp to edge).
+// Texels (section 4): raw (packHalf2x16(Y, Cb), packHalf2x16(Cr, 0)) at 2 off + f w h + y w + x; feature (packHalf2x16(Yh, Cbh),
+// packHalf2x16(Crh, Y)) at the same index + 2 P.
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int TS = 16, TA = TS + 4;   // the inner tile and the tile with the 2 px apron of the box mean
+shared vec3 tile[TA * TA];
+
+vec3 rawAt(int fOffRaw, int off, int w, int h, int f, ivec2 p) {   // raw texel (Y, Cb, Cr) of a level, clamped to the level
+    p = clamp(p, ivec2(0), ivec2(w - 1, h - 1));
+    const uvec2 t = pyr[fOffRaw + 2 * off + f * w * h + p.y * w + p.x];
+    return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
+}
+
+void main() {
+    const int lid = int(gl_LocalInvocationIndex);
+    const int f = int(gl_WorkGroupID.z);
+    const int l = pc.lvl;
+    int P, Bw, nLev;
+    v3Totals(P, Bw, nLev);
+    const V3Lv L = v3Lv(l);
+    const ivec2 t0 = ivec2(gl_WorkGroupID.xy) * TS;
+    if ((pc.mode & 1) != 0) {
+        for (int i = lid; i < TA * TA; i += TS * TS) tile[i] = rawAt(0, L.off, L.w, L.h, f, t0 - 2 + ivec2(i % TA, i / TA));
+    } else {
+        const V3Lv S = v3Lv(l - 1);
+        for (int i = lid; i < TA * TA; i += TS * TS) {
+            const ivec2 q = clamp(t0 - 2 + ivec2(i % TA, i / TA), ivec2(0), ivec2(L.w - 1, L.h - 1));
+            vec3 m = rawAt(0, S.off, S.w, S.h, f, 2 * q) + rawAt(0, S.off, S.w, S.h, f, 2 * q + ivec2(1, 0)) +
+                     rawAt(0, S.off, S.w, S.h, f, 2 * q + ivec2(0, 1)) + rawAt(0, S.off, S.w, S.h, f, 2 * q + ivec2(1, 1));
+            tile[i] = m * 0.25;
+        }
+    }
+    barrier();
+    const ivec2 l2 = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 p = t0 + l2;
+    if (p.x >= L.w || p.y >= L.h) return;
+    const vec3 c = tile[(l2.y + 2) * TA + l2.x + 2];
+    const int idx = 2 * L.off + f * L.w * L.h + p.y * L.w + p.x;
+    if ((pc.mode & 1) == 0) pyr[idx] = uvec2(packHalf2x16(c.xy), packHalf2x16(vec2(c.z, 0.0)));
+    vec3 s = vec3(0.0);
+    for (int j = 0; j < 5; j++)
+        for (int i = 0; i < 5; i++) s += tile[(l2.y + j) * TA + l2.x + i];
+    const vec3 h = c - s * (1.0 / 25.0);
+    pyr[2 * P + idx] = uvec2(packHalf2x16(h.xy), packHalf2x16(vec2(h.z, c.x)));
+}
