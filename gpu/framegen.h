@@ -722,8 +722,8 @@ public:
     // recordDebugV3Inject(): records the V3 estimate with the flow SEARCH replaced by the caller's flows (as recordEstimate otherwise: same Frame
     // rules, rings and UI plumbing; the next recordSynth(t) is the normal synthesis). f01 / f10: a VkBuffer (TRANSFER_SRC usage) holding fw*fh
     // vec2 each (flow px, full prev->curr / curr->prev vectors on prev's / curr's grid, debugV3Layout's fw, fh) at the given byte offsets; the
-    // buffer must be alive until the record retires. In the skeleton build the flows are copied into FD[0..1] and FF[0..1]; the later steps
-    // run the estimate's tail (v3_dense in inject mode, occlusion, fill, enclose, decide) on them.
+    // buffer must be alive until the record retires. The flows are copied into FD[0..1] and FF[0..1], then the estimate's tail runs on them (v3_dense in inject mode,
+    // occlusion, fill; later enclose, decide).
     bool recordDebugV3Inject(VkCommandBuffer cb, Frame prev, Frame curr, VkBuffer flows, VkDeviceSize f01Off, VkDeviceSize f10Off);
     // recordDebugV3Weights(): STUB until steps Y1/Y2 of gpu/V3.md (the weight stage's 28-float record per output pixel of a recordSynth(t)
     // with mode bit 3). Returns false always for now.
