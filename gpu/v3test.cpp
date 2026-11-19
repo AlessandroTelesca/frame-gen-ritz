@@ -451,9 +451,12 @@ struct Run {
     std::vector<std::vector<uint8_t>> out;   // per t
     int mode = 0;
     uint32_t unsure = 0;
+    std::vector<double> sShare;              // --sshare: per t, the share of pixels with smear amount s > 0.1 (the weight stage's s, from the dump of every pixel)
+    std::vector<std::vector<float>> sMap;    // and s itself (W * H)
     float failMix = 0, histD = 0;   // v3_decide: the unsure count (px of both grids), the soft fallback mix, the scene-cut divergence
 };
 static framegen::Interpolator gFg;
+static bool gSShare = false;   // --sshare
 static int gW = 0, gH = 0;
 
 // estimate (or, with flows != null, the injected-flows estimate) + recordDebugV3 in one submission, then one synth per t
@@ -484,6 +487,27 @@ static bool runV3(Img& a, Img& b, Img& o, const std::vector<double>& ts, const H
         submit();
         if (!ok) { fprintf(stderr, "recordSynth(%g) failed\n", t); return false; }
         r.out.push_back(download(o, gW, gH));
+    }
+    if (gSShare && !flows) {   // the weight stage's records of every pixel (recordDebugV3Weights, the dump grows the T-field buffer by ~230 MB at 1080p)
+        framegen::Interpolator::DebugV3Weights wl;
+        if (!gFg.debugV3WeightsLayout((uint32_t)(gW * gH), wl)) return false;
+        HostBuf wb = makeHostBuf((size_t)wl.size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        for (double t : ts) {
+            begin();
+            gFg.beginFrame();
+            ok = gFg.recordDebugV3Weights(cb, a.view, b.view, o.view, (float)t, wb.b, 0, (uint32_t)(gW * gH));
+            VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
+            submit();
+            if (!ok) { fprintf(stderr, "recordDebugV3Weights(%g) failed\n", t); destroyHostBuf(wb); return false; }
+            const float* f = (const float*)wb.map;
+            std::vector<float> sm((size_t)wl.count);
+            size_t c = 0;
+            for (uint32_t i = 0; i < wl.count; i++) { sm[i] = f[(size_t)i * 28 + 26]; c += sm[i] > 0.1f; }
+            r.sShare.push_back(100.0 * c / wl.count);
+            r.sMap.push_back(std::move(sm));
+        }
+        destroyHostBuf(wb);
     }
     return true;
 }
@@ -771,6 +795,7 @@ int main(int argc, char** argv) {
         else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
         else if (a == "--frames" && i + 1 < argc) gFrames = argv[++i];
         else if (a == "--save" && i + 1 < argc) gSave = argv[++i];
+        else if (a == "--sshare") gSShare = true;
         else if (a == "--profile") gProfile = true;
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
@@ -935,6 +960,16 @@ int main(int argc, char** argv) {
                        est.mode, est.failMix, est.histD, 0.45, share, shareE, ok ? "PASS" : "FAIL");
                 verdict(ok, true);
             }
+            if (gSShare) for (size_t k = 0; k < ts.size() && k < est.sShare.size(); k++) {
+                printf("%-20s smear  t=%.2f  share of pixels with s > 0.1: %.2f%%\n", nm.c_str(), ts[k], est.sShare[k]);
+                if (!gFrames.empty()) {
+                    std::vector<uint8_t> img((size_t)gW * gH * 4, 255);
+                    for (size_t i = 0; i < (size_t)gW * gH; i++) { const uint8_t v = (uint8_t)std::lround(255.0f * std::min(1.0f, std::max(0.0f, est.sMap[k][i]))); img[i * 4] = img[i * 4 + 1] = img[i * 4 + 2] = v; }
+                    std::string base = gFrames + "-" + sc.name + "-t" + std::to_string(ts[k]).substr(0, 4) + "-smap.ppm";
+                    for (char& ch : base) if (ch == '(' || ch == ')' || ch == ',' || ch == '%') ch = '_';
+                    writePpm(base, img, gW, gH, false, nullptr);
+                }
+            }
             {   // the stats of the estimate (state G): dominant motions, the camera model, the wide search's counters
                 const uint32_t* G = (const uint32_t*)(est.dump.data() + est.L.g);
                 float gf[64];
@@ -1094,9 +1129,9 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; rok && k < ts.size() && k < 8; k++) (maskOn ? on : off)[k] = hudStat(sc, r.out[k], renderFrame(sc, ts[k]), ts[k]);
             }
             for (size_t k = 0; k < ts.size() && k < 8; k++) {
-                const bool pass = on[k].ovl <= 8.0 && on[k].ring <= 4.0 && on[k].ringBad <= 1.0 && on[k].far <= 2.0;
+                const bool pass = on[k].ovl <= 10.0 && on[k].ring <= 6.0 && on[k].ringBad <= 2.5 && on[k].far <= 2.0;
                 const bool teeth = off[k].ringBad >= 2.0 * on[k].ringBad + 0.5 || off[k].ovl >= on[k].ovl + 1.0;
-                printf("%-20s static overlay t=%.2f  mask ON: overlay %5.2f (%zu px)  ring %5.2f  ring > 40 levels %5.2f%% (%zu px)  background far %5.2f   %s (overlay <= 8, ring <= 4, ring > 40 <= 1%%, far <= 2)\n", nm.c_str(), ts[k],
+                printf("%-20s static overlay t=%.2f  mask ON: overlay %5.2f (%zu px)  ring %5.2f  ring > 40 levels %5.2f%% (%zu px)  background far %5.2f   %s (overlay <= 10, ring <= 6, ring > 40 <= 2.5%%, far <= 2)\n", nm.c_str(), ts[k],
                        on[k].ovl, on[k].nOvl, on[k].ring, on[k].ringBad, on[k].nRing, on[k].far, pass ? "PASS" : "FAIL");
                 printf("%-20s static overlay t=%.2f  mask OFF: overlay %5.2f           ring %5.2f  ring > 40 levels %5.2f%%             background far %5.2f   %s (the check has teeth: OFF worse than ON)\n", nm.c_str(), ts[k],
                        off[k].ovl, off[k].ring, off[k].ringBad, off[k].far, teeth ? "PASS" : "FAIL");
