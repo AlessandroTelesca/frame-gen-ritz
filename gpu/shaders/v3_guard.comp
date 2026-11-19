@@ -5,7 +5,7 @@
 // Dispatch ceil(fw / 16) x ceil(fh / 16) x 2 (z = direction), workgroup 16x16, one flow px per thread.
 //   V2's vector: v3_anchor's re-anchoring of V2 Quality's per-pixel field (the FF region of V3B_FLOW, vec2 per pixel and direction, free until v3_fill).
 //   The rule (task 102's "b1", in 8-bit luma levels at flow resolution, which is what buf[0] holds): per pixel the matching cost of a vector v is the
-//   7x7 box mean of |L_src(x) - L_dst(x + v)| (bilinear); the indicator is (c2 + G_DC < c3) && |v3 - v2| > G_DIS; a pixel is replaced where the 5x5 box mean
+//   7x7 box mean of |L_src(x) - gm L_dst(x + v) + K| (bilinear; (K, gm) = the pair's lighting change as v3_dense uses it, v3DMu); the indicator is (c2 + G_DC < c3) && |v3 - v2| > G_DIS; a pixel is replaced where the 5x5 box mean
 //   of the indicator is above G_VOTE. Mode bit 0 = V2Motion: every pixel is replaced. Mode bit 1 = hook (j): the cost of the new vector is weighted like
 //   v3_dense_j's. Mode bit 3 = debug, rule forced false (the control of the tests: the pass runs, nothing is written).
 //   A replaced pixel gets FD = the re-anchored vector and the cost byte of MAP[dir] = V3's own matching cost of that vector (the 5x5 feature window of
@@ -92,6 +92,7 @@ void main() {
     const int offS = dir == 0 ? 0 : N, offD = dir == 0 ? N : 0;   // luma of the pixel's own frame, of the other frame (buf[0]: prev, then curr)
     const bool all = (pc.mode & M_V2MOTION) != 0, apply = all || (pc.mode & M_APPLY) != 0;
     bool replace = all, okBit = false;
+    const vec2 dm = v3DMu(dir);   // the pair's lighting change (gain, mean) as v3_dense sees it: the rule's luma terms are compensated the same way, so a fade or a gamma change does not favour V2's vector
     if ((pc.mode & M_PARTNER) != 0) {   // second dispatch: a pixel whose V2 landing pixel in the other frame was marked is replaced too (bit 9), so the two directions stay consistent
         if (inFrame) {
             const int mi = mapOff(dir) + p.y * pc.fw + p.x;
@@ -111,8 +112,8 @@ void main() {
             const vec2 v3 = vec2(fl[a], fl[a + 1]);
             const vec2 v2 = v2Vec(dir, q);
             const float ls = lumaAt(offS, q);
-            sD3[i] = abs(ls - lumaBil(offD, vec2(q) + v3));
-            sD2[i] = abs(ls - lumaBil(offD, vec2(q) + v2));
+            sD3[i] = abs(ls - dm.y * lumaBil(offD, vec2(q) + v3) + dm.x);
+            sD2[i] = abs(ls - dm.y * lumaBil(offD, vec2(q) + v2) + dm.x);
             sDis[i] = length(v3 - v2);
         }
         barrier();
@@ -155,7 +156,7 @@ void main() {
         int P, Bw, nLev;
         v3Totals(P, Bw, nLev);
         const V3Lv L = v3Lv(0);
-        const float c = winCost(L, 2 * P, dir, v3DMu(dir), p, v2, (pc.mode & M_J) != 0);
+        const float c = winCost(L, 2 * P, dir, dm, p, v2, (pc.mode & M_J) != 0);
         const int a = pc.fdOff + dir * 2 * N + 2 * (p.y * pc.fw + p.x);
         fl[a] = v2.x; fl[a + 1] = v2.y;
         ax[mapOff(dir) + p.y * pc.fw + p.x] = uint(min(255.0, floor(8.0 * c + 0.5)));
