@@ -1018,7 +1018,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
     printf("    UI WholeScreen: crosshair wrong %zu/%zu (t=.25: %zu), hud wrong %zu/%zu (t=.25: %zu)\n", xh, xhN, xh2, hud, hudN, hud2);
     expect(xh == 0 && xh2 == 0, "crosshair pixels equal the real ones (WholeScreen, t = 0.5 and 0.25)");
     expect(hud == 0 && hud2 == 0, "HUD box pixels equal the real ones (WholeScreen)");
-    if (!algoV3()) expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
+    expect(xhOff > 0 || hudOff > 0, "(the scene disturbs the UI without protection: the check has teeth)");
     {   // recordTrack: 8 frames tracked instead of observed leave the same counters, so the last pair's outputs are bit-identical
         Result rt = runSequence(e, sc, w, false, true);
         expect(rt.ok && rt.out[0].p0 == rw.out[0].p0 && rt.out[0].p1 == rw.out[0].p1 && rt.out[1].p0 == rw.out[1].p0 && rt.out[1].p1 == rw.out[1].p1,
@@ -1115,8 +1115,9 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         if (!off.ok || !v2.ok) { expect(false, "ghost scene init + sequence"); return; }
         printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
                off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
-        if (!algoV3()) expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
-        if (!algoV3()) expect(v2.art05 <= 8 && v2.artBlur <= 8, "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
+        expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
+        const size_t lim = algoV3() ? 80 : 8;   // V3 (Y2 measured 64 / 12 against Off 239 / 125): its own ceiling; the V2 limit is 8
+        expect(v2.art05 <= lim && v2.artBlur <= lim, algoV3() ? "CrosshairV2 leaves at most 80 artifact px around the plus, t = 0.5 and blurred (V3: Off 239 / 125)" : "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
         expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
     double pw = psnr(w05, truth, &near, false);

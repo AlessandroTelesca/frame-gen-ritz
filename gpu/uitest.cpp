@@ -659,7 +659,7 @@ static void marginCheck(int W, int H) {
             const bool noFillV2 = cs.mode == UiProtection::CrosshairV2 && !cs.fill;
             const size_t lim05 = noFillV2 ? 20 : 4, limBlur = 4;
             snprintf(what, sizeof what, "%s: artifact pixels around it at most %zu (Off: %zu / %zu)", cs.name, lim05, mo.art05, mo.artBlur);
-            if (!algoV3() || cs.mode != UiProtection::CrosshairV2) expect(m.art05 <= lim05 && m.artBlur <= limBlur, what);   // (V3: no uiReject until step Y2)
+            expect(m.art05 <= lim05 && m.artBlur <= limBlur, what);
         }
     }
 }
@@ -860,17 +860,17 @@ static void ghostCheck() {
                 expect(m2.uiBad == 0 && mf.uiBad == 0, what);
                 // the fill takes the crosshair out of the estimate too: nothing of it is left around the crosshair
                 snprintf(what, sizeof what, "%s: V2 + fill leaves at most 1 artifact px (t = 0.5) and 2 (t = 0.25)", name);
-                if (!algoV3()) expect(mf.art05 <= 1 && mf.art025 <= 2, what);   // (V3: no uiReject until step Y2)
+                expect(mf.art05 <= 1 && mf.art025 <= 2, what);
                 if (bgk == 0) {
                     // smooth noise: the crosshair's vote in the estimate (not its warp) is what is left; only the fill removes it
                     snprintf(what, sizeof what, "%s: V2 leaves no more artifact px than Off", name);
                     expect(m2.art05 <= mo.art05 && m2.art025 <= mo.art025, what);
                 } else {
                     // detailed backgrounds: the warp copy is the whole artifact; rejecting it leaves (almost) nothing, with or without the fill
-                    snprintf(what, sizeof what, "%s: V2 leaves at most 1 artifact px (t = 0.5) and 2 (t = 0.25)", name);
-                    if (!algoV3()) expect(m2.art05 <= 1 && m2.art025 <= 2, what);   // (V3: no uiReject until step Y2)
+                    snprintf(what, sizeof what, "%s: V2 leaves at most 1 artifact px (V3: 4) (t = 0.5) and 2 (t = 0.25)", name);
+                    expect(m2.art05 <= (algoV3() ? 4u : 1u) && m2.art025 <= 2, what);
                     snprintf(what, sizeof what, "%s: control, Off shows the doubled crosshair (>= 15 px, V2 %zu)", name, m2.art05);
-                    if (!algoV3()) expect(mo.art05 >= 15, what);
+                    expect(mo.art05 >= 15, what);
                 }
             }
     kPanX = oldPanX; kPanY = oldPanY;
@@ -956,7 +956,7 @@ static int v2Check(int W, int H) {
         Result rl = runSequence(sc, lo, true, nullptr);
         size_t badLo = uiDiffers(sc, rl.out[0], real11, 1, all);
         printf(" contrast gate 255: crosshair wrong %zu; gate 0: %zu\n", badHi, badLo);
-        if (!algoV3()) expect(badHi > 0, "V2: uiContrastThreshold 255 admits nothing: the crosshair is not protected");
+        expect(badHi > 0, "V2: uiContrastThreshold 255 admits nothing: the crosshair is not protected");
         expect(badLo == 0, "V2: uiContrastThreshold 0 (no gate): crosshair pixel-exact");
     }
 
@@ -986,7 +986,7 @@ static int v2Check(int W, int H) {
                 if (d > reach) outside++; else inside++;
             }
         printf(" V2 vs Off (t = 0.5 and 0.25): %zu pixels differ within %d px of the %dx%d work rectangle, %zu beyond (farthest %d px)\n", inside, reach, wr[2], wr[3], outside, far);
-        if (!algoV3()) expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off beyond the work rectangle plus the motion reach");
+        expect(inside > 0 && outside == 0, "V2 (no estimate fill): the generated frames are bit-identical to Off beyond the work rectangle plus the motion reach");
         for (int arm : {7, 16}) {
             Scene sh(W, H, 12, 0, 0, arm, 0);
             harshBackground(sh);
@@ -1018,7 +1018,7 @@ static int v2Check(int W, int H) {
             // 64.2, fill 57.6), so Quality gets 2 % of Off's error as tolerance. Possible later fix: suppress the `em > Q_B0`
             // blur branch in v2_morph.glsl (~line 71) for taps inside the mask; then this tolerance can go back to 0.5.
             const double tol = algoV2Quality() ? std::max(0.5, 0.02 * eo) : 0.5;
-            if (!algoV3()) expect(ef <= eo + tol, "V2 + estimate fill: the background near the crosshair is not worse than Off");   // (V3: no uiReject until step Y2)
+            expect(ef <= eo + tol, "V2 + estimate fill: the background near the crosshair is not worse than Off");
         }
     }
 
@@ -1101,10 +1101,10 @@ static int v2Check(int W, int H) {
         // window as a whole instead, V2 must not be worse than Off.
         // On top of the window check, a ceiling on the artifact count itself so a regression in it is caught (measured at
         // 624c1f4, vanish / appear: Performance 34 / 10, Quality 15 / 11; ceilings ~1.5-2x that). V1 keeps a2 == 0.
-        const bool mv2 = algoV2();
+        const bool mv2 = algoV2() || algoV3();   // V3: its own ceiling (Y2 measured vanish / appear 8 / 20; V1 162 / 144)
         if (mv2) {
-            const size_t cap = algoV2Quality() ? (grow ? 20 : 25) : (grow ? 20 : 50);
-            printf("   V2 %s: artifact px %zu, ceiling %zu\n", algoV2Quality() ? "quality" : "performance", a2, cap);
+            const size_t cap = algoV3() ? 25 : algoV2Quality() ? (grow ? 20 : 25) : (grow ? 20 : 50);
+            printf("   V2 %s: artifact px %zu, ceiling %zu\n", algoV3() ? "V3" : algoV2Quality() ? "quality" : "performance", a2, cap);
             expect(m2 <= mo + 0.5 && b2 <= bo, grow ? "V2: arm ends appear: the window is not worse than Off (mean, pixels > 32)"
                                                     : "V2: arm ends vanish: the window is not worse than Off (mean, pixels > 32)");
             expect(a2 <= cap, grow ? "V2: arm ends appear: artifact px within the ceiling"
@@ -1136,7 +1136,7 @@ static int v2Check(int W, int H) {
         size_t bv1 = uiDiffers(sc, rv1.out[0], real, 1, all);
         printf(" hysteresis (2 changed frames, back at 16, pair 16-17): wrong px  leave 4: %zu   leave 1: %zu   V1: %zu   (of %zu)\n", b4, b1, bv1, n);
         expect(b4 == 0, "hysteresis: leave 4 keeps the arm masked through a 2-frame disturbance, exact on the first pair after it");
-        if (!algoV3()) expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
+        expect(b1 > 0, "control: leave 1 loses the arm at the first change and has not got it back");
         expect(bv1 > 0, "control: V1 loses the arm (needs 8 still frames again)");
         if (algoV2()) {   // the same with V2's static-structure mask on (the default): it must not break the state machine's result
             Settings h4s = h4; h4s.v2StaticMask = true;
@@ -1167,8 +1167,8 @@ static int v2Check(int W, int H) {
         printf(" fast re-entry (arm leaves at 17, back at 19): wrong arm px  re-entry 2: pair(19,20) %zu, pair(18,19) %zu | re-entry 0: pair(19,20) %zu, pair(25,26) %zu, pair(26,27) %zu\n", a, b, c, d, e);
         expect(a == 0, "fast re-entry 2: the arm is protected again on the pair 2 frames after it came back");
         expect(b > 0, "(the pair before it is not: one matching frame is not enough)");
-        if (!algoV3()) expect(c > 0, "control: without re-entry the arm is still unprotected there");
-        if (!algoV3()) expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
+        expect(c > 0, "control: without re-entry the arm is still unprotected there");
+        expect(d > 0 && e == 0, "without re-entry the arm needs uiStillFrames = 8 still frames after it came back: protected from pair (26, 27)");
         if (algoV2()) {   // the same with V2's static-structure mask on (the default)
             Settings re2s = re2; re2s.v2StaticMask = true;
             size_t as = runAt(21, re2s);
@@ -1214,7 +1214,7 @@ static int v2Check(int W, int H) {
         (void)sameCurr2;
         size_t restBad = uiDiffers(sc, r2.out[0], real, 1, rest);
         printf(" pair gate: %zu crosshair pixels change in the last pair; pasted (== curr) V1 %zu, V2 %zu; unchanged crosshair wrong V2 %zu\n", nChanged, pasted1, pasted2, restBad);
-        expect(nChanged > 0 && (pasted2 == 0 || algoV3()), "V2: no pixel that changed in the pair is pasted (t = 0.5)");   // (V3: no uiReject until step Y2)
+        expect(nChanged > 0 && (pasted2 == 0 || (algoV3() && pasted2 <= 4)), "V2: no pixel that changed in the pair is pasted (t = 0.5)");
         expect(restBad == 0, "V2: the unchanged part of the crosshair stays pixel-exact in the same pair");
         {   // recordSynthBlur: the patch after the blend has the same gate
             size_t pastedB = 0, nB = 0;
