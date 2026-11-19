@@ -20,24 +20,44 @@ const float TAU = 1.5;
 const float BAD = 255.0;
 const int M_FF = 2, M_INJECT = 4;
 
-// mean cost of vector v at pixel p over the 5x5 window (invalid, 255, when fewer than half of the window's pixels have their target inside)
+// mean cost of vector v at pixel p over the 5x5 window (invalid, 255, when fewer than half of the window's pixels have their target inside).
+// The bilinear weights are the same for every window pixel (one sub-pixel offset), so the 6x6 integer texels under the window's targets are read
+// once, row by row, and interpolated in registers (36 reads instead of 100).
 float winCost(const V3Lv L, int fOff, int dir, float dMu, ivec2 p, vec2 v) {
+    const vec2 vf = floor(v), fr = v - vf;
+    const ivec2 vi = ivec2(vf);
+    const ivec2 mx = ivec2(L.w - 1, L.h - 1);
     float s = 0.0, n = 0.0;
-    for (int j = -2; j <= 2; j++)
+    vec4 prow[6];
+    {
+        const int ty = clamp(p.y - 2 + vi.y, 0, mx.y);
+        for (int i = 0; i < 6; i++) prow[i] = v3FeatAt(L, fOff, 1 - dir, ivec2(clamp(p.x - 2 + vi.x + i, 0, mx.x), ty));
+    }
+    for (int j = -2; j <= 2; j++) {
+        vec4 nrow[6];
+        const int ty = clamp(p.y + j + 1 + vi.y, 0, mx.y);
+        for (int i = 0; i < 6; i++) nrow[i] = v3FeatAt(L, fOff, 1 - dir, ivec2(clamp(p.x - 2 + vi.x + i, 0, mx.x), ty));
         for (int i = -2; i <= 2; i++) {
             const ivec2 x = p + ivec2(i, j);
             if (x.x < 0 || x.y < 0 || x.x >= L.w || x.y >= L.h) continue;
             const vec2 tq = vec2(x) + v;
             if (tq.x < 0.0 || tq.y < 0.0 || tq.x > float(L.w - 1) || tq.y > float(L.h - 1)) continue;
-            s += v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, tq), dMu);
+            const vec4 b = mix(mix(prow[i + 2], prow[i + 3], fr.x), mix(nrow[i + 2], nrow[i + 3], fr.x), fr.y);
+            s += v3Term(v3FeatAt(L, fOff, dir, x), b, dMu);
             n += 1.0;
         }
+        prow = nrow;
+    }
     return n >= 12.5 ? min(s / n, BAD) : BAD;
 }
 
+shared float tmap[4 * 144];   // per candidate: the matching term of every pixel of the tile with a 2 px apron (12x12), -1 = no term (outside)
+
 void main() {
     const int dir = int(gl_WorkGroupID.z);
-    const ivec2 p = ivec2(gl_WorkGroupID.xy) * 8 - 4 + ivec2(gl_LocalInvocationID.xy);
+    const ivec2 lp = ivec2(gl_LocalInvocationID.xy);
+    const int lid = int(gl_LocalInvocationIndex);
+    const ivec2 p = ivec2(gl_WorkGroupID.xy) * 8 - 4 + lp;
     int P, Bw, nLev;
     v3Totals(P, Bw, nLev);
     const V3Lv L = v3Lv(0);
@@ -56,40 +76,62 @@ void main() {
         return;
     }
 
-    // the 4 surrounding blocks: block k covers 8 px from 8 k, centre 8 k + 3.5
-    const ivec2 t0 = ivec2(gl_WorkGroupID.xy) - 1;   // the tile's left / upper block (uniform)
-    const vec2 u = (vec2(p) - 3.5) * 0.125;
-    const ivec2 i0 = ivec2(floor(u));
-    const vec2 a = u - vec2(i0);
-    const ivec2 ib[4] = ivec2[4](i0, i0 + ivec2(1, 0), i0 + ivec2(0, 1), i0 + ivec2(1, 1));
+    // the tile's 4 surrounding blocks (uniform over the workgroup): block k covers 8 px from 8 k, centre 8 k + 3.5; this pixel's bilinear weights
+    const ivec2 t0 = ivec2(gl_WorkGroupID.xy) - 1;
     vec4 rec[4];
     for (int k = 0; k < 4; k++) {
-        const int o = v3BlkIdx(L, dir, 0, ib[k]);
+        const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
         rec[k] = vec4(fl[o], fl[o + 1], fl[o + 2], 0.0);
     }
-    const float bwt[4] = float[4]((1.0 - a.x) * (1.0 - a.y), a.x * (1.0 - a.y), (1.0 - a.x) * a.y, a.x * a.y);
-    // uniform branch: the tile's own 4 blocks
     float spread = 0.0;
-    {
-        vec2 tv[4];
-        for (int k = 0; k < 4; k++) {
-            const int o = v3BlkIdx(L, dir, 0, t0 + ivec2(k & 1, k >> 1));
-            tv[k] = vec2(fl[o], fl[o + 1]);
-        }
-        for (int i = 0; i < 4; i++)
-            for (int j = i + 1; j < 4; j++) spread = max(spread, length(tv[i] - tv[j]));
-    }
-    if (!inFrame) return;
-    vec2 v;
-    float cost;
+    for (int i = 0; i < 4; i++)
+        for (int j = i + 1; j < 4; j++) spread = max(spread, length(rec[i].xy - rec[j].xy));
+    const vec2 u = (vec2(p) - 3.5) * 0.125;
+    const vec2 a = u - vec2(floor(u));
+    const float bwt[4] = float[4]((1.0 - a.x) * (1.0 - a.y), a.x * (1.0 - a.y), (1.0 - a.x) * a.y, a.x * a.y);
+    vec2 v = vec2(0.0);
+    float cost = 0.0;
     if (spread < 0.5) {
-        v = vec2(0.0); cost = 0.0;
+        if (!inFrame) return;
         for (int k = 0; k < 4; k++) { v += bwt[k] * rec[k].xy; cost += bwt[k] * rec[k].z; }
     } else {
+        // the cost of each distinct vector at each pixel of the tile and its apron, once (a 5x5 box sum of them per pixel afterwards), instead of
+        // 25 bilinear windows per pixel; a vector within 0.25 px of an earlier one shares its map
+        int rep[4];
+        for (int k = 0; k < 4; k++) {
+            rep[k] = k;
+            for (int j = 0; j < k; j++)
+                if (length(rec[j].xy - rec[k].xy) < 0.25) { rep[k] = rep[j]; break; }
+        }
+        const ivec2 to = ivec2(gl_WorkGroupID.xy) * 8 - 6;   // the apron's corner
+        for (int idx = lid; idx < 4 * 144; idx += 64) {
+            const int k = idx / 144, q = idx - k * 144;
+            if (rep[k] != k) continue;
+            const ivec2 x = to + ivec2(q % 12, q / 12);
+            float t = -1.0;
+            if (x.x >= 0 && x.y >= 0 && x.x < L.w && x.y < L.h) {
+                const vec2 tq = vec2(x) + rec[k].xy;
+                if (tq.x >= 0.0 && tq.y >= 0.0 && tq.x <= float(L.w - 1) && tq.y <= float(L.h - 1))
+                    t = v3Term(v3FeatAt(L, fOff, dir, x), v3FeatBil(L, fOff, 1 - dir, tq), dMu);
+            }
+            tmap[idx] = t;
+        }
+        barrier();
+        if (!inFrame) return;
         float c[4], cmin = 1e9;
-        for (int k = 0; k < 4; k++) { c[k] = winCost(L, fOff, dir, dMu, p, rec[k].xy); cmin = min(cmin, c[k]); }
+        for (int k = 0; k < 4; k++) {
+            if (rep[k] != k) { c[k] = c[rep[k]]; continue; }
+            float s = 0.0, n = 0.0;
+            for (int j = 0; j < 5; j++)
+                for (int i = 0; i < 5; i++) {
+                    const float t = tmap[k * 144 + (lp.y + j) * 12 + lp.x + i];
+                    if (t >= 0.0) { s += t; n += 1.0; }
+                }
+            c[k] = n >= 12.5 ? min(s / n, BAD) : BAD;
+            cmin = min(cmin, c[k]);
+        }
+        for (int k = 0; k < 4; k++) cmin = min(cmin, c[k]);
         float ws = 0.0;
-        v = vec2(0.0);
         for (int k = 0; k < 4; k++) {
             const float w = bwt[k] * exp(-max(0.0, c[k] - cmin) * (1.0 / TAU));
             v += w * rec[k].xy;

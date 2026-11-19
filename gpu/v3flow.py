@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Statistics of MotionVersion::V3's estimated flows from fgtest --dump DIR files (pair_NNNN.v3db, Interpolator::recordDebugV3's dump).
+
+  v3flow.py pair_0000.v3db [more.v3db ...]
+
+Per file: the header, the length of F01 / F10 (flow px, full prev->curr vectors; mean, p99, max), the number of NaN / inf / absurd (> the frame
+diagonal) vectors, the match cost (MAP cost8 / 8, levels) and the forward-backward agreement |F01(p) + F10(p + F01(p))| (bilinear sample of F10;
+median, share <= 1 flow px, share > 4 flow px; pixels whose target leaves the frame are not counted). Layout: gpu/framegen.h DebugV3Layout
+(16-word header padded to 64 bytes, then FF[0], FF[1], FD[0], FD[1] (fw*fh vec2 f32 each), MAP[0], MAP[1], S (fw*fh uint32 each), BLK).
+"""
+import sys
+
+import numpy as np
+
+
+def load(path):
+    raw = open(path, "rb").read()
+    h = np.frombuffer(raw[:64], np.uint32)
+    assert h[0] == 0x42443356, "not a recordDebugV3 dump"
+    W, H, fw, fh = (int(x) for x in h[2:6])
+    n = fw * fh
+    o = 64
+    out = dict(header=h, W=W, H=H, fw=fw, fh=fh, fs=int(h[8]), levels=int(h[9]), mode=int(h[10]))
+    for name in ("ff0", "ff1", "fd0", "fd1"):
+        out[name] = np.frombuffer(raw, np.float32, n * 2, o).reshape(fh, fw, 2)
+        o += n * 8
+    for name in ("map0", "map1", "s"):
+        out[name] = np.frombuffer(raw, np.uint32, n, o).reshape(fh, fw)
+        o += n * 4
+    return out
+
+
+def bilinear(f, x, y):
+    """f: (h, w, 2); x, y: float arrays (flow px index coordinates, clamped)."""
+    h, w, _ = f.shape
+    x = np.clip(x, 0, w - 1)
+    y = np.clip(y, 0, h - 1)
+    x0 = np.floor(x).astype(int)
+    y0 = np.floor(y).astype(int)
+    x1 = np.minimum(x0 + 1, w - 1)
+    y1 = np.minimum(y0 + 1, h - 1)
+    ax = (x - x0)[..., None]
+    ay = (y - y0)[..., None]
+    return (f[y0, x0] * (1 - ax) + f[y0, x1] * ax) * (1 - ay) + (f[y1, x0] * (1 - ax) + f[y1, x1] * ax) * ay
+
+
+def stats(path):
+    d = load(path)
+    fw, fh = d["fw"], d["fh"]
+    print(f"{path}: {d['W']}x{d['H']} flowScale {d['fs']}, {d['levels']} levels, G.mode {d['mode']}")
+    diag = float(np.hypot(fw, fh))
+    for name, f in (("F01", d["ff0"]), ("F10", d["ff1"])):
+        bad = ~np.isfinite(f).all(-1)
+        fin = np.where(np.isfinite(f), f, 0)
+        ln = np.hypot(fin[..., 0], fin[..., 1])
+        absurd = ln > diag
+        print(f"  {name}: |v| mean {ln.mean():.2f} p99 {np.percentile(ln, 99):.2f} max {ln.max():.2f} flow px; NaN/inf {int(bad.sum())}, > diagonal {int(absurd.sum())}")
+    for name, m in (("F01", d["map0"]), ("F10", d["map1"])):
+        c = (m & 255).astype(np.float32) / 8
+        print(f"  {name} match cost: mean {c.mean():.2f} p50 {np.median(c):.2f} p95 {np.percentile(c, 95):.2f} levels, share >= 18 {float((c >= 18).mean()) * 100:.1f}%")
+    yy, xx = np.mgrid[0:fh, 0:fw].astype(np.float32)
+    for name, a, b in (("F01", d["ff0"], d["ff1"]), ("F10", d["ff1"], d["ff0"])):
+        tx, ty = xx + a[..., 0], yy + a[..., 1]
+        ok = (tx >= 0) & (tx <= fw - 1) & (ty >= 0) & (ty <= fh - 1)
+        e = np.hypot(*(a + bilinear(b, tx, ty)).transpose(2, 0, 1))[ok]
+        print(f"  forward-backward {name}: median {np.median(e):.3f} p90 {np.percentile(e, 90):.2f} flow px; <= 1 px {float((e <= 1).mean()) * 100:.1f}%, > 4 px {float((e > 4).mean()) * 100:.1f}%  ({float(ok.mean()) * 100:.1f}% of pixels have a target inside)")
+
+
+if __name__ == "__main__":
+    for p in sys.argv[1:]:
+        stats(p)

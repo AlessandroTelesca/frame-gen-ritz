@@ -1,0 +1,9 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step E1 (gpu/V3.md section 3.5, TOP): the top level's exhaustive search, all integer v in [-8, 8]^2 (289 candidates, one
+// thread per candidate, 5 per thread, the 24x24 region of the other frame under all of them read once into shared memory), no prior; ties settle
+// at the shorter vector (a bias of 0.002 level per px of |v|_1). Writes BLK[top][dir][0] = (v, cost, amb) with amb = 1 - smoothstep(0.5, 3.0,
+// second - best), the second best among the candidates at least 3 px (Chebyshev) from the best. A one-level pyramid (tiny frames) has its level 0
+// here: the Lucas-Kanade refinement then follows. Dispatch gw x gh x 2, workgroup 64; push: lvl = n - 1, mode bit 0 = hook (j) (no-op).
+#define V3S_TOP 1
+#include "v3_search.glsl"

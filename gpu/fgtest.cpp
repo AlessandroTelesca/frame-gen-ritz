@@ -28,7 +28,8 @@
 // uint32 motionVersion, v2Mode), then the block field (bw*bh vec2 f32), the per-pixel half-vector field (fw*fh vec2 f32, midpoint
 // grid) and the packed mismatch e (eStride*H uint32, 4 px per word, low byte first) of the pair's last record. gpu/fgmaps.py turns it
 // into PNG maps. MotionVersion::V2: Performance writes its cleaned block field and zeros; Quality its cleaned block field, its
-// per-pixel field and, at the start of the e part, its coverage (see fgmaps.py). (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
+// per-pixel field and, at the start of the e part, its coverage (see fgmaps.py). MotionVersion::V3 also writes DIR/pair_NNNN.v3db, the raw
+// Interpolator::recordDebugV3 dump (framegen.h: header, FF[0..1] = F01 / F10, FD, MAP, S, BLK; gpu/v3flow.py reads it). (Version 1: the same maps, header words 14-15 = 0. Versions 2-4 were the old MotionVersion::V2's, tag v2-occlusion:
 // the same maps followed by its own, which no longer exist.)
 // All images are kept in VK_IMAGE_LAYOUT_GENERAL, like gamescope.
 #include "framegen.h"
@@ -570,6 +571,11 @@ int main(int argc, char** argv) {
         CK(vkMapMemory(dev, dmpMem, 0, dl.size, 0, (void**)&dmpMap));
     }
 
+    VkBuffer dmp3 = VK_NULL_HANDLE;   // V3's recordDebugV3 dump (created at the first V3 pair: --then may switch to V3 later)
+    VkDeviceMemory dmp3Mem = VK_NULL_HANDLE;
+    uint8_t* dmp3Map = nullptr;
+    framegen::Interpolator::DebugV3Layout dl3{};
+
     VkBufferImageCopy region{}, regionC{};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.imageExtent = {W, H, 1};
@@ -649,6 +655,24 @@ int main(int argc, char** argv) {
             VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
             vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
         }
+        bool dump3 = false;
+        if (dumpDir && fg.debugV3Layout(dl3)) {
+            if (!dmp3) {
+                VkBufferCreateInfo dbci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                dbci.size = dl3.size;
+                dbci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                CK(vkCreateBuffer(dev, &dbci, nullptr, &dmp3));
+                VkMemoryRequirements dreq;
+                vkGetBufferMemoryRequirements(dev, dmp3, &dreq);
+                VkMemoryAllocateInfo dma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, dreq.size,
+                                         memType(dreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)};
+                CK(vkAllocateMemory(dev, &dma, nullptr, &dmp3Mem));
+                CK(vkBindBufferMemory(dev, dmp3, dmp3Mem, 0));
+                CK(vkMapMemory(dev, dmp3Mem, 0, dl3.size, 0, (void**)&dmp3Map));
+            }
+            if (!fg.recordDebugV3(cb, dmp3, 0)) { fprintf(stderr, "recordDebugV3 failed\n"); return 1; }
+            dump3 = true;
+        }
         if (dumpDir) {
             if (!fg.recordDebugMaps(cb, dmp, 0)) { fprintf(stderr, "recordDebugMaps failed\n"); return 1; }
             VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
@@ -666,6 +690,14 @@ int main(int argc, char** argv) {
             hdr[14] = (uint32_t)setB.motionVersion; hdr[15] = (uint32_t)setB.v2Mode;
             fwrite(hdr, 1, sizeof hdr, f);
             fwrite(dmpMap, 1, dl.size, f);
+            fclose(f);
+        }
+        if (dump3) {
+            char path[4096];
+            snprintf(path, sizeof path, "%s/pair_%04zu.v3db", dumpDir, pairIdx);
+            FILE* f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "cannot write %s\n", path); return 1; }
+            fwrite(dmp3Map, 1, dl3.size, f);
             fclose(f);
         }
         if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
@@ -753,6 +785,7 @@ int main(int argc, char** argv) {
     vkDestroyBuffer(dev, stg, nullptr);
     vkDestroyBuffer(dev, dbg, nullptr);
     if (dmp) { vkDestroyBuffer(dev, dmp, nullptr); vkFreeMemory(dev, dmpMem, nullptr); }
+    if (dmp3) { vkDestroyBuffer(dev, dmp3, nullptr); vkFreeMemory(dev, dmp3Mem, nullptr); }
     vkFreeMemory(dev, dbgMem, nullptr);
     vkFreeMemory(dev, stgMem, nullptr);
     vkDestroyFence(dev, fence, nullptr);

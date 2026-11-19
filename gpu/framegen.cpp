@@ -56,6 +56,7 @@
 #include "v3_pyr_spv.h"
 #include "v3_hist_spv.h"
 #include "v3_search_spv.h"
+#include "v3_search_top_spv.h"
 #include "v3_dense_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
@@ -529,6 +530,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             P_ML_DUP, P_ML_REDUCE, P_ML_PYR, P_ML_OUT, P_ML_PLANES, P_ML_FEAT, P_ML_MATCH, P_ML_CONV = P_ML_MATCH + 2 * MLV_COUNT, P_ML_ZERO = P_ML_CONV + 10 * kMlNets, P_ML_GUARD,
             // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
             P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
+            P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_COUNT };
 // The match pipelines exist per activation storage (half: Settings::learnedHalf, specialization constant ML_HALF) and per net
 // variant (ML_EXT); the conv pipelines per activation storage too; convs per
@@ -1717,6 +1719,7 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V3_PYR].sp = SPV(v3_pyr);
         spv[P_V3_HIST].sp = SPV(v3_hist);
         spv[P_V3_SEARCH].sp = SPV(v3_search);
+        spv[P_V3_SEARCH_TOP].sp = SPV(v3_search_top);
         spv[P_V3_DENSE].sp = SPV(v3_dense);
         spv[P_V3_SYNTH] = {cs.v3Synth, spec};
     }
@@ -2705,11 +2708,11 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             for (int l = V.n - 1; l >= 0; l--) {
                 V3PC sv = v;
                 sv.lvl = l; sv.lw = V.w[l]; sv.lh = V.h[l]; sv.gw = V.gw[l]; sv.gh = V.gh[l];
-                sv.mode = hookJ | (l == V.n - 1 ? 2 : 0);   // search: bit 0 hook (j), bit 1 the top level (exhaustive)
+                sv.mode = hookJ;   // search: bit 0 hook (j)
                 const int its = (l >= 1 && l < V.n - 1) ? 2 : 1;
                 for (int it = 0; it < its; it++) {
                     sv.iter = it;
-                    r.runV3(P_V3_SEARCH, sv, V.gw[l], V.gh[l], 2);
+                    r.runV3(l == V.n - 1 ? P_V3_SEARCH_TOP : P_V3_SEARCH, sv, V.gw[l], V.gh[l], 2);   // (the top level: exhaustive, its own pipeline)
                     r.cbar();
                 }
                 r.stamp(l == V.n - 1 && V.n > 1 ? topName : lvNames[l]);
