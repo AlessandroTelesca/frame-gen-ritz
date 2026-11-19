@@ -61,9 +61,9 @@ void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
         const float fu = f * un;   // (tuning D1) the pair fallback acts where the pixel is itself unsure, not on the whole frame
         // (tuning D3) a garbage region's vector is replaced by the camera model's where it is far from it (it would drag content in from far away); o and hole stay as the
         // estimate flagged them: the hypothesis is still doubtful, only the direction its smear runs along is now a plausible one
-        const vec2 src = vec2(m) + gc;   // where the content at curr position m came from in prev, if it moved with the camera: outside the frame = content entering
+        const vec2 src = vec2(m) + (dir == 1 ? gc : -gc);   // where the content came from in the other frame, had it moved with the camera: outside the frame = content entering (A: prev side, B: curr side)
         const float ent = smoothstep(-8.0, 24.0, max(max(-src.x, src.x - float(pc.fw - 1)), max(-src.y, src.y - float(pc.fh - 1))));
-        const float fg = (dir == 1 ? ent : 0.0) * max(smoothstep(0.7, 1.0, mp.g), 0.0 * v3Occ(mp.e, length(gv), pc.occlSoft)) * smoothstep(V3_GARB0, V3_GARB1, length(gv - gc));
+        const float fg = ent * max(smoothstep(0.7, 1.0, mp.g), v3Occ(mp.e, length(gv), pc.occlSoft)) * smoothstep(V3_GARB0, V3_GARB1, length(gv - gc));
         gv = mix(gv, gc, fg);
         o *= 1.0 - max(fu, 0.5 * fg);
         hole *= 1.0 - max(fu, 0.5 * fg);
