@@ -19,10 +19,7 @@ vec2 fdAt(int dir, int pix) {
     const int i = pc.fdOff + dir * 2 * pc.fw * pc.fh + 2 * pix;
     return vec2(fl[i], fl[i + 1]);
 }
-float oEstAt(int dir, int pix, vec2 v) {
-    const V3Map m = v3MapUnpack(ax[mapOff(dir) + pix]);
-    return v3OccEff(v3Occ(m.e, length(v), 1.0), m.g);
-}
+float oEstAt(int dir, int pix) { return uintBitsToFloat(ax[2 * pc.fw * pc.fh + dir * pc.fw * pc.fh + pix]); }   // v3_occl's o_eff
 vec3 rawAt(int dir, int pix) {   // Y, Cb, Cr (levels) of the pixel's own frame, flow resolution
     const uvec2 t = pyr[dir * pc.fw * pc.fh + pix];
     return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
@@ -34,30 +31,36 @@ void main() {
     if (p.x >= pc.fw || p.y >= pc.fh) return;
     const int N = pc.fw * pc.fh;
     const int pix = p.y * pc.fw + p.x;
-    const vec2 v = fdAt(dir, pix);
-    const float o = oEstAt(dir, pix, v);
-    vec2 r = v;
+    const float o = oEstAt(dir, pix);
+    vec2 r = vec2(0.0);
+    bool copy = true;
     if (o >= 0.2) {
         const vec3 col = rawAt(dir, pix);
         vec2 acc = vec2(0.0);
         float ws = 0.0;
-        for (int k = 0; k < 4; k++) {
-            const ivec2 d = ivec2(k == 0 ? 1 : (k == 1 ? -1 : 0), k == 2 ? 1 : (k == 3 ? -1 : 0));
-            for (int s = 1; s <= R_FILL; s++) {
-                const ivec2 q = p + d * s;
-                if (q.x < 0 || q.y < 0 || q.x >= pc.fw || q.y >= pc.fh) break;
-                const int qi = q.y * pc.fw + q.x;
-                const vec2 vq = fdAt(dir, qi);
-                if (oEstAt(dir, qi, vq) < 0.1) {
-                    const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0)) / (1.0 + float(s) * 0.125);
-                    acc += w * vq;
-                    ws += w;
-                    break;
-                }
+        // the four walks advance together (independent loads overlap); a walk that found its pixel, or left the frame, stops
+        ivec2 hit[4] = ivec2[4](ivec2(-1), ivec2(-1), ivec2(-1), ivec2(-1));
+        int dist[4] = int[4](0, 0, 0, 0);
+        const ivec2 dirs[4] = ivec2[4](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1));
+        for (int s = 1; s <= R_FILL; s++) {
+            for (int k = 0; k < 4; k++) {
+                if (dist[k] != 0) continue;
+                const ivec2 q = p + dirs[k] * s;
+                if (q.x < 0 || q.y < 0 || q.x >= pc.fw || q.y >= pc.fh) { dist[k] = -1; continue; }
+                if (oEstAt(dir, q.y * pc.fw + q.x) < 0.1) { dist[k] = s; hit[k] = q; }
             }
+            if (all(notEqual(ivec4(dist[0], dist[1], dist[2], dist[3]), ivec4(0)))) break;
         }
-        if (ws > 0.0) r = mix(v, acc / ws, smoothstep(0.2, 0.8, o));
+        for (int k = 0; k < 4; k++) {
+            if (dist[k] <= 0) continue;
+            const int qi = hit[k].y * pc.fw + hit[k].x;
+            const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0)) / (1.0 + float(dist[k]) * 0.125);
+            acc += w * fdAt(dir, qi);
+            ws += w;
+        }
+        if (ws > 0.0) { r = mix(fdAt(dir, pix), acc / ws, smoothstep(0.2, 0.8, o)); copy = false; }
     }
+    if (copy) r = fdAt(dir, pix);
     const int ff = pc.fdOff + 4 * N + dir * 2 * N + 2 * pix;   // FF[2] follows FD[2] (2N floats per direction)
     fl[ff] = r.x;
     fl[ff + 1] = r.y;

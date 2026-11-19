@@ -6,6 +6,7 @@
 //   o = the occlusion ramp with the estimate's defaults (v3Occ, soft = 1); oBox = the mean of o over the 9x9 window (in-frame pixels);
 //   g = smoothstep(0.35, 0.70, oBox);
 //   MAP word = cost8 (kept) | e8 = min(255, round(8 e)) << 8 | amb8 << 16 (the level-0 block field's amb, bilinear over block centres) | g8 << 24;
+//   o_eff = o (1 - g) (the estimate's defaults) as a float into V3B_AUX words [2N + dir N + pix] for v3_fill;
 //   workgroup-local counts into G.unsureCount (u >= 0.5 with the defaults) and G.costSum (fixed point x16 of the matching cost).
 // The raw e is stored, the ramp is applied by v3_fill and v3_project with the runtime knobs. mode bit 2 = inject (tests): BLK holds an old estimate's
 // records (the flows were injected), so amb = 0.
@@ -15,9 +16,8 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 
 const int APR = 4, TW = 16 + 2 * APR;   // 24 x 24 tile
-shared float sO[TW * TW];
-shared float sE[16 * 16];
-shared vec2 sV[TW * TW];   // the vectors of the tile (the coherence of the occluded ones decides `garbage`)
+shared vec4 sQ[TW * TW];   // per tile pixel: (o, o vx, o vy, o |v|^2), 0 outside the frame: the box sums are 81 reads of one vec4
+shared vec4 sH[TW * 16];   // the horizontal 9-sums of sQ (24 rows x 16 columns): the box is separable
 shared uint cntU, sumC;
 
 // the field of direction dir at a flow-px position q (index coordinates, pixel k at k): bilinear, clamped
@@ -50,47 +50,46 @@ void main() {
     const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
     if (lid == 0) { cntU = 0u; sumC = 0u; }
     // the occlusion value of every pixel of the tile (-1 = outside the frame); the centre's e is kept for the store
-    for (int i = lid; i < TW * TW; i += 256) {
+    for (int r = 0; r < 3; r++) {
+        const int i = lid + 256 * r;
+        if (i >= TW * TW) break;
         const ivec2 p = org + ivec2(i % TW, i / TW) - APR;
-        float o = -1.0;
+        vec4 q = vec4(0.0);
         if (p.x >= 0 && p.y >= 0 && p.x < pc.fw && p.y < pc.fh) {
             float e, F;
             vec2 vv;
             consist(dir, p, e, F, vv);
-            o = v3Occ(e, F, 1.0);
-            sV[i] = vv;
-            const ivec2 c = p - org;
-            if (c.x >= 0 && c.y >= 0 && c.x < 16 && c.y < 16) sE[c.y * 16 + c.x] = e;
+            const float o = v3Occ(e, F, 1.0);
+            q = vec4(o, o * vv, o * dot(vv, vv));
         }
-        sO[i] = o;
+        sQ[i] = q;
+    }
+    barrier();
+    for (int i = lid; i < TW * 16; i += 256) {
+        const int row = i >> 4, col = i & 15;
+        vec4 h = vec4(0.0);
+        for (int k = 0; k < 9; k++) h += sQ[row * TW + col + k];
+        sH[i] = h;
     }
     barrier();
     const ivec2 lp = ivec2(gl_LocalInvocationID.xy);
     const ivec2 p = org + lp;
     if (p.x < pc.fw && p.y < pc.fh) {
-        float s = 0.0, n = 0.0, sv2 = 0.0;
-        vec2 sv = vec2(0.0);
-        for (int j = 0; j < 9; j++)
-            for (int i = 0; i < 9; i++) {
-                const int ti = (lp.y + j) * TW + lp.x + i;
-                const float o = sO[ti];
-                if (o >= 0.0) {
-                    s += o; n += 1.0;
-                    const vec2 vq = sV[ti];
-                    sv += o * vq;
-                    sv2 += o * dot(vq, vq);
-                }
-            }
+        vec4 q = vec4(0.0);
+        for (int j = 0; j < 9; j++) q += sH[(lp.y + j) * 16 + lp.x];
+        const float s = q.x, sv2 = q.w;
+        const vec2 sv = q.yz;
+        const float n = float((min(p.x + 4, pc.fw - 1) - max(p.x - 4, 0) + 1) * (min(p.y + 4, pc.fh - 1) - max(p.y - 4, 0) + 1));   // in-frame pixels of the window
         // garbage: a broad inconsistent region whose vectors are also incoherent (an occlusion strip, however wide, has the coherent vectors of the surface
         // that is revealed or covered; random vectors have none). The spread is taken over the occluded pixels only (weighted by o).
         const float so = max(s, 1e-3);
         const float spread = sqrt(max(sv2 / so - dot(sv / so, sv / so), 0.0));
         const float g = smoothstep(0.35, 0.70, s / n) * smoothstep(1.0, 3.0, spread);
-        const float e = sE[lp.y * 16 + lp.x];
+        float e, F;
+        vec2 vv;
+        consist(dir, p, e, F, vv);
         const int pix = p.y * pc.fw + p.x;
         const int N = pc.fw * pc.fh;
-        const int fi = pc.fdOff + dir * 2 * N + 2 * pix;
-        const float F = length(vec2(fl[fi], fl[fi + 1]));
         // amb: the level-0 block records (slot 0 of this direction), bilinear over the block centres (8 i + 3.5)
         float amb = 0.0;
         if ((pc.mode & 4) == 0) {
@@ -116,6 +115,7 @@ void main() {
         // the unsure count with the estimate's defaults (the stored, quantised values: what v3_project will see)
         const V3Map m = v3MapUnpack(w1);
         const float o = v3Occ(m.e, F, 1.0);
+        ax[2 * N + dir * N + pix] = floatBitsToUint(v3OccEff(o, m.g));   // o_eff for v3_fill's walks: V3B_AUX words [2N, 4N) (free: v2_static's layout leaves them)
         if (v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0) >= 0.5) atomicAdd(cntU, 1u);
         atomicAdd(sumC, cost8 * 2u);   // x16 fixed point of the cost: 16 * cost8 / 8
     }
