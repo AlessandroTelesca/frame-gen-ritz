@@ -803,7 +803,8 @@ int main(int argc, char** argv) {
         qp.queryCount = 2;
         VkQueryPool pool;
         CK(vkCreateQueryPool(dev, &qp, nullptr, &pool));
-        int batch = std::min(bench, (int)(framegen::Interpolator::kSetRing - 1) / std::max(mult - 1, 1));
+        const int setsPer = std::max(mult - 1, 1) + (setA.motionVersion == framegen::MotionVersion::V3 && setA.v3Guard != framegen::V3Guard::Off ? 1 : 0);   // the guard takes a second set per estimate
+        int batch = std::min(bench, (int)(framegen::Interpolator::kSetRing - 1) / setsPer);
         std::vector<double> per1;
         for (int rep = 0; rep < 5; rep++) {
             begin();
