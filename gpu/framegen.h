@@ -359,7 +359,7 @@ struct Settings {
     // pyramidMinSide, subpixel and searchPenalty apply to V2's estimate exactly as they do under MotionVersion::V2 (V3 itself still ignores them).
     // Runtime: setSettings() at any time, from the next recordEstimate; the first time it is on, setSettings creates V2's estimate pipelines inside V3's
     // group and allocates V2's two estimate buffers (no GPU wait, false if that fails: nothing changed); they stay until releaseUnusedMotion() (called with
-    // it Off) or a resize / destroy frees them. Cost on top of V3 (RX 7900 XTX, 1080p flowScale 2, 2x, whole pair): see INTEGRATION.md "Motion version 3".
+    // it Off) or a resize / destroy frees them. Cost on top of V3 (RX 7900 XTX, 1080p flowScale 2, 2x, per real pair): about +0.34 ms (Guard) / +0.31 ms (V2Motion), 14.06 MiB of buffers; see INTEGRATION.md "Motion guard".
     // Other versions ignore it. Does not drop the current estimate.
     V3Guard v3Guard = V3Guard::Off;
     // MotionVersion::Learned: the net (see LearnedNet). E2v5 = the default (E2v4, E2v3 before it); E1v5 = the small net, the recommended
