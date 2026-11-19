@@ -1,0 +1,127 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step Y1 (gpu/V3.md section 3.9): consistency of the two flows and the garbage measure. Dispatch ceil(fw / 16) x ceil(fh / 16) x 2
+// (z = direction), workgroup 16x16, one flow px per thread, a shared tile with a 4 px apron for the 9x9 box mean. Per pixel p of direction d (F01 shown):
+//   e = |F01(p) + F10(p + F01(p))| (the other direction's FD, bilinear; flow px), 31.9 where p + F01(p) is outside the frame;
+//   o = the occlusion ramp with the estimate's defaults (v3Occ, soft = 1); oBox = the mean of o over the 9x9 window (in-frame pixels);
+//   g = smoothstep(0.35, 0.70, oBox);
+//   MAP word = cost8 (kept) | e8 = min(255, round(8 e)) << 8 | amb8 << 16 (the level-0 block field's amb, bilinear over block centres) | g8 << 24;
+//   workgroup-local counts into G.unsureCount (u >= 0.5 with the defaults) and G.costSum (fixed point x16 of the matching cost).
+// The raw e is stored, the ramp is applied by v3_fill and v3_project with the runtime knobs. mode bit 2 = inject (tests): BLK holds an old estimate's
+// records (the flows were injected), so amb = 0.
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_maps.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int APR = 4, TW = 16 + 2 * APR;   // 24 x 24 tile
+shared float sO[TW * TW];
+shared float sE[16 * 16];
+shared vec2 sV[TW * TW];   // the vectors of the tile (the coherence of the occluded ones decides `garbage`)
+shared uint cntU, sumC;
+
+// the field of direction dir at a flow-px position q (index coordinates, pixel k at k): bilinear, clamped
+vec2 fdBil(int dir, vec2 q) {
+    const int N = pc.fw * pc.fh;
+    q = clamp(q, vec2(0.0), vec2(float(pc.fw - 1), float(pc.fh - 1)));
+    const ivec2 i0 = ivec2(floor(q));
+    const vec2 a = q - vec2(i0);
+    const ivec2 i1 = min(i0 + 1, ivec2(pc.fw - 1, pc.fh - 1));
+    const int base = pc.fdOff + dir * 2 * N;
+    const int a00 = base + 2 * (i0.y * pc.fw + i0.x), a10 = base + 2 * (i0.y * pc.fw + i1.x), a01 = base + 2 * (i1.y * pc.fw + i0.x), a11 = base + 2 * (i1.y * pc.fw + i1.x);
+    const vec2 v00 = vec2(fl[a00], fl[a00 + 1]), v10 = vec2(fl[a10], fl[a10 + 1]), v01 = vec2(fl[a01], fl[a01 + 1]), v11 = vec2(fl[a11], fl[a11 + 1]);
+    return mix(mix(v00, v10, a.x), mix(v01, v11, a.x), a.y);
+}
+
+// e and F of the pixel p of direction dir
+void consist(int dir, ivec2 p, out float e, out float F, out vec2 v) {
+    const int N = pc.fw * pc.fh;
+    const int i = pc.fdOff + dir * 2 * N + 2 * (p.y * pc.fw + p.x);
+    v = vec2(fl[i], fl[i + 1]);
+    const vec2 q = vec2(p) + v;
+    F = length(v);
+    if (q.x < -0.5 || q.y < -0.5 || q.x > float(pc.fw) - 0.5 || q.y > float(pc.fh) - 0.5) { e = 31.9; return; }
+    e = length(v + fdBil(1 - dir, q));
+}
+
+void main() {
+    const int dir = int(gl_WorkGroupID.z);
+    const int lid = int(gl_LocalInvocationIndex);
+    const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
+    if (lid == 0) { cntU = 0u; sumC = 0u; }
+    // the occlusion value of every pixel of the tile (-1 = outside the frame); the centre's e is kept for the store
+    for (int i = lid; i < TW * TW; i += 256) {
+        const ivec2 p = org + ivec2(i % TW, i / TW) - APR;
+        float o = -1.0;
+        if (p.x >= 0 && p.y >= 0 && p.x < pc.fw && p.y < pc.fh) {
+            float e, F;
+            vec2 vv;
+            consist(dir, p, e, F, vv);
+            o = v3Occ(e, F, 1.0);
+            sV[i] = vv;
+            const ivec2 c = p - org;
+            if (c.x >= 0 && c.y >= 0 && c.x < 16 && c.y < 16) sE[c.y * 16 + c.x] = e;
+        }
+        sO[i] = o;
+    }
+    barrier();
+    const ivec2 lp = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 p = org + lp;
+    if (p.x < pc.fw && p.y < pc.fh) {
+        float s = 0.0, n = 0.0, sv2 = 0.0;
+        vec2 sv = vec2(0.0);
+        for (int j = 0; j < 9; j++)
+            for (int i = 0; i < 9; i++) {
+                const int ti = (lp.y + j) * TW + lp.x + i;
+                const float o = sO[ti];
+                if (o >= 0.0) {
+                    s += o; n += 1.0;
+                    const vec2 vq = sV[ti];
+                    sv += o * vq;
+                    sv2 += o * dot(vq, vq);
+                }
+            }
+        // garbage: a broad inconsistent region whose vectors are also incoherent (an occlusion strip, however wide, has the coherent vectors of the surface
+        // that is revealed or covered; random vectors have none). The spread is taken over the occluded pixels only (weighted by o).
+        const float so = max(s, 1e-3);
+        const float spread = sqrt(max(sv2 / so - dot(sv / so, sv / so), 0.0));
+        const float g = smoothstep(0.35, 0.70, s / n) * smoothstep(1.0, 3.0, spread);
+        const float e = sE[lp.y * 16 + lp.x];
+        const int pix = p.y * pc.fw + p.x;
+        const int N = pc.fw * pc.fh;
+        const int fi = pc.fdOff + dir * 2 * N + 2 * pix;
+        const float F = length(vec2(fl[fi], fl[fi + 1]));
+        // amb: the level-0 block records (slot 0 of this direction), bilinear over the block centres (8 i + 3.5)
+        float amb = 0.0;
+        if ((pc.mode & 4) == 0) {
+            const int gw = (pc.fw + 7) >> 3, gh = (pc.fh + 7) >> 3;
+            const vec2 u = (vec2(p) - 3.5) * 0.125;
+            const ivec2 b0 = ivec2(floor(u));
+            const vec2 a = u - vec2(b0);
+            const int base = dir * 2 * gw * gh * 4;   // BLK level 0 starts at word 0: [dir][slot 0]
+            float av[4];
+            for (int k = 0; k < 4; k++) {
+                const ivec2 b = clamp(b0 + ivec2(k & 1, k >> 1), ivec2(0), ivec2(gw - 1, gh - 1));
+                av[k] = fl[base + (b.y * gw + b.x) * 4 + 3];
+            }
+            amb = mix(mix(av[0], av[1], a.x), mix(av[2], av[3], a.x), a.y);
+        }
+        const uint w0 = ax[mapOff(dir) + pix];
+        const uint cost8 = w0 & 255u;
+        const uint e8 = uint(min(255.0, floor(8.0 * e + 0.5)));
+        const uint g8 = uint(floor(255.0 * g + 0.5));
+        const uint a8 = uint(floor(255.0 * clamp(amb, 0.0, 1.0) + 0.5));
+        const uint w1 = cost8 | (e8 << 8) | (a8 << 16) | (g8 << 24);
+        ax[mapOff(dir) + pix] = w1;
+        // the unsure count with the estimate's defaults (the stored, quantised values: what v3_project will see)
+        const V3Map m = v3MapUnpack(w1);
+        const float o = v3Occ(m.e, F, 1.0);
+        if (v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0) >= 0.5) atomicAdd(cntU, 1u);
+        atomicAdd(sumC, cost8 * 2u);   // x16 fixed point of the cost: 16 * cost8 / 8
+    }
+    barrier();
+    if (lid == 0) {
+        atomicAdd(ax[gOff() + G_UNSURE_COUNT], cntU);
+        atomicAdd(ax[gOff() + G_COST_SUM], sumC);
+    }
+}

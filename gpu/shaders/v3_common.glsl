@@ -14,11 +14,13 @@ layout(push_constant) uniform V3PC {
     float cutThresh, globalFrac;             // Settings::v3SceneCut, Settings::globalFallback
     float smear, occlSoft, unsure;           // Settings::v3Smear, v3OcclSoft, v3Unsure
     float cx, cy;                            // model centre x, y (fw/2, fh/2) (stats), spare otherwise
-    float pad[7];
+    int fdOff;                               // Y1: the word offset of FD in V3B_FLOW (= 16 B: after the block records); FF = fdOff + 4 N, TF = fdOff + 8 N
+    float pad[6];
 } pc;
 // mode bits, per pass (a pass never reads another's meaning): search: bit 0 = hook (j) colour window; dense: bit 0 = (j), bit 2 = inject
 // (tests); synth: bit 0 = Gaussian blur weights, bit 1 = hook (l) detail split, bit 3 = debug dump.
 const int V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8;
+// (Y1) occl: bit 2 = inject (tests, BLK is stale: amb = 0); fill, project: none.
 
 // Binding 13: V3B_PYR, raw planes and features of both frames, all levels (uvec2 per texel, section 4); binding 14: V3B_AUX, static
 // layout + maps + the pair's state G (uint words); binding 15: V3B_FLOW, block records, dense and filled fields, the T-field (floats).

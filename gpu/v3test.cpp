@@ -217,7 +217,7 @@ static Flows exactFlows(const Scene& sc, int fs) {
 
 // hidden pixels of R_t (see the header comment); `strips` = the first condition alone (before the boundary band), for the t = 0 / 1 check
 // sides: bit 0 = the prev side of the first condition is tested, bit 1 = the curr side (the self-check tests one side at t = 0 / 1)
-static std::vector<uint8_t> hiddenMask(const Scene& sc, double t, std::vector<uint8_t>* strips = nullptr, int sides = 3) {
+static std::vector<uint8_t> hiddenMask(const Scene& sc, double t, std::vector<uint8_t>* strips = nullptr, int sides = 3, std::vector<uint8_t>* band = nullptr) {
     const int W = sc.W, H = sc.H;
     std::vector<uint8_t> a((size_t)W * H, 0), tmp((size_t)W * H, 0), d((size_t)W * H, 0);
     parallelRows(H, [&](int y) {
@@ -247,12 +247,13 @@ static std::vector<uint8_t> hiddenMask(const Scene& sc, double t, std::vector<ui
     if (strips) *strips = d;
     // plus the pixels within 2 px of a layer boundary at t
     const std::vector<uint8_t> id = idMap(sc, t);
+    if (band) band->assign((size_t)W * H, 0);
     parallelRows(H, [&](int y) {
         for (int x = 0; x < W; x++) {
             const uint8_t c = id[(size_t)y * W + x];
             for (int j = std::max(0, y - 2); j <= std::min(H - 1, y + 2); j++)
                 for (int i = std::max(0, x - 2); i <= std::min(W - 1, x + 2); i++)
-                    if (id[(size_t)j * W + i] != c) d[(size_t)y * W + x] = 1;
+                    if (id[(size_t)j * W + i] != c) { d[(size_t)y * W + x] = 1; if (band) (*band)[(size_t)y * W + x] = 1; }
         }
     });
     return d;
@@ -550,6 +551,21 @@ static std::vector<uint8_t> oracleBlend(const Scene& sc, const std::vector<uint8
 // carry another layer's true motion; --errmap PREFIX writes a PPM per direction (visible and right: dark grey, wrong: red, estimate = another layer's motion: yellow, not visible: black)
 static bool gDiag = false;
 static std::string gErrMap;
+static std::string gFrames;   // --frames PREFIX: PPMs of every in-between frame, its reference and the error (x8, grey)
+static void writePpm(const std::string& fn, const std::vector<uint8_t>& rgba, int W, int H, bool err, const std::vector<uint8_t>* ref) {
+    FILE* f = fopen(fn.c_str(), "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", W, H);
+    std::vector<uint8_t> row((size_t)W * 3);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            const size_t i = ((size_t)y * W + x) * 4;
+            for (int c = 0; c < 3; c++) row[x * 3 + c] = err ? (uint8_t)std::min(255, 8 * std::abs((int)rgba[i + c] - (int)(*ref)[i + c])) : rgba[i + c];
+        }
+        fwrite(row.data(), 1, row.size(), f);
+    }
+    fclose(f);
+}
 static int gBlkLevel = -1;
 static void diagFlow(const Scene& sc, const Flows& F, const float* est, const std::vector<float>& truth, const std::vector<uint8_t>& vis, int dir, const std::string& nm) {
     const int fw = F.fw, fh = F.fh, fs = F.fs, W = sc.W;
@@ -688,6 +704,7 @@ int main(int argc, char** argv) {
         else if (a == "--diag") gDiag = true;
         else if (a == "--blk" && i + 1 < argc) gBlkLevel = atoi(argv[++i]);
         else if (a == "--errmap" && i + 1 < argc) { gErrMap = argv[++i]; gDiag = true; }
+        else if (a == "--frames" && i + 1 < argc) gFrames = argv[++i];
         else if (a == "--list") list = true;
         else { fprintf(stderr, "usage: v3test [--size WxH] [--fs 1|2|4] [--scene shift|zoom|rotate|layers|fade|stripes|all] [--t T1,T2,..] [--report-only] [--selfcheck] [--diag] [--errmap PREFIX] [--list]\n"); return 2; }
     }
@@ -888,12 +905,37 @@ int main(int argc, char** argv) {
                 const Run& r = path ? inj : est;
                 if (!(path ? injOk : estOk) || r.out.size() <= k) { printf("%-20s inbetween %s t=%.2f: the run failed\n", nm.c_str(), path ? "exact flows" : "estimated  ", ts[k]); verdict(false, true); continue; }
                 const BetStat s = betweenStat(r.out[k], ref, hid);
+                if (!gFrames.empty()) {
+                    char tb[64];
+                    snprintf(tb, sizeof tb, "-t%.2f-%s", ts[k], path ? "exact" : "est");
+                    const std::string tn = tb;
+                    std::string base = gFrames + "-" + sc.name + tn;
+                    for (char& ch : base) if (ch == '(' || ch == ')' || ch == ',' || ch == '%') ch = '_';
+                    writePpm(base + "-out.ppm", r.out[k], gW, gH, false, nullptr);
+                    writePpm(base + "-err.ppm", r.out[k], gW, gH, true, &ref);
+                    if (path == 0) { std::string br = gFrames + "-" + sc.name + "-t" + tn.substr(2, 4) + "-ref.ppm"; for (char& ch : br) if (ch == '(' || ch == ')' || ch == ',' || ch == '%') ch = '_'; writePpm(br, ref, gW, gH, false, nullptr); }
+                }
                 const bool gated = path == 1 || sc.name.rfind("shift", 0) == 0;
                 const double thr = path ? 1.0 : 2.0;
                 const bool pass = s.n && s.mean <= thr;
                 printf("%-20s inbetween %s t=%.2f  mean %6.2f  p99 %6.2f  <=3 levels %5.1f%%  (non-hidden %5.1f%%)   %s (mean <= %.1f%s)\n", nm.c_str(),
                        path ? "exact flows" : "estimated  ", ts[k], s.mean, s.p99, s.le3, s.frac, gated ? (pass ? "PASS" : "FAIL") : "INFO", thr, gated ? "" : ", informational");
                 verdict(pass, gated);
+            }
+            if (sc.layers.size() > 1) {   // INSIDE the hidden strips (content absent in one real frame; not within 2 px of a layer boundary): ours against the plain time blend
+                std::vector<uint8_t> strips, band;
+                hiddenMask(sc, ts[k], &strips, 3, &band);
+                std::vector<uint8_t> notInside(strips.size());
+                for (size_t i = 0; i < strips.size(); i++) notInside[i] = !(strips[i] && !band[i]);   // (betweenStat skips the mask: the strip interior is what is left)
+                std::vector<uint8_t> blend(prev.size());
+                for (size_t i = 0; i < prev.size(); i++) blend[i] = (uint8_t)std::lround((1.0 - ts[k]) * prev[i] + ts[k] * curr[i]);
+                const BetStat sb = betweenStat(blend, ref, notInside);
+                for (int path = 0; path < 2; path++) {
+                    const Run& r = path ? inj : est;
+                    if (r.out.size() <= k) continue;
+                    const BetStat so = betweenStat(r.out[k], ref, notInside);
+                    printf("%-20s hidden strips %s t=%.2f  mean %6.2f  p99 %6.2f  (%.1f%% of the frame)   plain blend: mean %6.2f  p99 %6.2f\n", nm.c_str(), path ? "exact flows" : "estimated  ", ts[k], so.mean, so.p99, so.frac, sb.mean, sb.p99);
+                }
             }
         }
         printf("%-20s inject readback (FD == the injected flows, bit-exact): %s\n", nm.c_str(), rtOk ? "PASS" : "FAIL");

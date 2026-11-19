@@ -60,6 +60,10 @@
 #include "v3_dense_spv.h"
 #include "v3_wide_spv.h"
 #include "v3_stats_spv.h"
+// (Y1: occlusion, fill, projection; the synthesis above is the real one)
+#include "v3_occl_spv.h"
+#include "v3_fill_spv.h"
+#include "v3_project_spv.h"
 // MotionVersion::Learned: its passes and the nets' weights (gpu/ml/embed_weights.py), probed as a set: a host build that does not
 // generate them gets Learned refused with a reason. Only its duplicate test (ml_dup) and its static guard (ml_guard) read colour and
 // have format variants (probed per format below).
@@ -441,7 +445,8 @@ struct V3PC {
     float cutThresh, globalFrac;
     float smear, occlSoft, unsure;
     float cx, cy;
-    float pad[7];
+    int32_t fdOff;   // Y1: word offset of FD in V3B_FLOW (16 B); FF = +4 N, TF = +8 N
+    float pad[6];
 };
 static_assert(sizeof(V3PC) == sizeof(PC), "V3PC is pushed over PC's range");
 enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8 };   // synth mode bits (shaders/v3_common.glsl)
@@ -807,6 +812,7 @@ struct Interpolator::Impl {
     // v3inj: set around recordEstimate by recordDebugV3Inject.
     struct V3Inject { VkBuffer buf; VkDeviceSize f01, f10; };
     bool v3Fresh = false, v3Dirty = false;
+    uint32_t v3Ns = 1;   // the T-field slots V3B_FLOW holds (Y1: grown, with a copy of the estimate, by the first blurred record that needs more)
     const V3Inject* v3inj = nullptr;
     bool mv3() const { return set.motionVersion == MotionVersion::V3; }
     void v3Reset(VkCommandBuffer cb);
@@ -1725,6 +1731,9 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V3_DENSE].sp = SPV(v3_dense);
         spv[P_V3_WIDE].sp = SPV(v3_wide);
         spv[P_V3_STATS].sp = SPV(v3_stats);
+        spv[P_V3_OCCL].sp = SPV(v3_occl);
+        spv[P_V3_FILL].sp = SPV(v3_fill);
+        spv[P_V3_PROJECT].sp = SPV(v3_project);
         spv[P_V3_SYNTH] = {cs.v3Synth, spec};
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
@@ -1795,6 +1804,7 @@ bool Interpolator::Impl::motionSized(MotionGroup& g) {
         if (allocBuf(g.bufs[V3B_PYR], V.pyrBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) && allocBuf(g.bufs[V3B_AUX], V.auxBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT) &&
             allocBuf(g.bufs[V3B_FLOW], V.flowBytes(1), VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
             v3Fresh = true;
+            v3Ns = 1;
             return true;
         }
         for (UiBuf& b : g.bufs) freeBuf(b);
@@ -2257,6 +2267,7 @@ struct Rec {
         v.cutThresh = I.set.v3SceneCut; v.globalFrac = I.set.globalFallback;
         v.smear = I.set.v3Smear; v.occlSoft = I.set.v3OcclSoft; v.unsure = I.set.v3Unsure;
         v.cx = 0.5f * (float)I.fw; v.cy = 0.5f * (float)I.fh;
+        v.fdOff = (int)(16 * v3Layout(I.W, I.H, I.set.flowScale).B);   // FD in V3B_FLOW (words)
         return v;
     }
     V2PC v2pc() const {
@@ -2747,10 +2758,20 @@ bool Interpolator::recordEstimate(VkCommandBuffer cb, Frame prev, Frame curr) {
             r.stamp("inject");
         }
         V3PC dv = v;
-        dv.mode = hookJ | (inj ? 4 : 2);   // dense: bit 0 hook (j), bit 1 also write FF (= FD until v3_fill, step Y1), bit 2 inject
+        dv.mode = hookJ | (inj ? 4 : 0);   // dense: bit 0 hook (j), bit 1 also write FF (not since v3_fill writes it, step Y1), bit 2 inject
         r.runV3(P_V3_DENSE, dv, divUp(V.fw + 4, 8), divUp(V.fh + 4, 8), 2);
         r.cbar();
         r.stamp("dense");
+        // Y1: forward-backward consistency, the garbage measure and the MAP word (e8, amb8, g8), then the vector fill into FF (section 3.9, 3.10)
+        V3PC ov = v;
+        ov.mode = inj ? 4 : 0;   // occl: bit 2 = inject (the block records are stale: amb = 0)
+        r.runV3(P_V3_OCCL, ov, divUp(V.fw, 16), divUp(V.fh, 16), 2);
+        r.cbar();
+        r.stamp("occlusion");
+        r.runV3(P_V3_FILL, v, divUp(V.fw, 16), divUp(V.fh, 16), 2);
+        r.cbar();
+        r.stamp("fill");
+        // later (Y2): v3_enclose (static mask), v3_decide (scene cut, failMix)
         return true;
     }
     if (I.mlearned()) {   // the learned estimator instead of V1's pyramid and search (V1's luma above, V1's synthesis after it)
@@ -3097,14 +3118,34 @@ void Interpolator::Impl::v3Reset(VkCommandBuffer cb) {
     }
 }
 
-// V3: recordSynth (n = 1, t0 = t1 = t) and recordSynthBlur (n samples over [t0, t1]) in one pass, v3_synth.comp (gpu/V3.md section 3.15), then the
-// UI patch as V2's. The caller has checked the pair, the rings and the UI entries. Skeleton: the synthesis is a plain time-weighted blend of the
-// real frames (no projection pass yet).
+// V3: recordSynth (n = 1, t0 = t1 = t) and recordSynthBlur (n samples over [t0, t1]): v3_project (the T-field of every interior sample, flow
+// resolution) and v3_synth (full resolution, all samples averaged in registers; gpu/V3.md sections 3.14, 3.15), then the UI patch as V2's. The caller
+// has checked the pair, the rings and the UI entries. The interior samples (0 < t_k < 1, contiguous) are the ones that need a T-field slot; a
+// sample at t <= 0 / >= 1 is a real frame. A record that needs more slots than V3B_FLOW holds grows it first (a copy of the whole buffer, the
+// estimate included, into a larger one; the old buffer waits in blurGrave).
 bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Frame curr, Frame out, float t0, float t1, int n, bool gauss) {
-    VkDescriptorSet set_ = takeSet(R_SYNTH, srcP, srcC, out, false, rejectMasks(cb));
+    int lo = n, hi = -1;
+    for (int k = 0; k < n; k++) {
+        const float t = std::min(std::max(t0 + (t1 - t0) * (((float)k + 0.5f) / (float)n), t0), t1);
+        if (t > 0.0f && t < 1.0f) { lo = std::min(lo, k); hi = k; }
+    }
+    const int nInt = hi - lo + 1;   // 0: every sample is a real frame
     Rec r(*this, cb);
-    // orders this record after every earlier one (shared buffers) and zeroes u[0] (the untrusted count, which recordDebugCounters reads: the skeleton has none)
-    r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    // orders this record after every earlier one (shared buffers) and zeroes u[0] (the untrusted count, which recordDebugCounters reads)
+    r.barrier(CS, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    if (nInt > (int)v3Ns) {
+        MotionGroup& g = mo[(int)MotionVersion::V3];
+        const V3Layout V = v3Layout(W, H, set.flowScale);
+        const VkDeviceSize bytes = V.flowBytes((uint64_t)nInt);
+        UiBuf nb;
+        if (bytes > lim.sbRange || !allocBuf(nb, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) return false;
+        VkBufferCopy cp{0, 0, g.bufs[V3B_FLOW].size};
+        CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, nb.b, 1, &cp);
+        blurGrave.push_back(g.bufs[V3B_FLOW]);
+        g.bufs[V3B_FLOW] = nb;
+        v3Ns = (uint32_t)nInt;
+    }
+    VkDescriptorSet set_ = takeSet(R_SYNTH, srcP, srcC, out, false, rejectMasks(cb));
     CmdFillBuffer(cb, buf[2], 0, 4, 0);
     r.barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, RW);
     CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set_, 0, nullptr);
@@ -3112,6 +3153,14 @@ bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     v.n = n;
     v.t0 = t0;
     v.t1 = t1;
+    v.lvl = nInt;
+    v.iter = nInt > 0 ? lo : 0;
+    v.mode = 0;
+    if (nInt > 0) {
+        r.runV3(P_V3_PROJECT, v, divUp(fw, 8), divUp(fh, 8), (uint32_t)nInt);
+        r.cbar();
+        r.stamp("project");
+    }
     v.mode = gauss ? V3M_GAUSS : 0;
     r.runV3(P_V3_SYNTH, v, divUp((int)W, 8), divUp((int)H, 8));
     const char* name = n == 1 ? "synth" : "blur synth";

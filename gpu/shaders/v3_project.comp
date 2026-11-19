@@ -1,0 +1,93 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step Y1 (gpu/V3.md section 3.14): the two flows projected to sample time t by fixed-point gather, once per flow px.
+// Dispatch ceil(fw / 8) x ceil(fh / 8) x nInt (z = the interior sample slot; sample k = pc.iter + z has t_k = t0 + (t1 - t0)(k + 0.5)/n, as
+// v3_synth), workgroup 8x8, one output position m (flow px) per thread. Reads FF[0..1], MAP[0..1], G; writes TF[z].
+//   hypothesis A (prev's side): p = m - t F01'(m), then twice p = m - t F01'(p) (bilinear FF[0]); gA = F01'(p); residual rA = |p + t gA - m|;
+//     holeA = smoothstep(0.75, 2.0, rA) (nothing of prev lands at m); the maps at the flow px nearest to p give oA, uA (3.11, the runtime knobs);
+//   hypothesis B (curr's side): q = m - (1 - t) F10'(q) likewise with FF[1], gB = F10'(q), rB = |q + (1 - t) gB - m|, holeB, oB, uB.
+//   oA / oB are the garbage-corrected occlusion o_eff = o (1 - g) (a broad inconsistent region is bad flow, smeared by u, not an occlusion strip).
+// The record (4 words per flow px, float bits): w0 = packHalf2x16(gA), w1 = packHalf2x16(gB), w2 = packUnorm4x8(oA, holeA, uA, 0),
+// w3 = packUnorm4x8(oB, holeB, uB, 0).
+// G.failMix f (v3_decide, Y2; 0 until then): the vectors become mix(estimated, camera model, f), u = max(u, f), o and hole x (1 - f). G.mode == 1
+// (scene cut, Y2): nothing is written (the synth copies a real frame). Thread (0,0,0) of the dispatch writes u[0] = G.unsureCopy (f = 1: W H).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_maps.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// the filled field FF[dir] at a flow-px position q (index coordinates), bilinear, clamped to the frame
+vec2 ffBil(int dir, vec2 q) {
+    const int N = pc.fw * pc.fh;
+    q = clamp(q, vec2(0.0), vec2(float(pc.fw - 1), float(pc.fh - 1)));
+    const ivec2 i0 = ivec2(floor(q));
+    const vec2 a = q - vec2(i0);
+    const ivec2 i1 = min(i0 + 1, ivec2(pc.fw - 1, pc.fh - 1));
+    const int base = pc.fdOff + 4 * N + dir * 2 * N;
+    const int a00 = base + 2 * (i0.y * pc.fw + i0.x), a10 = base + 2 * (i0.y * pc.fw + i1.x), a01 = base + 2 * (i1.y * pc.fw + i0.x), a11 = base + 2 * (i1.y * pc.fw + i1.x);
+    const vec2 v00 = vec2(fl[a00], fl[a00 + 1]), v10 = vec2(fl[a10], fl[a10 + 1]), v01 = vec2(fl[a01], fl[a01 + 1]), v11 = vec2(fl[a11], fl[a11 + 1]);
+    return mix(mix(v00, v10, a.x), mix(v01, v11, a.x), a.y);
+}
+
+// the camera model (G.aff when valid, else the first valid dominant motion, else zero) at flow px m, as the displacement prev -> curr
+vec2 camModel(vec2 m) {
+    const int g = gOff();
+    const uint valid = ax[g + G_VALID];
+    if ((valid & 256u) != 0u) {
+        const vec2 XY = (m - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
+        const vec3 a = vec3(uintBitsToFloat(ax[g + G_AFF]), uintBitsToFloat(ax[g + G_AFF + 1]), uintBitsToFloat(ax[g + G_AFF + 2]));
+        const vec3 b = vec3(uintBitsToFloat(ax[g + G_AFF + 3]), uintBitsToFloat(ax[g + G_AFF + 4]), uintBitsToFloat(ax[g + G_AFF + 5]));
+        return vec2(dot(a, vec3(1.0, XY)), dot(b, vec3(1.0, XY)));
+    }
+    for (int k = 0; k < 4; k++)
+        if ((valid & (1u << k)) != 0u) return vec2(uintBitsToFloat(ax[g + G_DOM + 2 * k]), uintBitsToFloat(ax[g + G_DOM + 2 * k + 1]));
+    return vec2(0.0);
+}
+
+// one hypothesis: dir 0 = A (prev's side, time weight tt = t), dir 1 = B (curr's side, tt = 1 - t); returns g, and the hole / occlusion / unsure values
+void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
+    vec2 p = m - tt * ffBil(dir, m);
+    p = m - tt * ffBil(dir, p);
+    p = m - tt * ffBil(dir, p);
+    gv = ffBil(dir, p);
+    const float r = length(p + tt * gv - m);
+    const ivec2 pi = clamp(ivec2(floor(p + 0.5)), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+    const V3Map mp = v3MapUnpack(ax[mapOff(dir) + pi.y * pc.fw + pi.x]);
+    float hole = smoothstep(0.75, 2.0, r);
+    float o = v3OccEff(v3Occ(mp.e, length(gv), pc.occlSoft), mp.g);
+    float un = v3UnsureOf(mp.cost, o, mp.amb, mp.g, pc.unsure);
+    if (f > 0.0) {   // the estimate failed (soft, per pair): toward the camera model
+        vec2 gc = camModel(m);
+        if (dir == 1) gc = -camModel(m - gc);   // F10: the content at curr position m came from m - d(m)
+        gv = mix(gv, gc, f);
+        un = max(un, f);
+        o *= 1.0 - f;
+        hole *= 1.0 - f;
+    }
+    ohu = vec3(o, hole, un);
+}
+
+void main() {
+    const ivec2 m = ivec2(gl_GlobalInvocationID.xy);
+    const uint gz = gl_GlobalInvocationID.z;
+    const int g = gOff();
+    if (m.x == 0 && m.y == 0 && gz == 0u) {
+        const float f0 = uintBitsToFloat(ax[g + G_FAIL_MIX]);
+        u[0] = f0 >= 1.0 ? uint(pc.W) * uint(pc.H) : ax[g + G_UNSURE_COPY];
+    }
+    if (m.x >= pc.fw || m.y >= pc.fh) return;
+    if (ax[g + G_MODE] == 1u) return;   // scene cut (Y2): the synth copies a real frame
+    const int k = pc.iter + int(gz);
+    const float t = clamp(pc.t0 + (pc.t1 - pc.t0) * ((float(k) + 0.5) / float(pc.n)), pc.t0, pc.t1);
+    const float f = clamp(uintBitsToFloat(ax[g + G_FAIL_MIX]), 0.0, 1.0);
+    vec2 gA, gB;
+    vec3 a, b;
+    hyp(0, t, vec2(m), f, gA, a);
+    hyp(1, 1.0 - t, vec2(m), f, gB, b);
+    const int N = pc.fw * pc.fh;
+    const int o = pc.fdOff + 8 * N + int(gz) * 4 * N + 4 * (m.y * pc.fw + m.x);
+    fl[o] = uintBitsToFloat(packHalf2x16(gA));
+    fl[o + 1] = uintBitsToFloat(packHalf2x16(gB));
+    fl[o + 2] = uintBitsToFloat(packUnorm4x8(vec4(a, 0.0)));
+    fl[o + 3] = uintBitsToFloat(packUnorm4x8(vec4(b, 0.0)));
+}

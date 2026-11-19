@@ -1,0 +1,64 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step Y1 (gpu/V3.md section 3.10): vectors in occluded strips. Dispatch ceil(fw / 16) x ceil(fh / 16) x 2 (z = direction),
+// workgroup 16x16. Reads FD, the pixel's own frame's raw colour (b13 raw[0]: prev for F01, curr for F10) and MAP; writes FF[dir]. A pixel with an
+// occlusion o_est < 0.2 copies FD (nearly all pixels). Otherwise: in each of the 4 axis directions walk up to R_FILL = 12 flow px to the first
+// pixel with o_est < 0.1 and take its vector v_k, colour col_k and distance d_k;
+//   w_k = exp(-|col(p) - col_k|_1 / 24) / (1 + d_k / 8),  v_fill = sum w_k v_k / sum w_k  (none found: FD stays),
+//   FF = mix(FD, v_fill, smoothstep(0.2, 0.8, o_est)).
+// o_est is the occlusion of 3.11 with the estimate's defaults and the garbage measure applied (v3OccEff: a broad inconsistent region has no
+// trustworthy neighbour within reach, and is smeared by `u` instead). Soft all the way: the mix ramps with o_est, no switch.
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_maps.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int R_FILL = 12;
+
+vec2 fdAt(int dir, int pix) {
+    const int i = pc.fdOff + dir * 2 * pc.fw * pc.fh + 2 * pix;
+    return vec2(fl[i], fl[i + 1]);
+}
+float oEstAt(int dir, int pix, vec2 v) {
+    const V3Map m = v3MapUnpack(ax[mapOff(dir) + pix]);
+    return v3OccEff(v3Occ(m.e, length(v), 1.0), m.g);
+}
+vec3 rawAt(int dir, int pix) {   // Y, Cb, Cr (levels) of the pixel's own frame, flow resolution
+    const uvec2 t = pyr[dir * pc.fw * pc.fh + pix];
+    return vec3(unpackHalf2x16(t.x), unpackHalf2x16(t.y).x);
+}
+
+void main() {
+    const int dir = int(gl_GlobalInvocationID.z);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.fw || p.y >= pc.fh) return;
+    const int N = pc.fw * pc.fh;
+    const int pix = p.y * pc.fw + p.x;
+    const vec2 v = fdAt(dir, pix);
+    const float o = oEstAt(dir, pix, v);
+    vec2 r = v;
+    if (o >= 0.2) {
+        const vec3 col = rawAt(dir, pix);
+        vec2 acc = vec2(0.0);
+        float ws = 0.0;
+        for (int k = 0; k < 4; k++) {
+            const ivec2 d = ivec2(k == 0 ? 1 : (k == 1 ? -1 : 0), k == 2 ? 1 : (k == 3 ? -1 : 0));
+            for (int s = 1; s <= R_FILL; s++) {
+                const ivec2 q = p + d * s;
+                if (q.x < 0 || q.y < 0 || q.x >= pc.fw || q.y >= pc.fh) break;
+                const int qi = q.y * pc.fw + q.x;
+                const vec2 vq = fdAt(dir, qi);
+                if (oEstAt(dir, qi, vq) < 0.1) {
+                    const float w = exp(-dot(abs(col - rawAt(dir, qi)), vec3(1.0)) * (1.0 / 24.0)) / (1.0 + float(s) * 0.125);
+                    acc += w * vq;
+                    ws += w;
+                    break;
+                }
+            }
+        }
+        if (ws > 0.0) r = mix(v, acc / ws, smoothstep(0.2, 0.8, o));
+    }
+    const int ff = pc.fdOff + 4 * N + dir * 2 * N + 2 * pix;   // FF[2] follows FD[2] (2N floats per direction)
+    fl[ff] = r.x;
+    fl[ff + 1] = r.y;
+}
