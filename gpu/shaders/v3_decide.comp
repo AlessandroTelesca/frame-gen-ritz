@@ -1,0 +1,75 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step Y2 (gpu/V3.md section 3.12): the pair's decisions, one workgroup of 64 threads, at the end of the estimate.
+//   Scene cut: for each of the 9 tiles, p_b = (h0_b + 1) / (N_t0 + 64) and q_b likewise from frame 1 (the 64-bin luma histograms v3_hist filled); the
+//     symmetric KL divergence D_t = sum_b (p_b - q_b) ln(p_b / q_b); D = the mean over the tiles; cut = v3SceneCut > 0 && D > v3SceneCut.
+//     Deviation from the page (a fade must not be a cut): D is also taken with frame 1's histogram carried to frame 0's lighting by the pair's own gain
+//     and offset (the gm, K the search matches with, from the sums of v3_hist: y0 = gm y1 - K; each bin's count is spread over the bins it covers
+//     after the map), and D = the smaller of the two. A fade or a flash is an affine change of the luma and its D collapses; a change of scene is not.
+//     The flow plays no part: a cut is a change of the picture, and a flow that fails on a cut is the very thing it must not be asked about.
+//   Soft fallback: share = the unsure pixels among those that could have found a partner (v3_occl: G.unsureElig / G.elig; not the content that enters or
+//     leaves the view) ; failMix = smoothstep(globalFallback, 1.5 globalFallback, share), one float per pair that every synth of the pair reads (v3_project
+//     blends the vectors toward the camera model by it): no state is kept between pairs, so a share that hovers around the threshold changes the picture
+//     gradually instead of flipping it from one pair to the next. (The page counts all unsure pixels: a plain 500 px pan, where 26% of the frame is new
+//     content, then reads as a failed estimate.) The denominator is at least a quarter of the pixels of both grids.
+//   G.mode = cut ? 1 : 0. The counters, in the conventions bench/score reads (recordDebugCounters): u[1] = the SAD sum x 256 over the bw x bh level-0
+//     blocks (cut: 255 x 256 x blocks, "cut%" above 30); G.unsureCopy = the untrusted px (v3_project writes u[0] from it, every synth zeroes u[0]);
+//     at a cut or a failed estimate it is W x H. G.histD keeps D as float bits (word 29; test tools read it with the rest of G).
+#include "common.glsl"
+#include "v3_common.glsl"
+#include "v3_est.glsl"
+layout(local_size_x = 64) in;
+
+shared float sD[16], sDc[16];
+
+void main() {
+    const int lid = int(gl_LocalInvocationIndex);
+    const int g = gOff();
+    if (lid < 9) {
+        const int h0 = g + G_HIST + lid * 64, h1 = g + G_HIST + (9 + lid) * 64;
+        float n0 = 0.0, n1 = 0.0;
+        float c1[65];   // frame 1's cumulative counts
+        c1[0] = 0.0;
+        for (int b = 0; b < 64; b++) { n0 += float(ax[h0 + b]); c1[b + 1] = c1[b] + float(ax[h1 + b]); }
+        n1 = c1[64];
+        // frame 1's histogram in frame 0's lighting: y0 = gm y1 - K (v3DMu(0) = (K, gm)); the mass of the bins [4b, 4b + 4) of frame 0 is the cumulative count of
+        // frame 1 between the points that map to their edges (the counts are spread uniformly over a bin)
+        const vec2 dm = v3DMu(0);
+        float mass[64];
+        float tot = 0.0;
+        for (int b = 0; b < 64; b++) {
+            const float ya = clamp((4.0 * float(b) + dm.x) / dm.y * 0.25, 0.0, 64.0), yb = clamp((4.0 * float(b) + 4.0 + dm.x) / dm.y * 0.25, 0.0, 64.0);
+            const int ia = min(int(ya), 63), ib = min(int(yb), 63);
+            const float ca = c1[ia] + (c1[ia + 1] - c1[ia]) * (ya - float(ia)), cb = c1[ib] + (c1[ib + 1] - c1[ib]) * (yb - float(ib));
+            mass[b] = max(cb - ca, 0.0);
+            tot += mass[b];
+        }
+        float d = 0.0, dc = 0.0;
+        for (int b = 0; b < 64; b++) {
+            const float p = (float(ax[h0 + b]) + 1.0) / (n0 + 64.0);
+            const float q = (float(ax[h1 + b]) + 1.0) / (n1 + 64.0);
+            d += (p - q) * log(p / q);
+            const float qc = (mass[b] + 1.0) / (tot + 64.0);
+            dc += (p - qc) * log(p / qc);
+        }
+        sD[lid] = d;
+        sDc[lid] = dc;
+    }
+    barrier();
+    if (lid == 0) {
+        float D = 0.0, Dc = 0.0;
+        for (int t = 0; t < 9; t++) { D += sD[t]; Dc += sDc[t]; }
+        D = min(D, Dc) * (1.0 / 9.0);
+        const bool cut = pc.cutThresh > 0.0 && D > pc.cutThresh;
+        const float N2 = 2.0 * float(pc.fw) * float(pc.fh);
+        const float share = float(ax[g + G_UNSURE_ELIG]) / max(float(ax[g + G_ELIG]), 0.25 * N2);
+        const float failMix = smoothstep(pc.globalFrac, 1.5 * pc.globalFrac, share);
+        const float meanCost = float(ax[g + G_COST_SUM]) / 16.0 / N2;   // levels (G.costSum: fixed point x16 over both grids)
+        const uint nb = uint(pc.bw) * uint(pc.bh);
+        ax[g + G_MODE] = cut ? 1u : 0u;
+        ax[g + G_FAIL_MIX] = floatBitsToUint(failMix);
+        ax[g + G_HIST_D] = floatBitsToUint(D);
+        ax[g + G_UNSURE_COPY] = (cut || failMix >= 1.0) ? uint(pc.W) * uint(pc.H) : uint(float(ax[g + G_UNSURE_COUNT]) * 0.5 * float(pc.fscale * pc.fscale));
+        u[1] = cut ? 255u * 256u * nb : uint(256.0 * meanCost * float(nb) + 0.5);
+    }
+}

@@ -24,3 +24,19 @@ float v3UnsureOf(float cost, float oEff, float amb, float g, float kappa) {
     const float ucost = smoothstep(6.0 * kappa, 18.0 * kappa, cost);
     return max(max(ucost * (1.0 - oEff), 0.8 * amb), max(0.25 * oEff, g));
 }
+
+// the camera model (G.aff when valid, else the first valid dominant motion, else zero) at flow px m, as the displacement prev -> curr (the fallback of
+// v3_project, and v3_occl's test of which pixels could have found a partner at all)
+vec2 camModel(vec2 m) {
+    const int g = gOff();
+    const uint valid = ax[g + G_VALID];
+    if ((valid & 256u) != 0u) {
+        const vec2 XY = (m - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
+        const vec3 a = vec3(uintBitsToFloat(ax[g + G_AFF]), uintBitsToFloat(ax[g + G_AFF + 1]), uintBitsToFloat(ax[g + G_AFF + 2]));
+        const vec3 b = vec3(uintBitsToFloat(ax[g + G_AFF + 3]), uintBitsToFloat(ax[g + G_AFF + 4]), uintBitsToFloat(ax[g + G_AFF + 5]));
+        return vec2(dot(a, vec3(1.0, XY)), dot(b, vec3(1.0, XY)));
+    }
+    for (int k = 0; k < 4; k++)
+        if ((valid & (1u << k)) != 0u) return vec2(uintBitsToFloat(ax[g + G_DOM + 2 * k]), uintBitsToFloat(ax[g + G_DOM + 2 * k + 1]));
+    return vec2(0.0);
+}

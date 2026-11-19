@@ -706,7 +706,7 @@ public:
     // Debug / test only (gpu/v3test.cpp): MotionVersion::V3's estimate. All return false unless the selected version is V3 and a size is held.
     // recordDebugV3(): copies the latest V3 estimate into dst (TRANSFER_DST usage) at dstOffset, laid out as debugV3Layout() says: a header of
     // 16 uint32 [0 magic 'V3DB' = 0x42443356, 1 version = 1, 2 W, 3 H, 4 fw, 5 fh, 6 bw, 7 bh (level-0 8x8 block grid), 8 flowScale, 9 number of
-    // levels, 10 G.mode (0 normal, 1 scene cut), 11 G.unsureCount, 12 G.failMix (float bits), 13..15 spare], then fw*fh vec2 each (flow px, all
+    // levels, 10 G.mode (0 normal, 1 scene cut), 11 G.unsureCount, 12 G.failMix (float bits), 13 the scene-cut divergence D (float bits; v3_decide), 14..15 spare], then fw*fh vec2 each (flow px, all
     // full prev->curr vectors): FF[0] (F01, prev's grid, filled), FF[1] (F10, curr's grid), FD[0], FD[1] (dense, before the fill); then fw*fh
     // uint32 each: MAP[0], MAP[1] (cost8 | e8 << 8 | amb8 << 16 | g8 << 24), S (the static-structure mask, float bits); then BLK, the block
     // records of every level (V3B_FLOW's first region: per level l, direction d, slot p, gw_l*gh_l vec4 (vx, vy, cost, amb); gpu/V3.md
@@ -725,9 +725,16 @@ public:
     // buffer must be alive until the record retires. The flows are copied into FD[0..1] and FF[0..1], then the estimate's tail runs on them (v3_dense in inject mode,
     // occlusion, fill; later enclose, decide).
     bool recordDebugV3Inject(VkCommandBuffer cb, Frame prev, Frame curr, VkBuffer flows, VkDeviceSize f01Off, VkDeviceSize f10Off);
-    // recordDebugV3Weights(): STUB until steps Y1/Y2 of gpu/V3.md (the weight stage's 28-float record per output pixel of a recordSynth(t)
-    // with mode bit 3). Returns false always for now.
-    bool recordDebugV3Weights(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t, VkBuffer dst, VkDeviceSize dstOffset);
+    // recordDebugV3Weights(): a recordSynth(t) (same rules, same output) that also copies the weight stage's records (gpu/V3.md 3.16: 28 floats per
+    // output pixel, the net's input and target) into dst (TRANSFER_DST usage) at dstOffset: every debugV3WeightsLayout().stride-th pixel of the raster
+    // (pixel index y * W + x = k * stride), count of them, 112 bytes each: CAp CAc CBp CBc (12 floats: the taps' working values), oA holeA uA oB holeB
+    // uB t lenA lenB sigma (10; sigma = the static weight that pulled the pixel to the zero-vector blend, 0 away from overlays), w0..w3 s (5), one
+    // zero. maxPixels = the most records wanted (0: 65536; at least the whole frame when it is smaller). The first call with a larger count grows
+    // V3's T-field buffer by the slots the records need (a test aid: 1080p flowScale 2 takes 8.3 MB per 74 k records). The caller adds its own
+    // TRANSFER -> HOST barrier. False unless V3, the estimate's frames and a size are held.
+    struct DebugV3Weights { uint32_t stride = 1, count = 0; VkDeviceSize size = 0; };
+    bool debugV3WeightsLayout(uint32_t maxPixels, DebugV3Weights& l) const;
+    bool recordDebugV3Weights(VkCommandBuffer cb, Frame prev, Frame curr, Frame out, float t, VkBuffer dst, VkDeviceSize dstOffset, uint32_t maxPixels = 0);
 
     // Debug / test only (gpu/mltest.cpp): MotionVersion::Learned's internals, to verify the net against ml-fg's test vectors. Nothing
     // changes unless setDebugLearned() was called with a non-default value.

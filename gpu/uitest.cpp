@@ -1667,9 +1667,9 @@ static const char* algoName(MotionVersion v) { return v == MotionVersion::V2 ? "
 // Learned = V1's luma, 4 synth passes and 3 motion-blur passes, its duplicate test, reduction, pyramid, output, zero-test and static-guard
 // passes, its match (2) pipelines per activation storage and its conv pipelines, 10 per net (per activation storage, layer shape and
 // split): 22 + 10 per LearnedNet (framegen.h kLearnedNets); 22 = 16 + the variants' planes pass and extractor (2) and their 4 match pipelines.
-// V3 (gpu/V3.md): V1's luma and its own passes: 13 after step Y1; no motion-blur passes. Its final group has 15 (gpu/V3.md section 7:
-// luma, v2_static and 13 v3_*); raise this with the steps that add the passes.
-static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 13 : 16; }
+// V3 (gpu/V3.md): V1's luma, V2's static-mask pass and its own 14 passes (the page's 13 plus the top level's search) = 16 since step Y2 (13 after Y1: no
+// v3_enclose, v3_decide, v2_static); no motion-blur passes. Step F adds no pipeline (the per-format variants replace two of them).
+static int64_t versionPipes(MotionVersion v) { return v == MotionVersion::V2 ? 19 : v == MotionVersion::Learned ? 22 + 10 * (int64_t)kLearnedNets : v == MotionVersion::V3 ? 16 : 16; }
 
 // --algo picks the version the run starts in (`from`), the other one is switched to (`to`). Frames 10 and 11 of the check scene,
 // protection Off, t = 0.5.

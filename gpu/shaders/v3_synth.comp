@@ -1,23 +1,35 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
-// MotionVersion::V3's synthesis (gpu/V3.md section 3.15), build step Y1: the two-hypothesis gather. One full-resolution pass; all n samples of the
-// output are averaged in registers: n = 1 for recordSynth, recordSynthBlur's N sub-frames otherwise, each exactly what recordSynth(t_k) gives
-// (V3_QUANT), averaged with even or Gaussian weights (blur_resolve.comp's: exp(-2 x^2), x = (2k + 1 - n) / n) and rounded once by the store.
-// Sample times t_k = t0 + (t1 - t0)(k + 0.5)/n, as recordSynthBlur; a sample at t <= 0 / >= 1 is the real frame prev / curr (recordSynthBlur with
-// t1 = 0 or 1). The interior samples (0 < t < 1) are contiguous: v3_project wrote their T-field records, slot k - pc.iter (pc.lvl = their count).
+// MotionVersion::V3's synthesis (gpu/V3.md section 3.15), build step Y2: the two-hypothesis gather with the smear, the pixel clamp, the static mask,
+// the CrosshairV2 tap rejection and the whole-frame cut. One full-resolution pass; all n samples of the output are averaged in registers: n = 1 for
+// recordSynth, recordSynthBlur's N sub-frames otherwise, each exactly what recordSynth(t_k) gives (V3_QUANT), averaged with even or Gaussian weights
+// (blur_resolve.comp's: exp(-2 x^2), x = (2k + 1 - n) / n) and rounded once by the store. Sample times t_k are the host's (G words 1200..: the same
+// numbers v3_project used); a sample at t <= 0 / >= 1 is the real frame prev / curr. The interior samples (0 < t < 1) are contiguous: v3_project wrote
+// their T-field records, slot k - pc.iter (pc.lvl = their count).
 // Per interior sample:
-//   TF: the two projected vectors gA, gB bilinear over the 4 flow px around x (full-resolution vector = fs x the flow vector), the scalars
-//       (o, hole, u of A and B) bilinear as well;
-//   taps (positions rounded to 1/32 px by V3_TAP): A: prev(x - t gA), curr(x + (1 - t) gA); B: curr(x - (1 - t) gB), prev(x + t gB); a tap outside the
-//       frame takes its partner, softly over 2 px past the edge;
-//   the weight stage (v3_weights.glsl) -> w[4] and the smear s; sharp colour Cs = sum w_i C_i; quantised as the store does.
-// Not yet (build step Y2): the whole-frame cut (G.mode == 1), the static mask (steps 2, 9), the CrosshairV2 tap rejection (uiReject on every tap pair), the
-// pixel clamp (step 7), the smear (step 8: s is computed and ignored), the debug dump (mode bit 3). The places are marked "Y2:". The per-format variants (step F)
-// go through the V3_* macros of v3_format.glsl (YUV also writes its CbCr plane once per 2x2 block, as v2_morph.glsl).
+//   1. G.mode == 1 (scene cut, v3_decide): the nearer real frame (prev for t <= 0.5), whole frame, nothing else runs.
+//   2. TF: the two projected vectors gA, gB bilinear over the 4 flow px around x (full-resolution vector = fs x the flow vector), the scalars
+//      (o, hole, u of A and B) bilinear as well; the pixel's static bits (C of v3_enclose: an overlay near / near a tap).
+//   3. taps (positions rounded to 1/32 px by V3_TAP): A: prev(x - t gA), curr(x + (1 - t) gA); B: curr(x - (1 - t) gB), prev(x + t gB); each pair through
+//      CrosshairV2's uiReject on the raw texels, a tap outside the frame takes its partner (softly over 2 px), a tap on a static overlay takes its
+//      partner (sReject, near overlays only).
+//   4. the weight stage (v3_weights.glsl): w[4] and the smear s; sharp colour Cs = sum w_i C_i.
+//   5. the pixel clamp: Cs is limited, per channel, to the range of the 3x3 texels around each tap of the dominant hypothesis (both, where the weights
+//      of the two are within 0.25): the output never holds a colour the sources do not show next to the places it was taken from.
+//   6. the smear along the motion where the estimate is unsure: 4 more sets of the 4 taps at times t + j tau (tau = v3Smear s / 2, j = -2, -1, 1, 2; each
+//      hypothesis along its own vector, at most 48 px), weights as in 4, mixed (1,2,3,2,1)/9 with the clamped Cs in the middle; the result replaces Cs by
+//      smoothstep(0.05, 0.5, s). An unsure pixel's colour comes from real source pixels along its own motion, never from the same place of a real frame.
+//   7. the static mask: where the two real frames show the same structure at x (a HUD stroke, a semi-transparent panel) the pixel takes the zero-vector
+//      time blend (1 - t) prev(x) + t curr(x) by the static weight (v2_morph.glsl's decision: S confirmed at full resolution, E, both taps on it).
+//   8. quantise exactly as the store does (V3_QUANT), accumulate with the blur weights; store.
+// Mode bits (V3PC.mode): 1 Gaussian blur weights, 2 hook (l) detail split (wired, no effect yet), 8 debug dump: the 28-float record of the weight stage
+// per output pixel (V3.md 3.16), every pc.lw-th pixel of the raster, the first pc.lh of them, into the T-field slot after the interior ones.
+// The per-format variants (step F) go through the V3_* macros of v3_format.glsl (YUV also writes its CbCr plane once per 2x2 block, as v2_morph.glsl).
 #include "common.glsl"
 #include "v3_common.glsl"
 #include "v3_format.glsl"
 #include "v3_weights.glsl"
+#include "v3_static.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 
 // A tap outside the frame reads the clamped edge: where content enters or leaves the view only the other frame shows it, so the tap takes its partner
@@ -34,6 +46,96 @@ void edgeReject(vec2 pa, vec2 pb, inout vec3 ca, inout vec3 cb_) {
     cb_ = mix(cb_, a, clamp(ob - oa, 0.0, 1.0));
 }
 
+// One hypothesis' pair of taps, pa on prev and pc_ on curr: the working values wa, wc after CrosshairV2's tap rejection (on the raw texels), the edge
+// rule and, near a static overlay (nearT), the overlay's tap rule; so = (sout, sboth, sbS) of v2_morph.glsl's sReject (sout = 1 away from overlays: the
+// taps leave them, 0 at the zero vector); em0 = the pair's disagreement before the overlay rule (the taps' own fit).
+void v3Pair(vec2 pa, vec2 pc_, bool nearT, out vec3 wa, out vec3 wc, out vec3 so, out float em0) {
+    const vec4 a = V3_TAP(texPrev, texPrevC, pa), c = V3_TAP(texCurr, texCurrC, pc_);
+    vec3 ra = a.rgb, rc = c.rgb;
+    uiReject(V3_UIP(pa), V3_UIP(pc_), ra, rc);
+    wa = V3_LEVELS(ra);
+    wc = V3_LEVELS(rc);
+    edgeReject(pa, pc_, wa, wc);
+    const vec3 d0 = V3_D(wa, wc);
+    em0 = max(d0.r, max(d0.g, d0.b));
+    so = vec3(all(lessThan(abs(pc_ - pa), vec2(1.0))) ? 0.0 : 1.0, 0.0, 0.0);
+    if (nearT) {
+        so = sReject(pa, pc_, wa, wc, sOverAt(pa, sCell(pa)), sOverAt(pc_, sCell(pc_)));
+        if (so.z > 0.0) so.z *= tapsStatic(pa, pc_, a.rgb, c.rgb);
+        if (so.y > 0.0) {   // (not where both taps are on CrosshairV2's UI: its patch and its own tap rule decide there)
+            bool ha, hc;
+            uiRejectHits(V3_UIP(pa), V3_UIP(pc_), ha, hc);
+            if (ha && hc) so.y = 0.0;
+        }
+    }
+}
+
+// the range (raw texel values) of the 3x3 texels around the texel nearest to the tap position pos
+void v3Box(bool onCurr, vec2 pos, inout vec3 lo, inout vec3 hi) {
+    pos = roundEven(pos * 32.0) * (1.0 / 32.0);
+    const ivec2 c = ivec2(floor(pos + 0.5));
+    const ivec2 mx = ivec2(pc.W - 1, pc.H - 1);
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) {
+            const ivec2 q = clamp(c + ivec2(i, j), ivec2(0), mx);
+            const vec3 v = onCurr ? V3_PX(texCurr, texCurrC, q).rgb : V3_PX(texPrev, texPrevC, q).rgb;
+            lo = min(lo, v);
+            hi = max(hi, v);
+        }
+}
+
+// the static weight of the pixel p: the zero-vector time blend takes over where the two real frames show the same structure at p (v2_morph.glsl's
+// decision with the dominant mix of the two hypotheses' values: em = the pair disagreement after the overlay rule, em0 before it, so = (sout, sboth, sbS)).
+// sa, sc: the two frames' working values at p.
+float v3StaticWeight(ivec2 p, uint sbits, vec3 sa, vec3 sc, float em, float em0, vec3 so) {
+    const float sout = so.x, sboth = so.y, sbS = so.z;
+    const vec3 s3 = sAt(vec2(p), sbits);   // S (nearest flow px), E (enclosure), S dilated by ~1 flow px
+    const vec2 sp = s3.xy;
+    const float sxd = s3.z;
+    float ws = 0.0;
+    if (em > V3_Z0 || sxd > 0.0 || sp.y * sout > 0.0 || sboth > 0.0) {   // (only then can the zero vector win)
+        const vec3 dz = V3_D(sa, sc);
+        const float z = max(dz.r, max(dz.g, dz.b));
+        // ... and so do both neighbours along x or along y (a stroke): a lone pixel that happens to match in a moving texture does not switch
+        float zn[4];
+        float num = 0.0, den = 0.0;
+        const bool inS = sxd > 0.0;
+        for (int k = 0; k < 4; k++) {
+            const ivec2 o = k < 2 ? ivec2(2 * k - 1, 0) : ivec2(0, 2 * k - 5);
+            const ivec2 pn = clamp(p + o, ivec2(0), ivec2(pc.W - 1, pc.H - 1));
+            const vec3 an = V3_LEVELS(V3_PX(texPrev, texPrevC, pn).rgb), cn = V3_LEVELS(V3_PX(texCurr, texCurrC, pn).rgb);
+            const vec3 d = V3_D(an, cn);
+            zn[k] = max(d.r, max(d.g, d.b));
+            if (inS) {
+                const vec3 ga = V3_G(sa, an), gc = V3_G(sc, cn);
+                const vec3 gd = abs(ga - gc), gm = max(abs(ga), abs(gc));
+                num += max(gd.r, max(gd.g, gd.b));
+                den += max(gm.r, max(gm.g, gm.b));
+            }
+        }
+        const float zh = max(zn[0], zn[1]), zv = max(zn[2], zn[3]);
+        const float zs = max(z, min(zh, zv));
+        ws = clamp((em - zs - V3_Z0) * (1.0 / V3_Z1), 0.0, 1.0) * clamp(1.0 - zs * (1.0 / V3_ZMAX), 0.0, 1.0);
+        // not next to CrosshairV2's UI (its own patch and tap rejection handle it)
+        if (ws > 0.0 && (uiHitA(p - 1, p + 1) || uiHitC(p - 1, p + 1))) ws = 0.0;
+        // a static structure (the mask, dilated by ~1 flow px: the rim of a stroke), confirmed at full resolution: the pixel and its neighbours agree, or
+        // their structure does (a semi-transparent overlay) where there is structure at all
+        if (inS) {
+            const float rf = num / (den + V3_SEPS);
+            const bool onUi = uiHitA(p, p) || uiHitC(p, p);
+            const float conf = max(onUi ? 0.0 : clamp((V3_SR1 - rf) * (1.0 / (V3_SR1 - V3_SR0)), 0.0, 1.0) * clamp((den - V3_SD0) * (1.0 / V3_SD1), 0.0, 1.0),
+                                   clamp(1.0 - zs * (1.0 / V3_ZMAX), 0.0, 1.0));
+            ws = max(ws, sxd * conf);
+        }
+        // inside an overlay (E) whose taps leave it, and both taps on the overlay: the overlay's own place, unless the taps' own fit is clearly better
+        const float fitM = clamp((zs - em0 - V3_Z0) * (1.0 / V3_Z1), 0.0, 1.0);
+        ws = max(ws, sp.y * sout * (1.0 - fitM));
+        ws = max(ws, sboth * (1.0 - fitM));
+        ws = max(ws, sbS);
+    }
+    return ws;
+}
+
 void main() {
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= pc.W || p.y >= pc.H) return;
@@ -47,6 +149,9 @@ void main() {
     for (int k = 0; k < 4; k++) fc[k] = clamp(f0 + ivec2(k & 1, k >> 1), ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
     const float bw[4] = float[4]((1.0 - fa.x) * (1.0 - fa.y), fa.x * (1.0 - fa.y), (1.0 - fa.x) * fa.y, fa.x * fa.y);
     const vec4 s0 = V3_PX(texPrev, texPrevC, p), s1 = V3_PX(texCurr, texCurrC, p);
+    const bool cut = ax[gOff() + G_MODE] == 1u;
+    const uint sbits = sCellBits(sCell(vec2(p)));   // C of v3_enclose: bit 0 an overlay near this pixel, bit 1 a tap of this pixel can land near one
+    const bool nearS = (sbits & 1u) != 0u, nearT = (sbits & 2u) != 0u;
 
     vec3 acc = vec3(0.0);
     float accA = 0.0, ws = 0.0;
@@ -56,12 +161,11 @@ void main() {
         const float w = (pc.mode & V3M_GAUSS) != 0 ? exp(-2.0 * x * x) : 1.0;
         vec3 v;
         float a;
-        if (t <= 0.0) {
+        if (t <= 0.0 || (cut && t <= 0.5)) {
             v = V3_LEVELS(s0.rgb); a = s0.a;
-        } else if (t >= 1.0) {
+        } else if (t >= 1.0 || cut) {
             v = V3_LEVELS(s1.rgb); a = s1.a;
         } else {
-            // Y2: step 1, G.mode == 1 (scene cut): output = prev (t <= 0.5) or curr, skip the rest. Step 2: the static mask bits and sigma.
             const int tf = pc.fdOff + 8 * N + (k - pc.iter) * 4 * N;
             vec2 gA = vec2(0.0), gB = vec2(0.0);
             vec4 rA = vec4(0.0), rB = vec4(0.0);   // (o, hole, u, 0) of A and B: bilinear too (a ramp of a few px, not a step at the flow grid)
@@ -74,25 +178,67 @@ void main() {
             }
             gA *= fsc;
             gB *= fsc;
-            const vec2 pAp = vec2(p) - t * gA, pAc = vec2(p) + (1.0 - t) * gA;
-            const vec2 pBc = vec2(p) - (1.0 - t) * gB, pBp = vec2(p) + t * gB;
-            // Y2: the CrosshairV2 tap rejection (uiReject(V3_UIP(pa), V3_UIP(pc_), wa, wc)) on each raw tap pair, before the levels
+            const vec2 xp = vec2(p);
+            const vec2 pAp = xp - t * gA, pAc = xp + (1.0 - t) * gA;
+            const vec2 pBc = xp - (1.0 - t) * gB, pBp = xp + t * gB;
             V3WIn wi;
-            wi.CAp = V3_LEVELS(V3_TAP(texPrev, texPrevC, pAp).rgb);
-            wi.CAc = V3_LEVELS(V3_TAP(texCurr, texCurrC, pAc).rgb);
-            wi.CBc = V3_LEVELS(V3_TAP(texCurr, texCurrC, pBc).rgb);
-            wi.CBp = V3_LEVELS(V3_TAP(texPrev, texPrevC, pBp).rgb);
-            edgeReject(pAp, pAc, wi.CAp, wi.CAc);
-            edgeReject(pBp, pBc, wi.CBp, wi.CBc);
+            vec3 soA, soB;
+            float em0A, em0B;
+            v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A);
+            v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B);
             wi.oA = rA.x; wi.holeA = rA.y; wi.uA = rA.z;
             wi.oB = rB.x; wi.holeB = rB.y; wi.uB = rB.z;
             wi.t = t;
             wi.lenA = length(gA); wi.lenB = length(gB);
             V3WOut wo;
             v3Weights(wi, wo);
-            const vec3 Cs = wo.w[0] * wi.CAp + wo.w[1] * wi.CAc + wo.w[2] * wi.CBp + wo.w[3] * wi.CBc;
-            // Y2: step 7 the pixel clamp of Cs, step 8 the smear (wo.s), step 9 the static blend
-            v = V3_QUANT(Cs);
+            vec3 C = wo.w[0] * wi.CAp + wo.w[1] * wi.CAc + wo.w[2] * wi.CBp + wo.w[3] * wi.CBc;
+            const float wA = wo.w[0] + wo.w[1], wB = wo.w[2] + wo.w[3];
+            // step 5: the pixel clamp, to the 3x3 neighbourhoods of the dominant hypothesis' taps (both where the weights are within 0.25)
+            {
+                vec3 lo = vec3(1e9), hi = vec3(-1e9);
+                if (wA > wB - 0.25) { v3Box(false, pAp, lo, hi); v3Box(true, pAc, lo, hi); }
+                if (wB > wA - 0.25) { v3Box(true, pBc, lo, hi); v3Box(false, pBp, lo, hi); }
+                C = clamp(C, V3_LEVELS(lo), V3_LEVELS(hi));
+            }
+            // step 6: the smear along the motion where the estimate is unsure (no smear at all with v3Smear = 0)
+            if (pc.smear > 0.0 && wo.s > 1.0 / 16.0) {
+                const float amt = 0.5 * pc.smear * wo.s;
+                const float kA = min(1.0, 48.0 / max(wi.lenA * 2.0 * amt, 1e-3)), kB = min(1.0, 48.0 / max(wi.lenB * 2.0 * amt, 1e-3));   // |tau g| <= 48 px
+                vec3 Cm = 3.0 * C;
+                for (int j = -2; j <= 2; j++) {
+                    if (j == 0) continue;
+                    const float tj = float(j) * amt;
+                    const float tA = t + tj * kA, tB = t + tj * kB;
+                    vec3 cAp, cAc, cBp, cBc, so_;
+                    float e_;
+                    v3Pair(xp - tA * gA, xp + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_);
+                    v3Pair(xp + tB * gB, xp - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_);
+                    Cm += (3.0 - abs(float(j))) * (wo.w[0] * cAp + wo.w[1] * cAc + wo.w[2] * cBp + wo.w[3] * cBc);
+                }
+                C = mix(C, Cm * (1.0 / 9.0), smoothstep(0.05, 0.5, wo.s));
+            }
+            // step 7: the static mask
+            float wst = 0.0;
+            if (nearS || nearT) {
+                const vec3 sa = V3_LEVELS(s0.rgb), sc = V3_LEVELS(s1.rgb);
+                const vec3 dA = V3_D(wi.CAp, wi.CAc), dB = V3_D(wi.CBp, wi.CBc);
+                const float em = wA * max(dA.r, max(dA.g, dA.b)) + wB * max(dB.r, max(dB.g, dB.b));
+                const float em0 = wA * em0A + wB * em0B;
+                wst = v3StaticWeight(p, sbits, sa, sc, em, em0, wA * soA + wB * soB);
+                C = mix(C, (1.0 - t) * sa + t * sc, wst);
+            }
+            if ((pc.mode & V3M_DUMP) != 0 && p.y * pc.W + p.x < pc.lw * pc.lh && (p.y * pc.W + p.x) % pc.lw == 0) {
+                // the 28-float record of the weight stage (V3.md 3.16): inputs, sigma (the static weight), outputs
+                const int rec = pc.fdOff + 8 * N + pc.lvl * 4 * N + 28 * ((p.y * pc.W + p.x) / pc.lw);
+                const vec3 cc[4] = vec3[4](wi.CAp, wi.CAc, wi.CBp, wi.CBc);
+                for (int i = 0; i < 4; i++) { fl[rec + 3 * i] = cc[i].x; fl[rec + 3 * i + 1] = cc[i].y; fl[rec + 3 * i + 2] = cc[i].z; }
+                const float sc_[10] = float[10](wi.oA, wi.holeA, wi.uA, wi.oB, wi.holeB, wi.uB, t, wi.lenA, wi.lenB, wst);
+                for (int i = 0; i < 10; i++) fl[rec + 12 + i] = sc_[i];
+                fl[rec + 22] = wo.w[0]; fl[rec + 23] = wo.w[1]; fl[rec + 24] = wo.w[2]; fl[rec + 25] = wo.w[3]; fl[rec + 26] = wo.s; fl[rec + 27] = 0.0;
+            }
+            // (V3M_DETAIL: hook (l), the detail split, is a later task: the bit is read by nothing yet)
+            v = V3_QUANT(C);
             a = mix(s0.a, s1.a, t);
         }
         acc += w * v;

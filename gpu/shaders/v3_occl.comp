@@ -18,7 +18,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 const int APR = 4, TW = 16 + 2 * APR;   // 24 x 24 tile
 shared vec4 sQ[TW * TW];   // per tile pixel: (o, o vx, o vy, o |v|^2), 0 outside the frame: the box sums are 81 reads of one vec4
 shared vec4 sH[TW * 16];   // the horizontal 9-sums of sQ (24 rows x 16 columns): the box is separable
-shared uint cntU, sumC;
+shared uint cntU, sumC, cntE, cntUE;
 
 // the field of direction dir at a flow-px position q (index coordinates, pixel k at k): bilinear, clamped
 vec2 fdBil(int dir, vec2 q) {
@@ -48,7 +48,7 @@ void main() {
     const int dir = int(gl_WorkGroupID.z);
     const int lid = int(gl_LocalInvocationIndex);
     const ivec2 org = ivec2(gl_WorkGroupID.xy) * 16;
-    if (lid == 0) { cntU = 0u; sumC = 0u; }
+    if (lid == 0) { cntU = 0u; sumC = 0u; cntE = 0u; cntUE = 0u; }
     // the occlusion value of every pixel of the tile (-1 = outside the frame); the centre's e is kept for the store
     for (int r = 0; r < 3; r++) {
         const int i = lid + 256 * r;
@@ -116,12 +116,26 @@ void main() {
         const V3Map m = v3MapUnpack(w1);
         const float o = v3Occ(m.e, F, 1.0);
         ax[2 * N + dir * N + pix] = floatBitsToUint(v3OccEff(o, m.g));   // o_eff for v3_fill's walks: V3B_AUX words [2N, 4N) (free: v2_static's layout leaves them)
-        if (v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0) >= 0.5) atomicAdd(cntU, 1u);
+        const bool uns = v3UnsureOf(m.cost, v3OccEff(o, m.g), m.amb, m.g, 1.0) >= 0.5;
+        if (uns) atomicAdd(cntU, 1u);
+        // the failed-estimate share counts only the pixels that could have found a partner: not those whose own vector or the camera model's leaves the frame
+        // (content that enters or leaves the view is unmatched in the best of estimates; a 500 px pan is not a failed estimate)
+        {
+            const vec2 cm = dir == 0 ? camModel(vec2(p)) : -camModel(vec2(p));
+            const vec2 tc = vec2(p) + cm, tv = vec2(p) + vv;
+            const vec2 hi = vec2(float(pc.fw) - 0.5, float(pc.fh) - 0.5);
+            if (all(greaterThanEqual(tc, vec2(-0.5))) && all(lessThanEqual(tc, hi)) && all(greaterThanEqual(tv, vec2(-0.5))) && all(lessThanEqual(tv, hi))) {
+                atomicAdd(cntE, 1u);
+                if (uns) atomicAdd(cntUE, 1u);
+            }
+        }
         atomicAdd(sumC, cost8 * 2u);   // x16 fixed point of the cost: 16 * cost8 / 8
     }
     barrier();
     if (lid == 0) {
         atomicAdd(ax[gOff() + G_UNSURE_COUNT], cntU);
         atomicAdd(ax[gOff() + G_COST_SUM], sumC);
+        atomicAdd(ax[gOff() + G_ELIG], cntE);
+        atomicAdd(ax[gOff() + G_UNSURE_ELIG], cntUE);
     }
 }

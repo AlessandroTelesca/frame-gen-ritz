@@ -29,21 +29,6 @@ vec2 ffBil(int dir, vec2 q) {
     return mix(mix(v00, v10, a.x), mix(v01, v11, a.x), a.y);
 }
 
-// the camera model (G.aff when valid, else the first valid dominant motion, else zero) at flow px m, as the displacement prev -> curr
-vec2 camModel(vec2 m) {
-    const int g = gOff();
-    const uint valid = ax[g + G_VALID];
-    if ((valid & 256u) != 0u) {
-        const vec2 XY = (m - vec2(pc.cx, pc.cy)) / vec2(pc.cx, pc.cy);
-        const vec3 a = vec3(uintBitsToFloat(ax[g + G_AFF]), uintBitsToFloat(ax[g + G_AFF + 1]), uintBitsToFloat(ax[g + G_AFF + 2]));
-        const vec3 b = vec3(uintBitsToFloat(ax[g + G_AFF + 3]), uintBitsToFloat(ax[g + G_AFF + 4]), uintBitsToFloat(ax[g + G_AFF + 5]));
-        return vec2(dot(a, vec3(1.0, XY)), dot(b, vec3(1.0, XY)));
-    }
-    for (int k = 0; k < 4; k++)
-        if ((valid & (1u << k)) != 0u) return vec2(uintBitsToFloat(ax[g + G_DOM + 2 * k]), uintBitsToFloat(ax[g + G_DOM + 2 * k + 1]));
-    return vec2(0.0);
-}
-
 // one hypothesis: dir 0 = A (prev's side, time weight tt = t), dir 1 = B (curr's side, tt = 1 - t); returns g, and the hole / occlusion / unsure values
 void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
     vec2 p = m - tt * ffBil(dir, m);

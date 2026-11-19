@@ -1,0 +1,60 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// MotionVersion::V3, build step Y2 (gpu/V3.md section 3.13): per 8x8 cell of the flow grid, once per estimate (after v3_fill), from v2_static.comp's
+// cell maxima s8 and the filled field F01 (FF[0]). The semantics of v2_enclose.comp (same E and C words, the layout of v2_motion.glsl), without the
+// subgroup operations of that shader (V3 asks for nothing beyond Vulkan 1.2 core compute): one cell per thread, all reads by that thread.
+//   E: the cell lies between static structure on all four sides, within E_R cells to its left, right, above and below (the inside of an overlay:
+//      the tinted, nearly flat background of a HUD panel between its text lines and its border, which S alone cannot see). All four sides: two
+//      would also hold between two unrelated static edges left and right of a moving scene. E = the smallest of the four sides' largest s8.
+//   C: bit 0: E, or static structure in the cell or one of its 8 neighbours (where the synthesis reads S and E of a place at all);
+//      bit 1: a warp tap of a pixel of this cell can land near static structure (where the synthesis looks at its taps' S and E at all). The taps of a pixel
+//      at any t lie on the segment m - v .. m + v (v = F01 of the cell's centre pixel, in cells = flow px / 8), walked in steps of at most 2 cells, each with
+//      the box of cells around it: 3x3 (V2 grows it to 5x5 where the cleaned block vectors around stray from v; V3's field is per pixel and the T-field
+//      projects it per t, so the 3x3 box stands).
+// Writes E (float bits) and C (bits) to ax[eOff() + cell], ax[cOff() + cell]. Dispatch ceil(N8 / 64) workgroups of 64 threads.
+#include "common.glsl"
+#include "v3_common.glsl"
+layout(local_size_x = 64) in;
+
+const int E_R = 6;   // reach in cells (8 flow px each)
+const int WALK_MAX = 48;   // at most this many steps on a half segment (vectors beyond ~96 cells: 768 flow px)
+
+float s8(ivec2 c) {
+    if (c.x < 0 || c.y < 0 || c.x >= s8W() || c.y >= s8H()) return 0.0;
+    return uintBitsToFloat(ax[s8Off() + c.y * s8W() + c.x]);
+}
+
+void main() {
+    const int ci = int(gl_GlobalInvocationID.x);
+    if (ci >= s8W() * s8H()) return;
+    const ivec2 c = ivec2(ci % s8W(), ci / s8W());
+    // E: the largest s8 within E_R cells on each of the 4 sides; the smallest of the four
+    float e = 1e30;
+    const ivec2 dirs[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    for (int d = 0; d < 4 && e > 0.0; d++) {
+        float m = 0.0;
+        for (int k = 1; k <= E_R; k++) m = max(m, s8(c + k * dirs[d]));
+        e = min(e, m);
+    }
+    // near: the 3x3 cells around c
+    float nb = 0.0;
+    for (int j = -1; j <= 1; j++)
+        for (int i = -1; i <= 1; i++) nb = max(nb, s8(c + ivec2(i, j)));
+    const bool near_ = max(e, nb) > 0.0;
+    // tap: the segment m - v .. m + v of the cell's centre pixel
+    float tap = 0.0;
+    {
+        const ivec2 cp = clamp(c * 8 + 4, ivec2(0), ivec2(pc.fw - 1, pc.fh - 1));
+        const int N = pc.fw * pc.fh;
+        const int o = pc.fdOff + 4 * N + 2 * (cp.y * pc.fw + cp.x);   // FF[0]
+        const vec2 v = vec2(fl[o], fl[o + 1]) * (1.0 / 8.0);          // the full vector in cells
+        const int ns = min(WALK_MAX, int(ceil(0.5 * max(abs(v.x), abs(v.y)))) + 1);   // steps of at most 2 cells on each half: with the box around each, no gap
+        for (int st = -ns; st <= ns && tap <= 0.0; st++) {
+            const ivec2 ce = ivec2(floor(vec2(c) + 0.5 + v * (float(st) / float(ns))));
+            for (int j = -1; j <= 1; j++)
+                for (int i = -1; i <= 1; i++) tap = max(tap, s8(ce + ivec2(i, j)));
+        }
+    }
+    ax[eOff() + ci] = floatBitsToUint(e);
+    ax[cOff() + ci] = (near_ ? 1u : 0u) | (tap > 0.0 ? 2u : 0u);
+}

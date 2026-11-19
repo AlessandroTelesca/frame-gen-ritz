@@ -424,6 +424,8 @@ struct Run {
     framegen::Interpolator::DebugV3Layout L{};
     std::vector<std::vector<uint8_t>> out;   // per t
     int mode = 0;
+    uint32_t unsure = 0;
+    float failMix = 0, histD = 0;   // v3_decide: the unsure count (px of both grids), the soft fallback mix, the scene-cut divergence
 };
 static framegen::Interpolator gFg;
 static int gW = 0, gH = 0;
@@ -445,6 +447,9 @@ static bool runV3(Img& a, Img& b, Img& o, const std::vector<double>& ts, const H
     uint32_t hdr[16];
     memcpy(hdr, r.dump.data(), sizeof hdr);
     r.mode = (int)hdr[10];
+    r.unsure = hdr[11];
+    memcpy(&r.failMix, &hdr[12], 4);
+    memcpy(&r.histD, &hdr[13], 4);
     r.out.clear();
     for (double t : ts) {
         begin();
@@ -822,6 +827,14 @@ int main(int argc, char** argv) {
         const std::string nm = sc.name;
         const double flowThr = sc.fade ? 90.0 : 95.0;
         if (estOk) {
+            {   // the pair's decisions (v3_decide): an ordinary pair is no cut and no failed estimate (the fade scene included: a lighting change is not a cut)
+                const uint32_t* G = (const uint32_t*)(est.dump.data() + est.L.g);
+                const double N2 = 2.0 * F.fw * F.fh, share = 100.0 * est.unsure / N2, shareE = 100.0 * G[31] / std::max((double)G[30], 0.25 * N2);
+                const bool ok = est.mode == 0 && est.failMix == 0.0f;
+                printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut %.2f)  unsure %.1f%% of flow px, %.1f%% of those that could find a partner (globalFallback 15%%)   %s (an ordinary pair: mode 0, failMix 0)\n", nm.c_str(),
+                       est.mode, est.failMix, est.histD, 0.45, share, shareE, ok ? "PASS" : "FAIL");
+                verdict(ok, true);
+            }
             {   // the stats of the estimate (state G): dominant motions, the camera model, the wide search's counters
                 const uint32_t* G = (const uint32_t*)(est.dump.data() + est.L.g);
                 float gf[64];
