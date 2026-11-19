@@ -49,12 +49,13 @@ enum class MotionVersion : uint32_t {
                   // ms per generated frame at 1080p, per-pass GPU profile.) Memory on top of V1 (activations + state): 1080p E2v3 / E2v4 /
                   // E2v5 100 + 11 MB, E1v3 / E1v4 / E1v5 58 + 11 MB; 1440p E2v3 / E2v4 / E2v5 177 + 20 MB, E1v3 / E1v4 / E1v5 103 + 20 MB
                   // (learnedHalf: half the activations); the zero test and the static guard need none; the weights of all eight nets 2.3 MB.
-    V3 = 3,   // the third algorithm (design: gpu/V3.md): a gather-based, two-flow, occlusion-aware interpolator. UNDER CONSTRUCTION: this build
-              // has its skeleton only (build step S of gpu/V3.md): the library, buffers, settings and test hooks are final, the motion
-              // estimate does not exist yet and the synthesis is a plain time-weighted blend of the two real frames, (1 - t) prev + t curr,
-              // quantised as the format's store does (recordSynthBlur: the n sub-frames' blends, averaged). Only Format::Rgba8 so far: any
-              // other Format makes init() / setSettings() / reconfigure() refuse V3 with a reason (Interpolator::settingsError). No device
-              // requirement beyond Vulkan 1.2 core compute. Settings::v3* are accepted and validated and have no effect yet.
+    V3 = 3,   // the third algorithm (design: gpu/V3.md): a gather-based, two-flow, occlusion-aware interpolator, built for the best picture
+              // (about 0.9 ms per real pair at 1080p, flowScale 2, 2x on a 7900 XTX, 1.1 / 1.3 ms at 3x / 4x; INTEGRATION.md "Motion version 3").
+              // Both flow directions, occlusion, a vector fill in hidden strips, smear along the motion where unsure (it never holds a patch of a
+              // real frame; a scene cut shows the nearer real frame). Every Format (v3_planes and v3_synth have a variant per format: a host build
+              // that lacks them gets V3 refused for that format with a reason, Interpolator::settingsError / initError). flowScale 1, 2, 4.
+              // No device requirement beyond Vulkan 1.2 core compute. Settings::v3* apply; searchRadius, searchRadiusTop, pyramidMinSide,
+              // subpixel, trustLow / trustHigh, sceneCutSad, hudBonus, smoothBonus, searchPenalty, learned* and v2Mode are ignored.
 };
 
 // The weights of MotionVersion::Learned (Settings::learnedNet). Values are append-only and never renumbered. All nets are the same
@@ -318,13 +319,14 @@ struct Settings {
     // the zero vector and keeps warp taps off them, with or without uiProtection. On = the default; off = V2's synthesis as without
     // it (the tests' unprotected reference). V1 ignores it. Runtime: setSettings() at any time, from the next recordEstimate on.
     bool v2StaticMask = true;
-    // MotionVersion::V3 (see gpu/V3.md section 6; all have no effect in the skeleton build, which only blends the two frames):
+    // MotionVersion::V3 (see gpu/V3.md section 6):
     // v3Smear [0, 1]: smear strength, +- (this x the inter-frame motion) at full unsureness; 0 = no smear.
     // v3OcclSoft [0.25, 4]: width of the occlusion ramp (higher = softer one-sided transition). v3Unsure [0.25, 4]: scales the poor-match
     // ramp of the unsure measure (higher = trusts worse matches). Runtime, act in the synthesis, no re-estimate needed.
     // v3SceneCut [0, 4]: the histogram divergence above which a pair is a scene cut (0 = never), read by the estimate.
     // v3ColourWindow: hook (j), matching windows weighted by colour similarity (from the next estimate); v3DetailSplit: hook (l), fine
-    // detail from one frame and the coarse picture blended. Both off = the default. Other versions ignore all six. Runtime: setSettings()
+    // detail from one frame and the coarse picture blended. RESERVED: both are accepted and wired through and have no effect yet (output
+    // identical on and off); later tasks implement them. Both off = the default. Other versions ignore all six. Runtime: setSettings()
     // at any time; changing one does not drop the current estimate.
     float v3Smear = 0.35f;
     float v3OcclSoft = 1.0f;

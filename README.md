@@ -62,6 +62,35 @@ Quality, preliminary (reference clips, every 20th window, PSNR vs V1): Performan
 
 Other formats cost what Rgba8 does (1080p 2x fs 2, Performance / Quality: Rgb10 0.193 / 0.290, Nv12 0.189 / 0.283, P010 0.191 / 0.287 ms), RgbaF16 a little more (encoded 0.217 / 0.314, linear scRGB 0.256 / 0.362 ms: twice the bytes, and linear light is compared as PQ codes); table per format and flowScale in INTEGRATION.md "Motion version 2".
 
+## Motion version 3
+
+`MotionVersion::V3` is the third interpolator, and the one built for the best picture rather than the lowest cost (design and as-built notes: `gpu/V3.md`). It estimates motion in both directions, finds the pixels that are hidden in one of the two frames, fills the vectors in those strips from their neighbours, and builds each generated pixel by gathering from both real frames along both vectors. Where it cannot trust the motion it **smears along the motion** instead of guessing: it never holds a patch of a real frame and never shows a sharp wrong patch; the only real frame it shows is a whole-frame scene cut. The estimate is a 6-level pyramid search with an exhaustive top level (a guaranteed reach of 512 px between the two real frames at 1080p, `flowScale` 2, about 768 px through a wide search on unreliable blocks), a camera-motion fit, a soft per-pixel field at the edges and an occlusion measure. It runs every format (Rgba8, Rgb10, RgbaF16, Nv12, P010, HDR included), every UI-protection mode and motion blur, and needs only Vulkan 1.2 core compute (no subgroup operations).
+
+| Setting | Default | What it does |
+|---|---|---|
+| `motionVersion = MotionVersion::V3` | V1 | Selects it (`fgtest --set algo=v3`). Runtime; a switch drops the current estimate. |
+| `v3Smear` | 0.35 | Strength of the smear where V3 is unsure (0-1; 0 = none). |
+| `v3OcclSoft`, `v3Unsure` | 1.0, 1.0 | Width of the occlusion ramp and trust in poor matches (0.25-4 each). |
+| `v3SceneCut` | 0.45 | Histogram divergence above which a pair is a scene cut (0-4; 0 = never). |
+| `v3ColourWindow`, `v3DetailSplit` | false, false | Reserved, no effect yet. |
+
+V3 ignores `trustLow`, `trustHigh`, `sceneCutSad`, `hudBonus`, `smoothBonus`, `searchPenalty`, `searchRadius`, `searchRadiusTop`, `pyramidMinSide` and `subpixel`; it honours `flowScale`, `globalFallback` (as the "estimate failed" threshold), `v2StaticMask`, the `ui*` settings and `blurSamples`. All V3 settings are runtime.
+
+Cost, RX 7900 XTX, 1080p, back-to-back median ms per real pair (one estimate + N-1 synths), Battlefield frames 100 / 101 (fast) and 400 / 401 (calm); runs differ by about 3 %:
+
+| flowScale, mult | V3 fast / calm | (V2 Quality) |
+|---|---|---|
+| 2, 2x | 0.89 / 0.84 | 0.261 |
+| 2, 3x | 1.07 / 1.04 | 0.364 |
+| 2, 4x | 1.26 / 1.23 | 0.432 |
+| 4, 2x | 0.44 / 0.45 | 0.159 |
+| 4, 3x | 0.61 / 0.64 | 0.272 |
+| 4, 4x | 0.78 / 0.85 | 0.344 |
+
+The limit for the design was 1.1 ms at `flowScale` 2, 2x; every format is under it at 2x (Rgb10 0.89, RgbaF16 encoded 0.94, linear 0.99, Nv12 0.92, P010 0.93 ms on the fast pair), 3x and 4x are above it. 1440p `flowScale` 2, 2x: 1.55 / 1.45 ms; `flowScale` 1, 2x: 2.84 / 2.62 ms. Each generated frame beyond the first costs about 0.18 ms. Memory: 56 MiB at 1080p `flowScale` 2 (100 MiB at 1440p), plus 7.9 MiB per interior sample of a motion-blurred output at 1080p. The per-pass table, per-format and per-size tables, reach, memory, the shader build list and the known limits are in INTEGRATION.md "Motion version 3".
+
+Known limits, plainly: the static-structure mask is luma-based (a HUD element with about the luma of its background is not protected); the smear is active on a large share of the pixels on hard footage, so a fast pan at a 30 fps base looks soft; content entering at the frame edge and areas uncovered behind a moving object are reconstructed approximately (mean error about 5-6 levels in the synthetic two-layer scene, against 0.7 with exact motion); a scene cut is found from histograms, so a cut between two scenes with the same level statistics is not seen; the fallback threshold was calibrated on a small set of clips; at `flowScale` 1 and 4 zoom and rotation fall slightly under the 95 % mark in the known-motion tests (about 94 %). `v3test` (known-motion tests with exact data), `fgtest --dump` with `gpu/v3flow.py` and `fgtest --v3weights` are its tools.
+
 ## Learned motion estimate (testing)
 
 `MotionVersion::Learned` is opt-in. It is V1 with its motion search replaced by ml-fg's learned estimator, a 5-level conv net on the flow-res luma, followed by ml-fg's zero-motion test. It writes V1's per-pixel field and scene-cut SAD, and V1's synthesis, fallbacks, motion blur and UI protection are unchanged.
@@ -94,6 +123,7 @@ It costs more than V1: 1080p 2x, back-to-back per pair, e2v5 1.35-1.66 ms (half 
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
 | `gpu/compare.py` | GPU vs Python reference checks, and the benchmark runs |
 | `gpu/ml/`, `gpu/shaders/ml_*`, `gpu/mltest.cpp` | `MotionVersion::Learned`: the nets' weights (ml-fg export: e2v3, e1v3, e2v4, e1v4, e2v5, e1v5, and the colour / features variants g2v2, g2v3, m2v2, m2v3) and `embed_weights.py`, its passes (incl. `ml_zero`, `ml_guard`), its test against ml-fg's test vectors (`ml/synthcheck.py`: end to end; `ml/guardcheck.py`: the static guard vs ml-fg's `static_guard.py`) |
+| `gpu/V3.md`, `gpu/shaders/v3_*`, `gpu/v3test.cpp`, `gpu/v3flow.py` | `MotionVersion::V3`: the design page (with the as-built notes and the measured cost), its 14 passes (`v3_planes` and `v3_synth` have a variant per format), the known-motion test (`v3test`) and the flow statistics script |
 | `ML-FG-TESTING.md` | QC record of the learned motion estimator (both backends): status, parity, cost, integration notes |
 | `INTEGRATION.md` | Integration spec for gamescope-ritz, full API contract, settings, costs |
 
@@ -144,12 +174,12 @@ The library is not limited to 8-bit RGB games. The format is picked once at `ini
 | `Nv12` | `R8_UNORM` (Y plane view; chroma `R8G8_UNORM`) | `Frame{Y view, CbCr view}` |
 | `P010` | `R16_UNORM` (Y plane view; chroma `R16G16_UNORM`; 10 bits in the high bits) | `Frame{Y view, CbCr view}` |
 
-- **Both motion versions run every format.** V1 and V2 (both modes, static mask, motion blur, every UI-protection mode), SDR and HDR (Rgb10 / RgbaF16 with PQ, RgbaF16 scRGB with values far above 1.0, P010 BT.2020 PQ): highlights are interpolated, never clipped (`formattest`'s HDR check: a 1000-4000-nit object moved to its mid position within 0.25 PQ levels).
+- **Every motion version runs every format.** V1, V2 and V3 (V2 in both modes, static mask, motion blur, every UI-protection mode), SDR and HDR (Rgb10 / RgbaF16 with PQ, RgbaF16 scRGB with values far above 1.0, P010 BT.2020 PQ): highlights are interpolated, never clipped (`formattest`'s HDR check: a 1000-4000-nit object moved to its mid position within 0.25 PQ levels).
 - **Rgba8 is untouched.** Each colour shader is built once per format from the same source (`-DFG_FORMAT_*`, `gpu/shaders/format.glsl`); with no define it compiles to the same SPIR-V as before (checked with `cmp` for all 20 shaders when formats landed; since the CrosshairV2 tap rejection the four warp shaders carry two more buffer bindings, and their *output* is checked by hash instead: Off, `Crosshair` and `WholeScreen` equal `origin/main` bit for bit in every format), keeps its header names, and a host that passes plain `VkImageView`s changes nothing. The other variants are only loaded when chosen. The motion estimate runs on luma and is the same code for every format.
 - **Thresholds keep their meaning.** Every level-based setting stays in "8-bit levels": the library converts what it measures to the levels of an 8-bit picture (10-bit codes / 4, PQ codes for linear float, YCbCr differences mapped to R'G'B'), so a number means the same perceived amount in every format. Blending and warping stay in the source's own space.
 - **Host contract.** NV12 / P010: one multi-planar image created with `MUTABLE_FORMAT | EXTENDED_USAGE`, plane views (`PLANE_0` as `R8`/`R16`, `PLANE_1` as `R8G8`/`R16G16`); `out`'s two views are both written (Y full, CbCr half resolution; chroma assumed centre-sited). Every format except Rgba8 and RgbaF16 needs the device feature `shaderStorageImageExtendedFormats`. `InitInfo::getFormatProps` lets `init()` check device support and report a reason (`initError()`).
 - **Memory** of one UI-protection clean copy at 1440p: Rgba8 / Rgb10 14.7 MB, RgbaF16 29.5 MB, Nv12 5.5 MB, P010 11.1 MB. **Embedded SPIR-V** per non-Rgba8 format: Rgb10 418 KB, RgbaF16 442 KB, Nv12 and P010 490 KB each (of which V2's synthesis 251 / 263 / 276 / 276 KB).
-- **Sizes:** from `Interpolator::kMinSize` (16 x 16) up to the device's limits, checked with a reason (`Interpolator::sizeError()`, `initError()`, `settingsError()`): RX 7900 XTX, both versions, every format, up to 16384 x 16384 at flowScale 2 / 4 and 12288 x 12288 at flowScale 1; verified with validation and GPU-AV from 16 x 16 to 7680 x 4320 (INTEGRATION.md "Formats").
+- **Sizes:** from `Interpolator::kMinSize` (16 x 16) up to the device's limits, checked with a reason (`Interpolator::sizeError()`, `initError()`, `settingsError()`): RX 7900 XTX, V1 and V2, every format, up to 16384 x 16384 at flowScale 2 / 4 and 12288 x 12288 at flowScale 1; verified with validation and GPU-AV from 16 x 16 to 7680 x 4320 (INTEGRATION.md "Formats").
 
 Full contract, the threshold table per format, build and gamescope notes: INTEGRATION.md "Formats".
 
@@ -263,12 +293,12 @@ gpu/build/uitest trackbench [W H]        # GPU cost of recordTrack vs recordObse
 gpu/build/uitest bench [W H]             # per-pass GPU times: moving / still / 70% still scenes, all modes
 ```
 
-`uitest`, `blurtest` and `formattest` take `--algo v1|v2` and `--mode quality|performance` to run their checks with motion version 2.
+`uitest`, `blurtest` and `formattest` take `--algo v1|v2|learned|v3` and `--mode quality|performance` to run their checks with another motion version.
 
 `formattest` (needs no footage) checks every image format (Rgb10, RgbaF16 encoded and linear, NV12, P010) on the same kind of synthetic scene, single frames only (640x360 by default, a few milliseconds of GPU per format):
 
 ```sh
-gpu/build/formattest check [--separate-planes] [--algo v1|v2] [--mode quality|performance] [W H]   # per format: output vs the Rgba8 path, YUV planes written, blur, exact crosshair / HUD, HDR highlights, size limits
+gpu/build/formattest check [--separate-planes] [--algo v1|v2|v3] [--mode quality|performance] [W H]   # per format: output vs the Rgba8 path, YUV planes written, blur, exact crosshair / HUD, HDR highlights, size limits
                                                        # with UI protection, 10-bit gradient precision, float highlights above 1.0, API refusals
 gpu/build/formattest time [W H]                        # one GPU time per format (estimate + one synth), default 1920x1080
 ```
@@ -330,8 +360,8 @@ for (int k = 1; k < N; ++k)
 | `hudBonus` | 1.0 | Zero-vector bonus that keeps static HUD elements in place. Too high can freeze slow motion. 0 = off. |
 | `smoothBonus` | 0.5 | Bonus for the smooth vector field. Higher = calmer but softer motion edges. |
 | `searchPenalty` | 0.5 | Search cost per pixel step. Higher = steadier on flat or repetitive surfaces, lower = follows small fast detail. |
-| `searchRadius` | 2 | Motion search: integer vectors tried within ± this many pixels of the seed on every pyramid level below the coarsest. 1-12. V1 and V2 (both modes); `Learned` ignores it. Runtime. Above 6 it runs a wider search shader and costs more. |
-| `searchRadiusTop` | 6 | The same at the coarsest pyramid level (seed 0). 1-12. V1 and V2; `Learned` ignores it. Runtime. With n pyramid levels the finest level reaches `searchRadiusTop * 2^(n-1) + searchRadius * (2^(n-1) - 1)` flow pixels: at 1080p `flowScale` 2 the defaults give 4 levels and 62 flow pixels, about 250 px between the two real frames. Above 6 it uses the wider search shader for that level only. |
+| `searchRadius` | 2 | Motion search: integer vectors tried within ± this many pixels of the seed on every pyramid level below the coarsest. 1-12. V1 and V2 (both modes); `Learned` and V3 ignore it. Runtime. Above 6 it runs a wider search shader and costs more. |
+| `searchRadiusTop` | 6 | The same at the coarsest pyramid level (seed 0). 1-12. V1 and V2; `Learned` and V3 ignore it. Runtime. With n pyramid levels the finest level reaches `searchRadiusTop * 2^(n-1) + searchRadius * (2^(n-1) - 1)` flow pixels: at 1080p `flowScale` 2 the defaults give 4 levels and 62 flow pixels, about 250 px between the two real frames. Above 6 it uses the wider search shader for that level only. |
 | `subpixel` | true | 1/2 + 1/4 px refinement. Off saves about 0.04-0.06 ms per pair, slightly softer on slow pans. |
 | `uiProtection` | Off | `Off`, `Crosshair`, `WholeScreen` or `CrosshairV2`: static-UI protection (see above). Runtime. |
 | `uiBoxHeightFrac` | 0.025 | Box = square of side round(frame height * frac), clamped to [8, min(w, h)]. [0, 1]; 0 = legacy area box. Runtime. |
@@ -348,12 +378,14 @@ for (int k = 1; k < N; ++k)
 | `blurSamples` | 0 | Motion blur: sub-frames averaged by `recordSynthBlur()`. 0 or 1 = off, 2-16 on (see above). Runtime. |
 | `blurWeights` | Gaussian | `Even` (1/N each) or `Gaussian` (ends of the window at 2 sigma, weights taken at the slice centres). Runtime. |
 | `uiMaxStillFraction` | 0.75 | WholeScreen: above this still share (of cells outside the box) the whole-screen passes are skipped for that frame. 1 = never. |
-| `motionVersion` | V1 | `V1`, `V2` (see "Motion version 2") or `Learned` (see "Learned motion estimate"; flowScale 2 only); all run every format. Runtime; a switch drops the current estimate. |
+| `motionVersion` | V1 | `V1`, `V2` (see "Motion version 2"), `V3` (see "Motion version 3") or `Learned` (see "Learned motion estimate"; flowScale 2 only); all run every format. Runtime; a switch drops the current estimate. |
+| `v3Smear`, `v3OcclSoft`, `v3Unsure`, `v3SceneCut` | 0.35, 1.0, 1.0, 0.45 | V3 only: smear strength (0-1), occlusion softness (0.25-4), trust in poor matches (0.25-4), scene-cut histogram divergence (0-4, 0 = never). Runtime. |
+| `v3ColourWindow`, `v3DetailSplit` | false, false | V3 only: reserved, no effect yet. |
 | `learnedNet`, `learnedHalf` | E2v5, false | Learned only: the net (`E2v5`, `E1v5` = the small net, `E2v4`, `E1v4`, `E2v3`, `E1v3`, and the variants `G2v2` / `M2v2` = colour, `G2v3` / `M2v3` = learned features) and fp16 activation storage. Runtime; the next estimate uses them. |
 | `learnedZeroTest`, `learnedStaticGuard` | true, false | Learned only: ml-fg's zero-motion test on the net's field (next estimate) and the opt-in static guard on the generated frames (next synth). Runtime. |
 | `v2Mode` | Quality | V2 only: `Quality` or `Performance`. Runtime; a switch keeps the estimate. |
 | `flowScale` | 2 | Motion estimation at 1/flowScale resolution: 1, 2 or 4. 4 is much cheaper but can miss thin, fine motion. 1 is much slower and was not better on the test clips. (structural) |
-| `pyramidMinSide` | 48 | Pyramid stop: levels are added, each half the size, while the smaller side of the next one is at least this many flow pixels. 16-256. Smaller = more levels = longer reach, more cost, more risk of a wrong coarse match. Applies to every motion version (the buffers follow it). Structural: `reconfigure()`; `setSettings()` refuses a change. |
+| `pyramidMinSide` | 48 | Pyramid stop: levels are added, each half the size, while the smaller side of the next one is at least this many flow pixels. 16-256. Smaller = more levels = longer reach, more cost, more risk of a wrong coarse match. Applies to V1, V2 and `Learned` (the buffers follow it; V3 builds its own pyramid and ignores it). Structural: `reconfigure()`; `setSettings()` refuses a change. |
 
 The defaults of `searchRadius`, `searchRadiusTop` and `pyramidMinSide` reproduce the earlier output exactly. Two passes used to clip long vectors: the per-level median (parent vectors beyond 127 px) and V2 Quality's coverage step (half-vectors beyond 127.75 flow px). If any of the three settings is off its default and the reach needs it, they run wide variants instead and do not clip (the median stays exact, Quality's claims keep the exact vector; Quality's match key loses low bits only above 2^21 flow pixels, i.e. beyond 1920x1080 at `flowScale` 1). With the defaults the plain passes run at every frame size, so the output is exactly as before, including the clipping on very large frames. Long vectors cost time mostly in the search: at 1080p `flowScale` 2, radius 12 / 12 and `pyramidMinSide` 16 a pair takes about 1.3 ms instead of 0.3 ms. V2's overlay walk grows with the vector: about +0.03 ms at 100 flow px and +0.3 ms at 300 flow px (`flowScale` 1). `gpu/shifttest.py` checks that a known 400 and 600 px shift is found.
 
@@ -407,6 +439,7 @@ For video, `Pacer::OnFrame(id, ptsNs, streamKey, format)` replaces `OnArrival`: 
 - HUD drawn into the game image can still show artifacts, especially translucent HUD elements and scrolling or changing text. Solid, static HUD is handled by the optional static-UI protection (`uiProtection`, above); semi-transparent or shape-changing UI is not protected by it either (`CrosshairV2` leaves a crosshair that changes shape or transparency alone while it changes). Overlays composited later by gamescope are not affected.
 - Repetitive structures (stairs, ladders, fences) under fast motion can lock onto the wrong period. Both warps then agree, so the mismatch test cannot catch it.
 - Very fast flicks below the whole-frame fallback threshold can show seams between warped and held regions.
+- V3 (`MotionVersion::V3`) smears where it is unsure, so fast pans at a low base rate look soft, and its cost at 3x and 4x is above 1.1 ms at 1080p; see "Motion version 3" for its other limits.
 - Interpolation adds latency, because a generated frame needs the next real frame.
 - At a low base frame rate (3x, 4x) motion between real frames is larger, so fallbacks are more frequent.
 - Presentation is the caller's job. `gpu/pacing.h` decides the schedule (which frame at which time), the caller owns the clock, the display and the actual present.
