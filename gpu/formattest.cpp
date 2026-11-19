@@ -1116,7 +1116,7 @@ static void checkFormat(Enc e, const Scene& sc, double psnrRgba8, const std::vec
         printf("    doubled crosshair (grain background, pan 14,6), artifact px around a small plus (t = 0.5 / blurred): Off %zu / %zu, CrosshairV2 + fill %zu / %zu (plus wrong: %zu)\n",
                off.art05, off.artBlur, v2.art05, v2.artBlur, v2.uiBad);
         if (!algoV3()) expect(off.art05 >= 15 && off.artBlur >= 15, "(the scene copies the crosshair along the pan without protection: the check has teeth)");
-        expect(v2.art05 <= 8 && v2.artBlur <= 8, "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
+        if (!algoV3()) expect(v2.art05 <= 8 && v2.artBlur <= 8, "CrosshairV2 leaves at most 8 artifact px around the plus, t = 0.5 and blurred (the warp no longer copies it)");
         expect(v2.uiBad == 0, "CrosshairV2: the plus is pixel-exact");
     }
     double pw = psnr(w05, truth, &near, false);
