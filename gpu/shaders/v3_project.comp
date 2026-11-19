@@ -29,6 +29,9 @@ vec2 ffBil(int dir, vec2 q) {
     return mix(mix(v00, v10, a.x), mix(v01, v11, a.x), a.y);
 }
 
+// (tuning D3) a garbage region's vector is taken for the camera model's where it is far from it: a ramp over the vector difference (flow px)
+const float V3_GARB0 = 20.0, V3_GARB1 = 50.0;
+
 // one hypothesis: dir 0 = A (prev's side, time weight tt = t), dir 1 = B (curr's side, tt = 1 - t); returns g, and the hole / occlusion / unsure values
 void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
     vec2 p = m - tt * ffBil(dir, m);
@@ -41,13 +44,19 @@ void hyp(int dir, float tt, vec2 m, float f, out vec2 gv, out vec3 ohu) {
     float hole = smoothstep(0.75, 2.0, r);
     float o = v3OccEff(v3Occ(mp.e, length(gv), pc.occlSoft), mp.g);
     float un = v3UnsureOf(mp.cost, o, mp.amb, mp.g, pc.unsure);
-    if (f > 0.0) {   // the estimate failed (soft, per pair): toward the camera model
+    // the estimate failed: toward the camera model, softly. (tuning D1/D3) per pixel: where the pixel is itself unsure (f, the pair's share of failed pixels, x u), and
+    // wherever the garbage measure g says the vectors around are incoherent (content entering at the edge, a region without a partner): there the camera model is the
+    // best neighbouring motion there is, and the garbage vector would drag content in from far away
+    if (f > 0.0 || mp.g > 0.0) {
         vec2 gc = camModel(m);
         if (dir == 1) gc = -camModel(m - gc);   // F10: the content at curr position m came from m - d(m)
-        const float fp = f * un;   // (tuning D1) the fallback acts where the pixel is itself unsure, not on the whole frame
-        gv = mix(gv, gc, fp);
-        o *= 1.0 - fp;
-        hole *= 1.0 - fp;
+        const float fu = f * un;   // (tuning D1) the pair fallback acts where the pixel is itself unsure, not on the whole frame
+        // (tuning D3) a garbage region's vector is replaced by the camera model's where it is far from it (it would drag content in from far away); o and hole stay as the
+        // estimate flagged them: the hypothesis is still doubtful, only the direction its smear runs along is now a plausible one
+        const float fg = max(smoothstep(0.7, 1.0, mp.g), v3Occ(mp.e, length(gv), pc.occlSoft)) * smoothstep(V3_GARB0, V3_GARB1, length(gv - gc));
+        gv = mix(gv, gc, max(fu, fg));
+        o *= 1.0 - max(fu, 0.5 * fg);
+        hole *= 1.0 - max(fu, 0.5 * fg);
     }
     ohu = vec3(o, hole, un);
 }

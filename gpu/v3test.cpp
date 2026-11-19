@@ -1072,7 +1072,9 @@ int main(int argc, char** argv) {
                        path ? "exact flows" : "estimated  ", ts[k], s.mean, s.p99, s.le3, s.frac, gated ? (pass ? "PASS" : "FAIL") : "INFO", thr, gated ? "" : ", informational");
                 verdict(pass, gated);
             }
-            if (sc.layers.size() > 1) {   // INSIDE the hidden strips (content absent in one real frame; not within 2 px of a layer boundary): ours against the plain time blend
+            const bool shiftScene = sc.layers.size() == 1 && sc.name.rfind("shift", 0) == 0;
+            if (sc.layers.size() > 1 || shiftScene) {   // (shift scenes: the strip entering at the leading edge, no partner in the other frame; informational, tuning D3)
+                // INSIDE the hidden strips (content absent in one real frame; not within 2 px of a layer boundary): ours against the plain time blend
                 std::vector<uint8_t> strips, band;
                 hiddenMask(sc, ts[k], &strips, 3, &band);
                 std::vector<uint8_t> notInside(strips.size());
@@ -1084,7 +1086,7 @@ int main(int argc, char** argv) {
                     const Run& r = path ? inj : est;
                     if (r.out.size() <= k) continue;
                     const BetStat so = betweenStat(r.out[k], ref, notInside);
-                    printf("%-20s hidden strips %s t=%.2f  mean %6.2f  p99 %6.2f  (%.1f%% of the frame)   plain blend: mean %6.2f  p99 %6.2f\n", nm.c_str(), path ? "exact flows" : "estimated  ", ts[k], so.mean, so.p99, so.frac, sb.mean, sb.p99);
+                    printf("%-20s %s %s t=%.2f  mean %6.2f  p99 %6.2f  (%.1f%% of the frame)   plain blend: mean %6.2f  p99 %6.2f\n", nm.c_str(), shiftScene ? "entering edge" : "hidden strips", path ? "exact flows" : "estimated  ", ts[k], so.mean, so.p99, so.frac, sb.mean, sb.p99);
                 }
             }
         }
