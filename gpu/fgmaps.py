@@ -39,7 +39,9 @@ def load(path):
     ew = np.frombuffer(raw, np.uint32, es * H, o).reshape(H, es)
     e = np.stack([(ew >> (8 * i)) & 255 for i in range(4)], -1).reshape(H, es * 4)[:, :W].astype(np.float32)
     ver = int(h[1])
-    algo = ("v1", "v2")[min(int(h[14]), 1)] if ver >= 5 else ("v2" if ver >= 2 else "v1")
+    algo = ("v1", "v2", "v2", "v3")[min(int(h[14]), 3)] if ver >= 5 else ("v2" if ver >= 2 else "v1")
+    if algo == "v3":   # MotionVersion::V3 (gpu/V3.md): the skeleton dumps the full F01 (prev -> curr, flow px); the other versions dump half vectors
+        block, pf = block / 2, pf / 2
     mode = ("quality", "performance")[min(int(h[15]), 1)] if ver >= 5 else None
     return dict(W=W, H=H, fw=fw, fh=fh, bw=bw, bh=bh, fscale=fscale, block=block, pf=pf, e=e,
                 trustLow=float(hf[0]), trustHigh=float(hf[1]), version=ver, algo=algo, mode=mode)

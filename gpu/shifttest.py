@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Known-shift test of the long-vector paths (Settings::searchRadius / searchRadiusTop / pyramidMinSide at their largest).
 
-  shifttest.py FGTEST [--validate] [--keep DIR]        exit status 0 = all cases pass
+  shifttest.py FGTEST [--validate] [--keep DIR] [--v3]        exit status 0 = all cases pass
 
 Builds a 1/f-noise picture (broad-band structure, no repetition), curr = prev shifted by a known whole-pixel amount (the content that
 leaves the frame is replaced by the picture's next columns / rows, as a real pan), runs fgtest on it (V1, V2 Quality, V2 Performance)
@@ -12,6 +12,8 @@ and requires, in the region visible in both frames:
 Cases: (1) flowScale 2, shift (400, 100) at searchRadius 12 / searchRadiusTop 12 / pyramidMinSide 16: beyond the default reach
 (~250 px), below the two 127-px clip limits of the histogram and the V2 Quality claims; (2) flowScale 1, shift (600, 300): beyond both,
 so the wide median histogram and the wide claims decide; (3) shift (1) with the default settings must NOT be found.
+--v3 adds MotionVersion::V3 as a fourth contestant (per-pixel field slot = F01 at the flow pixels). It is reported but NOT counted:
+it fails until the estimate steps of gpu/V3.md (E1..) exist (the skeleton produces no flow).
 --validate runs fgtest under the Khronos validation layer (GPU-assisted and synchronization validation) and fails on any message
 other than the layer's start-up notes.
 """
@@ -107,6 +109,7 @@ def check(label, maps, out, truth, dx, dy, perf):
 def main():
     a = sys.argv[1:]
     validate = "--validate" in a
+    v3 = "--v3" in a
     keep = a[a.index("--keep") + 1] if "--keep" in a else None
     pos = [x for i, x in enumerate(a) if not x.startswith("--") and (i == 0 or a[i - 1] != "--keep")]
     if not pos:
@@ -126,7 +129,7 @@ def main():
             scenes[(dx, dy)] = scene(dx, dy)
         prev, curr, truth = scenes[(dx, dy)]
         print(f"case {cname}" + ("" if found else "  (must NOT be found)"))
-        for label, algo in (("V1", "algo=v1"), ("V2 Quality", "algo=v2,v2Mode=quality"), ("V2 Performance", "algo=v2,v2Mode=performance")):
+        for label, algo in (("V1", "algo=v1"), ("V2 Quality", "algo=v2,v2Mode=quality"), ("V2 Performance", "algo=v2,v2Mode=performance")) + ((("V3 (expected fail)", "algo=v3"),) if v3 else ()):
             # (the strip a pan reveals is more than the default 15 % of the frame: the whole-frame fallbacks are off, they are not under test)
             s = f"{algo},flowScale={fs},globalFallback=1,sceneCutSad=255" + ("," + extra if extra else "")
             p, msgs, out, maps = run(fgtest, tmp, f"c{cname[0]}_{label[:2]}{label[-1]}", s, prev, curr, validate)
@@ -135,6 +138,8 @@ def main():
                 fails += 1
                 continue
             frac, psnr = check(label, maps, out, truth, dx, dy, label == "V2 Performance")
+            if label.startswith("V3"):
+                continue   # reported only
             if msgs:
                 fails += 1
                 print(f"  {label}: {len(msgs)} validation message(s):")
