@@ -354,6 +354,9 @@ void main() {
                 for (int i = 0; i < 10; i++) fl[rec + 12 + i] = sc_[i];
                 fl[rec + 22] = wo.w[0]; fl[rec + 23] = wo.w[1]; fl[rec + 24] = wo.w[2]; fl[rec + 25] = wo.w[3]; fl[rec + 26] = wo.s; fl[rec + 27] = 0.0;
             }
+            // (task 107) the synthesis never stores a non-finite value (a UNORM store turns a NaN into black): where the colour is undefined the pixel is the
+            // plain time blend of the two real frames at t. Nothing in the tested range reaches it (the output is byte-identical with the line removed).
+            if (any(isnan(C)) || any(isinf(C))) C = (1.0 - t) * V3_LEVELS(s0.rgb) + t * V3_LEVELS(s1.rgb);
             v = V3_QUANT(C);
             a = mix(s0.a, s1.a, t);
         }
