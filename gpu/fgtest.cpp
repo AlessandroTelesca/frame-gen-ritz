@@ -384,12 +384,17 @@ static void destroyImg(Img& i) {
 int main(int argc, char** argv) {
     bool bgra = false;
     int bench = 0, mult = 2;
-    bool split = false, stats = false;
+    bool split = false, stats = false, marker = false;
+    framegen::Settings initS;
+    bool haveInit = false;
+    std::vector<std::string> trackFiles;   // --track-files
+    std::vector<bool> seqReconf;           // --seq: this state is applied with reconfigure() (a 'reconf=1' token), not setSettings()
     int window = 0;
     const char* dumpDir = nullptr;
     const char* wPrefix = nullptr;   // --v3weights
     uint32_t wMax = 0;
     std::vector<float> ts{0.5f};
+    std::vector<std::vector<float>> tseq;   // --tseq: the t list of each pair (the last repeats)
     framegen::Settings setA;
     char* thenArg = nullptr;
     std::vector<framegen::Settings> seq;   // --seq: per pair, the settings applied by setSettings() before it (live-toggle test)
@@ -410,6 +415,21 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mult") && i + 1 < argc) mult = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--split")) split = true;
         else if (!strcmp(argv[i], "--stats")) stats = true;
+        else if (!strcmp(argv[i], "--init") && i + 1 < argc) { haveInit = true; if (!parseSettings(argv[++i], initS)) return 2; }   // task 107: the settings init() gets (a host that starts as V1 and switches with setSettings); the --set / --seq states apply on top before the pairs
+        else if (!strcmp(argv[i], "--track-files") && i + 1 < argc) {   // task 107: at the first pair that does not continue the stream, these real frames are uploaded and recordTrack'd first (a host that was paused: only recordTrack runs)
+            std::string all = argv[++i];
+            for (size_t a = 0; a <= all.size();) { size_t b = all.find(',', a); if (b == std::string::npos) b = all.size(); trackFiles.push_back(all.substr(a, b - a)); a = b + 1; }
+        }
+        else if (!strcmp(argv[i], "--tseq") && i + 1 < argc) {   // task 107: "t,t;t;t,t,t": per pair its own synth times (a host's pacer: 1..4 synths per pair, any t)
+            std::string all = argv[++i];
+            for (size_t a = 0; a <= all.size();) {
+                size_t b = all.find(';', a); if (b == std::string::npos) b = all.size();
+                std::vector<float> l; std::string one = all.substr(a, b - a);
+                for (size_t c = 0; c < one.size();) { size_t d = one.find(',', c); if (d == std::string::npos) d = one.size(); l.push_back((float)atof(one.substr(c, d - c).c_str())); c = d + 1; }
+                tseq.push_back(l); a = b + 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--marker")) marker = true;   // task 107: pre-fill every output with magenta before each pair (the host clears nothing: a texel a synth leaves unwritten stays magenta)
         else if (!strcmp(argv[i], "--window") && i + 1 < argc) window = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dumpDir = argv[++i];
         else if (!strcmp(argv[i], "--v3weights") && i + 1 < argc) wPrefix = argv[++i];
@@ -422,6 +442,9 @@ int main(int argc, char** argv) {
                 size_t b = all.find(';', a);
                 if (b == std::string::npos) b = all.size();
                 std::string one = all.substr(a, b - a);
+                const size_t rc = one.find("reconf=1");
+                seqReconf.push_back(rc != std::string::npos);
+                if (rc != std::string::npos) { one.erase(rc, 8); if (rc < one.size() && one[rc] == ',') one.erase(rc, 1); else if (rc > 0 && one[rc - 1] == ',') one.erase(rc - 1, 1); }
                 framegen::Settings st = setA;
                 if (!one.empty() && !parseSettings(one.data(), st)) return 2;
                 seq.push_back(st);
@@ -554,9 +577,10 @@ int main(int argc, char** argv) {
     Img spare{};
     if (uiOn) { spare = makeImage(W, H, fmt, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT); inputs.push_back(&spare); }
     size_t nOut = std::max(ts.size(), (size_t)std::max(mult - 1, 1));
+    for (auto& l : tseq) nOut = std::max(nOut, l.size());
     std::vector<Img> outs;
     for (size_t k = 0; k < nOut; k++)
-        outs.push_back(makeImage(W, H, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT));
+        outs.push_back(makeImage(W, H, fmt, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
     Img& out = outs[0];
     begin();
     for (Img* i : inputs) imgBarrier(cb, *i, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -571,7 +595,7 @@ int main(int argc, char** argv) {
     info.height = H;
     info.viewFormat = fmt;
     info.getMemProps = vkGetPhysicalDeviceMemoryProperties; info.getProps2 = vkGetPhysicalDeviceProperties2;
-    info.settings = setA;
+    info.settings = haveInit ? initS : setA;
     if (gFmt != Fmt::Rgba8) info.getFormatProps = vkGetPhysicalDeviceFormatProperties;
     if (gFmt == Fmt::F16Lin) { info.transfer = framegen::Transfer::Linear; info.linearWhiteNits = 80.0f; }
     if (gFmt == Fmt::P010) info.yuvMatrix = framegen::YuvMatrix::Bt2020;
@@ -628,6 +652,20 @@ int main(int argc, char** argv) {
         submit();
     };
 
+    // --marker: an output image pre-filled with opaque magenta (255, 0, 255) in the frame format's own encoding
+    auto fillMarker = [&](Img& img) {
+        uint8_t* dst = gFmt == Fmt::Rgba8 ? map : fileBuf.data();
+        for (size_t i = 0; i < bytes; i += 4) { dst[i] = 255; dst[i + 1] = 0; dst[i + 2] = 255; dst[i + 3] = 255; }
+        swz(map);
+        if (gFmt != Fmt::Rgba8) encodeFrame(fileBuf.data(), W, H, map, off1);
+        begin();
+        imgBarrier(cb, img, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdCopyBufferToImage(cb, stg, img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        if (img.imgC) vkCmdCopyBufferToImage(cb, stg, img.imgC, VK_IMAGE_LAYOUT_GENERAL, 1, &regionC);
+        imgBarrier(cb, img, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        submit();
+    };
+
     // UI protection on (--set/--then ui=..): fgtest drives it like a host. Every real frame is uploaded into a ring of 3 input
     // images and recordObserve'd ONCE when it arrives, in pair order: a pair whose prev is the previous pair's curr (the same
     // path string) reuses that image and its observation, so a run of consecutive pairs is one stream of real frames with
@@ -641,6 +679,7 @@ int main(int argc, char** argv) {
 
     for (size_t p = 2; p + 2 < pos.size(); p += 3) {
         size_t pairIdx = (p - 2) / 3;
+        const std::vector<float>& tcur = tseq.empty() || thenArg ? ts : tseq[std::min(pairIdx, tseq.size() - 1)];
         if (window > 0 && pairIdx > 0 && pairIdx % window == 0) {   // a fresh Interpolator: nothing carried over
             vkDeviceWaitIdle(dev);
             if (!fg.init(info)) { fprintf(stderr, "fg.init (--window) failed\n"); return 1; }
@@ -651,6 +690,17 @@ int main(int argc, char** argv) {
             upload(pos[p + 1], curr);
         } else {
             int ps = lastSlot;
+            if (!trackFiles.empty() && pairIdx > 0 && pos[p] != lastPath) {   // --track-files: the paused stretch: every frame is only tracked
+                for (const std::string& tf : trackFiles) {
+                    const int ts_ = (lastSlot + 1) % 3;
+                    upload(tf, *inputs[ts_], false);
+                    begin();
+                    if (!fg.recordTrack(cb, inputs[ts_]->fr())) { fprintf(stderr, "fg.recordTrack failed\n"); return 1; }
+                    submit();
+                    lastSlot = ts_;
+                }
+                ps = -1;   // the host's next paint observes its prev: a fresh pair
+            }
             if (ps < 0 || pos[p] != lastPath) {   // not a continuation: prev is a new real frame
                 ps = (lastSlot + 1) % 3;
                 upload(pos[p], *inputs[ps], true);
@@ -668,22 +718,24 @@ int main(int argc, char** argv) {
         if (!seq.empty()) {   // the live toggle: the GPU is idle between pairs (submit() waits); a switch of the motion version drops the estimate, record() makes a new one
             const framegen::Settings& st = seq[std::min(pairIdx, seq.size() - 1)];
             if (const char* why = fg.settingsError(st)) { fprintf(stderr, "pair %zu: settingsError: %s\n", pairIdx, why); return 1; }
-            if (!fg.setSettings(st)) { fprintf(stderr, "pair %zu: setSettings failed\n", pairIdx); return 1; }
+            if (seqReconf[std::min(pairIdx, seq.size() - 1)]) { if (!fg.reconfigure(st)) { fprintf(stderr, "pair %zu: reconfigure failed\n", pairIdx); return 1; } }
+            else if (!fg.setSettings(st)) { fprintf(stderr, "pair %zu: setSettings failed\n", pairIdx); return 1; }
             fg.releaseUnusedMotion();   // frees the resources the state does not use (the guard's two buffers at Off, an unselected version's group); the next state may need them again
             fprintf(stderr, "pair %zu: motionVersion %u v3Guard %u\n", pairIdx, (unsigned)st.motionVersion, (unsigned)st.v3Guard);
         }
+        if (marker) for (auto& o : outs) fillMarker(o);
         begin();
         if (thenArg) {
-            if (!fg.record(cb, prev.fr(), curr.fr(), outs[0].fr(), ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+            if (!fg.record(cb, prev.fr(), curr.fr(), outs[0].fr(), tcur[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
             if (!fg.setSettings(setB)) { fprintf(stderr, "setSettings failed (invalid or structural --then?)\n"); return 1; }
-            if (!fg.record(cb, prev.fr(), curr.fr(), outs[1].fr(), ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+            if (!fg.record(cb, prev.fr(), curr.fr(), outs[1].fr(), tcur[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
             fg.setSettings(setA);   // the next pair starts from A again
-        } else if (ts.size() == 1 && !split) {
-            if (!fg.record(cb, prev.fr(), curr.fr(), out.fr(), ts[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
+        } else if (tcur.size() == 1 && !split) {
+            if (!fg.record(cb, prev.fr(), curr.fr(), out.fr(), tcur[0])) { fprintf(stderr, "fg.record failed\n"); return 1; }
         } else {
             if (!fg.recordEstimate(cb, prev.fr(), curr.fr())) { fprintf(stderr, "fg.recordEstimate failed\n"); return 1; }
-            for (size_t k = 0; k < ts.size(); k++)
-                if (!fg.recordSynth(cb, prev.fr(), curr.fr(), outs[k].fr(), ts[k])) { fprintf(stderr, "fg.recordSynth failed\n"); return 1; }
+            for (size_t k = 0; k < tcur.size(); k++)
+                if (!fg.recordSynth(cb, prev.fr(), curr.fr(), outs[k].fr(), tcur[k])) { fprintf(stderr, "fg.recordSynth failed\n"); return 1; }
         }
         if (stats) {
             if (!fg.recordDebugCounters(cb, dbg, 0)) { fprintf(stderr, "recordDebugCounters failed\n"); return 1; }
@@ -752,7 +804,7 @@ int main(int argc, char** argv) {
             CK(vkBindBufferMemory(dev, wb, wm, 0));
             CK(vkMapMemory(dev, wm, 0, wl.size, 0, (void**)&wp));
             begin();
-            if (!fg.recordDebugV3Weights(cb, prev.fr(), curr.fr(), outs[0].fr(), ts[0], wb, 0, wMax)) { fprintf(stderr, "recordDebugV3Weights failed\n"); return 1; }
+            if (!fg.recordDebugV3Weights(cb, prev.fr(), curr.fr(), outs[0].fr(), tcur[0], wb, 0, wMax)) { fprintf(stderr, "recordDebugV3Weights failed\n"); return 1; }
             VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
             vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
             submit();
@@ -765,7 +817,7 @@ int main(int argc, char** argv) {
             vkFreeMemory(dev, wm, nullptr);
         }
         if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
-        for (size_t k = 0; k < ts.size(); k++) {
+        for (size_t k = 0; k < tcur.size(); k++) {
             begin();
             imgBarrier(cb, outs[k], VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             vkCmdCopyImageToBuffer(cb, outs[k].img, VK_IMAGE_LAYOUT_GENERAL, stg, 1, &region);
@@ -773,7 +825,7 @@ int main(int argc, char** argv) {
             submit();
             swz(map);
             if (gFmt != Fmt::Rgba8) decodeFrame(map, off1, W, H, fileBuf.data());
-            std::string path = pos[p + 2] + (ts.size() > 1 ? "." + std::to_string(k) : "");
+            std::string path = pos[p + 2] + (tcur.size() > 1 ? "." + std::to_string(k) : "");
             FILE* f = fopen(path.c_str(), "wb");
             fwrite(gFmt == Fmt::Rgba8 ? map : fileBuf.data(), 1, bytes, f);
             fclose(f);
