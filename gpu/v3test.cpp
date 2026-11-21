@@ -9,7 +9,7 @@
 //     --size   frame size (default 1920x1080). The scenes' lengths (shifts, layer sizes) are those of 1080p scaled by min(W/1920, H/1080);
 //              the texture (wavelengths 4..128 px) is not.
 //     --fs     flowScale (1, 2 or 4; default 2)
-//     --scene  shift | zoom | rotate | layers | fade | stripes | all (default all; stripes = repetitive texture, informational, not in all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
+//     --scene  shift | zoom | rotate | layers | fade | stripes | border | all (default all; border = task 109 frame-border injection scenes; stripes = repetitive texture, informational, not in all). shift = 7 shifts, layers = a rectangle and a zooming disc on a background.
 //     --t      times of the in-between frames measured (default 0.25,0.5)
 //     --report-only   always exit 0 (until the later steps of V3 make the metrics pass)
 //     --selfcheck     verify the tool itself instead of V3: (i) the CPU warp of prev by the exact F10 (and of curr by F01) reproduces curr (prev)
@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -796,6 +797,125 @@ static std::vector<double> parseTs(const char* s) {
     return v;
 }
 
+// (task 109) the frame-border scenes (gpu/V3.md 3.15 "As built (user test 2, task 109)"): a textured pan of 40 px (1080p lengths) whose frames carry a
+// dark border (6 px of 0), black bars (60 px top and bottom) or a bright border (6 px of 255, the control), with injected vectors (recordDebugV3Inject:
+// F01 = v, F10 = -v everywhere, as the search would give for a pan) of 100 .. 1500 px and a diagonal one, t = 0.02 / 0.5 / 0.98, v3Smear 0 and 0.35;
+// and with non-finite / out-of-half-range vectors (NaN, +inf, 1e5 flow px) in the centre third (the true pan elsewhere). Checks, inside the frame minus
+// a margin (the decoration + 16 px): among the pixels whose two taps (at t, for the injected v) both lie more than 2 px outside the frame, the share
+// that takes the border's colour (luma < 8 dark, > 248 bright: the texture never reaches either) is <= 0.002 (worst t); the share over the whole
+// interior is printed as information (a wrong vector with one tap inside reads real content, the decoration inside the picture included: no rule can
+// tell a black border from black content). In the non-finite region: border colour and the share darker than min(prev, curr) - 40 at the pixel
+// <= 0.0005 each. A vector whose taps both leave the picture must not bring the border in; a non-finite vector must not reach the output.
+static float lumaOf(const std::vector<uint8_t>& f, size_t i) { return 0.299f * f[4 * i] + 0.587f * f[4 * i + 1] + 0.114f * f[4 * i + 2]; }
+static void borderScenes(const framegen::Settings& base, Img& a, Img& b, Img& o, int W, int H) {
+    framegen::Interpolator::DebugV3Layout L;
+    if (!gFg.debugV3Layout(L)) { printf("border: no V3 layout   FAIL\n"); verdict(false, true); return; }
+    const int fw = (int)L.fw, fh = (int)L.fh, fs = (int)L.fscale;
+    const size_t N = (size_t)fw * fh;
+    const double k = std::min(W / 1920.0, H / 1080.0);
+    Scene sc;
+    sc.W = W; sc.H = H;
+    Layer l = plane(5, 0.5 * W, 0.5 * H);
+    l.shx = 40.0 * k;
+    sc.layers = {l};
+    const std::vector<uint8_t> p0 = renderFrame(sc, 0.0), c0 = renderFrame(sc, 1.0);
+    const std::vector<double> ts = {0.02, 0.5, 0.98};
+    struct Deco { const char* nm; uint8_t v; int w; bool barsOnly; };
+    const int bars = std::max(8, (int)std::lround(60.0 * k));
+    const Deco decos[3] = {{"dark border", 0, 6, false}, {"black bars", 0, bars, true}, {"bright border", 255, 6, false}};
+    HostBuf fb = makeHostBuf(N * 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    float* f01 = (float*)fb.map;
+    float* f10 = f01 + 2 * N;
+    for (const Deco& d : decos) {
+        std::vector<uint8_t> p = p0, c = c0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                const bool on = d.barsOnly ? (y < d.w || y >= H - d.w) : (x < d.w || y < d.w || x >= W - d.w || y >= H - d.w);
+                if (!on) continue;
+                for (int ch = 0; ch < 3; ch++) p[4 * ((size_t)y * W + x) + ch] = c[4 * ((size_t)y * W + x) + ch] = d.v;
+            }
+        upload(p, a, W, H);
+        upload(c, b, W, H);
+        const int M = d.w + 16;
+        // the share of the interior that takes the border's colour, worst over the t's; and (nf) the share of the region darker than min(prev, curr) - 40
+        // vFull != 0: also the share of border colour among the pixels whose two taps (prev at x - t v, curr at x + (1 - t) v) both lie more than 2 px
+        // outside the frame (the mechanism: nothing of the picture is there, clamp-to-edge reads the border); 0 such pixels: 0
+        auto measure = [&](const Run& r, int x0, int y0, int x1, int y1, double& bordShare, double& darkShare, double vxF = 0.0, double vyF = 0.0, double* bothShare = nullptr, size_t* bothN = nullptr) {
+            bordShare = darkShare = 0.0;
+            if (bothShare) *bothShare = 0.0;
+            if (bothN) *bothN = 0;
+            auto outside = [&](double px, double py) { return px < -2.5 || py < -2.5 || px > W + 1.5 || py > H + 1.5; };
+            for (size_t kt = 0; kt < r.out.size(); kt++) {
+                const auto& out = r.out[kt];
+                const double t = ts[kt];
+                size_t nb = 0, nd = 0, n = 0, mb = 0, mn = 0;
+                for (int y = std::max(y0, M); y < std::min(y1, H - M); y++)
+                    for (int x = std::max(x0, M); x < std::min(x1, W - M); x++) {
+                        const size_t i = (size_t)y * W + x;
+                        const float g = lumaOf(out, i);
+                        const bool bc = d.v == 0 ? g < 8.0f : g > 248.0f;
+                        nb += bc;
+                        nd += g < std::min(lumaOf(p, i), lumaOf(c, i)) - 40.0f;
+                        n++;
+                        if ((vxF != 0.0 || vyF != 0.0) && outside(x - t * vxF, y - t * vyF) && outside(x + (1.0 - t) * vxF, y + (1.0 - t) * vyF)) { mn++; mb += bc; }
+                    }
+                bordShare = std::max(bordShare, (double)nb / std::max<size_t>(n, 1));
+                darkShare = std::max(darkShare, (double)nd / std::max<size_t>(n, 1));
+                if (bothShare) *bothShare = std::max(*bothShare, (double)mb / std::max<size_t>(mn, 1));
+                if (bothN) *bothN += mn;
+            }
+        };
+        struct Vec { const char* nm; double x, y; };
+        const Vec vecs[] = {{"100", 100, 0}, {"300", 300, 0}, {"600", 600, 0}, {"1500 across", 1500, 0}, {"1500 down", 0, 1500}, {"700 diagonal", 700, -700}};
+        for (const Vec& v : vecs)
+            for (float smear : {0.0f, 0.35f}) {
+                const float vx = (float)(v.x * k / fs), vy = (float)(v.y * k / fs);
+                for (size_t i = 0; i < N; i++) { f01[2 * i] = vx; f01[2 * i + 1] = vy; f10[2 * i] = -vx; f10[2 * i + 1] = -vy; }
+                framegen::Settings st = base;
+                st.v3Smear = smear;
+                gFg.setSettings(st);
+                Run r;
+                const bool ok = runV3(a, b, o, ts, &fb, r);
+                double bs = 1.0, ds = 0.0, ms = 1.0;
+                size_t mn = 0;
+                if (ok) measure(r, 0, 0, W, H, bs, ds, v.x * k, v.y * k, &ms, &mn);
+                const bool pass = ok && ms <= 0.002;
+                char nm[96];
+                snprintf(nm, sizeof nm, "border %s v=%s", d.nm, v.nm);
+                printf("%-36s smear %.2f inject: border colour where both taps leave the frame %.4f of %zu px, in the whole frame %.4f (informational)   %s (<= 0.002)\n",
+                       nm, smear, ms, mn, bs, pass ? "PASS" : "FAIL");
+                verdict(pass, true);
+            }
+        // non-finite vectors in the centre third, the true pan elsewhere
+        const float bad[3] = {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1e5f};
+        const char* badNm[3] = {"NaN", "+inf", "1e5"};
+        for (int q = 0; q < 3; q++) {
+            const float sx = (float)(40.0 * k / fs);
+            for (int y = 0; y < fh; y++)
+                for (int x = 0; x < fw; x++) {
+                    const size_t i = (size_t)y * fw + x;
+                    const bool in = x >= fw / 3 && x < 2 * fw / 3 && y >= fh / 3 && y < 2 * fh / 3;
+                    f01[2 * i] = in ? bad[q] : sx; f01[2 * i + 1] = in ? bad[q] : 0.0f;
+                    f10[2 * i] = in ? bad[q] : -sx; f10[2 * i + 1] = in ? bad[q] : 0.0f;
+                }
+            framegen::Settings st = base;
+            st.v3Smear = 0.35f;
+            gFg.setSettings(st);
+            Run r;
+            const bool ok = runV3(a, b, o, ts, &fb, r);
+            double bs = 1.0, ds = 1.0;
+            if (ok) measure(r, fs * (fw / 3), fs * (fh / 3), fs * (2 * fw / 3), fs * (2 * fh / 3), bs, ds);
+            const bool pass = ok && bs <= 0.0005 && ds <= 0.0005;
+            char nm[96];
+            snprintf(nm, sizeof nm, "border %s v=%s", d.nm, badNm[q]);
+            printf("%-36s smear 0.35 inject: border colour in the region %.4f, darker than min(prev, curr) - 40 %.4f   %s (<= 0.0005)\n", nm, bs, ds, pass ? "PASS" : "FAIL");
+            verdict(pass, true);
+        }
+    }
+    gFg.setSettings(base);
+    destroyHostBuf(fb);
+}
+
 int main(int argc, char** argv) {
     int W = 1920, H = 1080, fs = 2;
     std::string which = "all";
@@ -832,7 +952,7 @@ int main(int argc, char** argv) {
     if ((fs != 1 && fs != 2 && fs != 4) || W < 16 || H < 16) { fprintf(stderr, "--fs 1|2|4, --size at least 16x16\n"); return 2; }
     for (double t : ts) if (!(t > 0.0 && t < 1.0)) { fprintf(stderr, "--t: times in (0, 1)\n"); return 2; }
     std::vector<Scene> scenes = makeScenes(which, W, H);
-    if (scenes.empty() && which != "decide") { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
+    if (scenes.empty() && which != "decide" && which != "border") { fprintf(stderr, "unknown scene %s (shift zoom rotate layers fade all)\n", which.c_str()); return 2; }
     if (list) { for (auto& s : scenes) printf("%s\n", s.name.c_str()); return 0; }
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -949,6 +1069,7 @@ int main(int argc, char** argv) {
         }
         gFg.setSettings(info.settings);
     }
+    if (which == "all" || which == "border") borderScenes(info.settings, a, b, o, W, H);
     for (const Scene& sc : scenes) {
         const Flows F = exactFlows(sc, fs);
         const std::vector<uint8_t> prev = renderFrame(sc, 0.0), curr = renderFrame(sc, 1.0);

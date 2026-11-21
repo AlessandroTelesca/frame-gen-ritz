@@ -118,6 +118,11 @@ void main() {
     // the other hypothesis or the plain blend takes over. Nothing finite and sane passes this test (NaN fails every comparison).
     if (!all(lessThan(abs(gA), vec2(60000.0)))) { gA = vec2(0.0); a = vec3(0.0, 1.0, 0.0); }
     if (!all(lessThan(abs(gB), vec2(60000.0)))) { gB = vec2(0.0); b = vec3(0.0, 1.0, 0.0); }
+    {   // (task 109, behaviour) a vector longer than the frame's diagonal moves nothing that the pair shows: the same (a hole with the zero vector)
+        const float diag = length(vec2(float(pc.fw), float(pc.fh)));
+        if (length(gA) > diag) { gA = vec2(0.0); a = vec3(0.0, 1.0, 0.0); }
+        if (length(gB) > diag) { gB = vec2(0.0); b = vec3(0.0, 1.0, 0.0); }
+    }
     const int N = pc.fw * pc.fh;
     const int o = pc.fdOff + 8 * N + int(gz) * 4 * N + 4 * (m.y * pc.fw + m.x);
     fl[o] = uintBitsToFloat(packHalf2x16(gA));

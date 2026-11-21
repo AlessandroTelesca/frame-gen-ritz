@@ -266,8 +266,13 @@ void main() {
             v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A, hitA V3L_ARG(vAp, vAc));
             v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B, hitB V3L_ARG(vBp, vBc));
             // (tuning D3) an occluded hypothesis owns one frame only (A prev, B curr): that tap outside the frame is no source at all, so the hypothesis is a hole
-            wi.oA = rA.x; wi.holeA = max(max(rA.y, hitA), rA.x * outsideFar(pAp)); wi.uA = rA.z;
-            wi.oB = rB.x; wi.holeB = max(max(rB.y, hitB), rB.x * outsideFar(pBc)); wi.uB = rB.z;
+            // (task 109) a hypothesis whose taps BOTH lie far outside the picture (more than V3_FAR0..V3_FAR1 px past the edge in both frames: a vector
+            // longer than the frame, or a large one near a corner) has no source at all: clamp-to-edge would read the frame's border texels (black with a
+            // dark border). It is a hole too; the weight it keeps (both hypotheses far) goes to the zero-vector blend below (farW). A tap just past the edge
+            // (content entering or leaving, edgeReject) is not touched: its partner is inside.
+            const float farA = min(outside(pAp), outside(pAc)), farB = min(outside(pBp), outside(pBc));
+            wi.oA = rA.x; wi.holeA = max(max(max(rA.y, hitA), rA.x * outsideFar(pAp)), farA); wi.uA = rA.z;
+            wi.oB = rB.x; wi.holeB = max(max(max(rB.y, hitB), rB.x * outsideFar(pBc)), farB); wi.uB = rB.z;
             wi.t = t;
             wi.lenA = length(gA); wi.lenB = length(gB);
             V3WOut wo;
@@ -337,11 +342,23 @@ void main() {
                     // (tuning 3) the 4 smear sets also sit on a plus of radius lat around the pixel: where the estimate is unsure the colour is low-passed across the motion too,
                     // so that no block edge of the vector field survives (taps of a hypothesis stay on its own line, shifted)
                     const vec2 xs = xp + lat * (((j + 2) & 1) == 0 ? vec2(float(j < 0 ? 1 : -1), 0.0) : vec2(0.0, float(j < 0 ? 1 : -1)));
-                    v3Pair(xs - tA * gA, xs + (1.0 - tA) * gA, nearT, cAp, cAc, so_, e_, h_ V3L_DUM);
-                    v3Pair(xs + tB * gB, xs - (1.0 - tB) * gB, nearT, cBp, cBc, so_, e_, h_ V3L_DUM);
+                    const vec2 aP = xs - tA * gA, aC = xs + (1.0 - tA) * gA, bP = xs + tB * gB, bC = xs - (1.0 - tB) * gB;
+                    v3Pair(aP, aC, nearT, cAp, cAc, so_, e_, h_ V3L_DUM);
+                    v3Pair(bP, bC, nearT, cBp, cBc, so_, e_, h_ V3L_DUM);
+                    {   // (task 109) a smear set whose two taps of a hypothesis both lie far outside reads no border texel: that hypothesis' share is the blend
+                        const float fA = min(outside(aP), outside(aC)), fB = min(outside(bP), outside(bC));
+                        if (fA > 0.0) { cAp = mix(cAp, blend0, fA); cAc = mix(cAc, blend0, fA); }
+                        if (fB > 0.0) { cBp = mix(cBp, blend0, fB); cBc = mix(cBc, blend0, fB); }
+                    }
                     Cm += (3.0 - abs(float(j))) * (wo.w[0] * cAp + wo.w[1] * cAc + wo.w[2] * cBp + wo.w[3] * cBc);
                 }
                 C = mix(C, Cm * (1.0 / 9.0), smoothstep(0.05, 0.5, wo.s));
+            }
+            // (task 109) the weight still on hypotheses whose taps both lie far outside (both hypotheses far: all of it) takes the zero-vector blend of the
+            // two real frames at the pixel, not a mix of border texels
+            {
+                const float farW = wA * farA + wB * farB;
+                if (farW > 0.0) C = mix(C, blend0, farW);
             }
             // step 7: the static mask
             float wst = 0.0;
