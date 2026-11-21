@@ -274,6 +274,12 @@ void main() {
             v3Weights(wi, wo);
             vec3 C = wo.w[0] * wi.CAp + wo.w[1] * wi.CAc + wo.w[2] * wi.CBp + wo.w[3] * wi.CBc;
             const float wA = wo.w[0] + wo.w[1], wB = wo.w[2] + wo.w[3];
+            // (task 109) the plain time blend of the two real frames at the pixel: the fallback wherever the colour is not defined (never black, never a
+            // texel of the frame's border)
+            const vec3 blend0 = mix(V3_LEVELS(s0.rgb), V3_LEVELS(s1.rgb), t);   // (mix, not the static mask's own (1 - t) a + t c: sharing that expression changed how the compiler fuses it there, 1 level on one pixel)
+            // the clamp box below is unset (lo > hi) only when neither hypothesis dominates, i.e. when wA / wB are NaN: clamping to it would turn the colour
+            // into a finite black. Such a pixel, or one whose vectors are not finite, takes blend0 instead, before the clamp, and skips the smear.
+            bool sane = all(lessThan(abs(vec4(gA, gB)), vec4(1e30)));
 #if defined(V3L)
             // step 5 with hook (l): the detail split. Cs = sum w_i LP_i + sum d_i (C_i - LP_i) = C - sum (w_i - d_i) (C_i - LP_i), LP_i the 3x3 mean around the
             // tap (the same 9 texels as the clamp's box), d_i the detail shares: the sharpened weights (tilted to the later frame at a tie), the mass of a tap
@@ -302,7 +308,8 @@ void main() {
                         if (needLp) corr += (e * vl[i]) * (ci[i] - V3_LEVELS(mean));
                     }
                 }
-                C = clamp(C - V3L_GAIN * corr, V3_LEVELS(lo), V3_LEVELS(hi));
+                sane = sane && all(lessThanEqual(lo, hi));
+                C = sane ? clamp(C - V3L_GAIN * corr, V3_LEVELS(lo), V3_LEVELS(hi)) : blend0;
             }
 #else
             // step 5: the pixel clamp, to the 3x3 neighbourhoods of the dominant hypothesis' taps (both where the weights are within 0.25)
@@ -310,11 +317,12 @@ void main() {
                 vec3 lo = vec3(1e9), hi = vec3(-1e9);
                 if (wA > wB - 0.25) { v3Box(false, pAp, lo, hi); v3Box(true, pAc, lo, hi); }
                 if (wB > wA - 0.25) { v3Box(true, pBc, lo, hi); v3Box(false, pBp, lo, hi); }
-                C = clamp(C, V3_LEVELS(lo), V3_LEVELS(hi));
+                sane = sane && all(lessThanEqual(lo, hi));
+                C = sane ? clamp(C, V3_LEVELS(lo), V3_LEVELS(hi)) : blend0;
             }
 #endif
             // step 6: the smear along the motion where the estimate is unsure (no smear at all with v3Smear = 0)
-            if (pc.smear > 0.0 && wo.s > 1.0 / 16.0) {
+            if (sane && pc.smear > 0.0 && wo.s > 1.0 / 16.0) {
                 const float amt = 0.5 * pc.smear * wo.s;
                 const float kA = min(1.0, 48.0 / max(wi.lenA * 2.0 * amt, 1e-3)), kB = min(1.0, 48.0 / max(wi.lenB * 2.0 * amt, 1e-3));   // |tau g| <= 48 px
                 vec3 Cm = 3.0 * C;
@@ -356,7 +364,7 @@ void main() {
             }
             // (task 107) the synthesis never stores a non-finite value (a UNORM store turns a NaN into black): where the colour is undefined the pixel is the
             // plain time blend of the two real frames at t. Nothing in the tested range reaches it (the output is byte-identical with the line removed).
-            if (any(isnan(C)) || any(isinf(C))) C = (1.0 - t) * V3_LEVELS(s0.rgb) + t * V3_LEVELS(s1.rgb);
+            if (any(isnan(C)) || any(isinf(C))) C = blend0;
             v = V3_QUANT(C);
             a = mix(s0.a, s1.a, t);
         }

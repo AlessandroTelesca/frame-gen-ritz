@@ -6,7 +6,8 @@
 Per file: the header, the length of F01 / F10 (flow px, full prev->curr vectors; mean, p99, max), the number of NaN / inf / absurd (> the frame
 diagonal) vectors, the match cost (MAP cost8 / 8, levels) and the forward-backward agreement |F01(p) + F10(p + F01(p))| (bilinear sample of F10;
 median, share <= 1 flow px, share > 4 flow px; pixels whose target leaves the frame are not counted). Layout: gpu/framegen.h DebugV3Layout
-(16-word header padded to 64 bytes, then FF[0], FF[1], FD[0], FD[1] (fw*fh vec2 f32 each), MAP[0], MAP[1], S (fw*fh uint32 each), BLK).
+(16-word header padded to 64 bytes, then FF[0], FF[1], FD[0], FD[1] (fw*fh vec2 f32 each), MAP[0], MAP[1], S (fw*fh uint32 each), BLK,
+G words 0..63, the cells; version 2 (task 109): T-field slot 0, load() returns it as gA, gB (flow px), rA, rB (o, hole, u) and its t as tf_t).
 """
 import sys
 
@@ -40,6 +41,17 @@ def load(path):
     out["blk"] = blk
     if len(raw) >= o + 256:
         out["g"] = np.frombuffer(raw, np.uint32, 64, o)
+    o += 256
+    n8 = ((fw + 7) // 8) * ((fh + 7) // 8)
+    o += n8 * 12   # the cells s8, E, C
+    if int(h[1]) >= 2 and len(raw) >= o + 16 * n:   # (version 2, task 109) T-field slot 0 of the latest synth, its t in header word 14
+        w = np.frombuffer(raw, np.uint32, 4 * n, o).reshape(fh, fw, 4)
+        out["tf_t"] = float(h[14:15].view(np.float32)[0])
+        half = lambda x: x.astype(np.uint16).view(np.float16).astype(np.float32)
+        out["gA"] = np.stack([half(w[..., 0] & 0xffff), half(w[..., 0] >> 16)], -1)   # flow px
+        out["gB"] = np.stack([half(w[..., 1] & 0xffff), half(w[..., 1] >> 16)], -1)
+        out["rA"] = np.stack([(w[..., 2] >> (8 * k)) & 255 for k in range(3)], -1).astype(np.float32) / 255   # oA, holeA, uA
+        out["rB"] = np.stack([(w[..., 3] >> (8 * k)) & 255 for k in range(3)], -1).astype(np.float32) / 255
     return out
 
 

@@ -2158,6 +2158,7 @@ bool Interpolator::debugV3Layout(DebugV3Layout& l) const {
     for (int i = 0; i < V.n; i++) { l.blkLevel[i] = o; o += (VkDeviceSize)V.gw[i] * V.gh[i] * 4 * 16; }
     l.g = o; o += 64 * 4;   // G words 0..63
     l.cells = o; o += (VkDeviceSize)V.N8 * 12;   // (Y2) the static mask's cell maxima s8, enclosure E and "overlay near" bits C (N8 words each)
+    l.tf = o; o += (VkDeviceSize)V.N * 16;   // (task 109) T-field slot 0: the latest synth's projected record (4 words per flow px), its t in header word 14
     l.size = o;
     return true;
 }
@@ -2171,16 +2172,18 @@ bool Interpolator::recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize 
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
     I.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     // the 16-word header: the constants by CmdUpdateBuffer, then G.mode, G.unsureCount, G.failMix copied from the aux buffer
-    const uint32_t hdr[10] = {0x42443356u, 1u, L.W, L.H, L.fw, L.fh, L.bw, L.bh, L.fscale, L.nLevels};
+    const uint32_t hdr[10] = {0x42443356u, 2u, L.W, L.H, L.fw, L.fh, L.bw, L.bh, L.fscale, L.nLevels};
     I.CmdUpdateBuffer(cb, dst, dstOffset, sizeof(hdr), hdr);
     const VkDeviceSize g0 = (VkDeviceSize)V.gOff() * 4;
     VkBufferCopy h[4] = {{g0 + 4 * 4, dstOffset + 40, 4}, {g0 + 2 * 4, dstOffset + 44, 4}, {g0 + 24 * 4, dstOffset + 48, 4}, {g0 + 29 * 4, dstOffset + 52, 4}};   // G_MODE, G_UNSURE_COUNT, G_FAIL_MIX, G_HIST_D
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 4, h);
-    I.CmdFillBuffer(cb, dst, dstOffset + 56, 8, 0);   // words 14..15 spare
+    VkBufferCopy tk{g0 + 1200 * 4, dstOffset + 56, 4};   // word 14: G_TK[0], the t of T-field slot 0 (task 109)
+    I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 1, &tk);
+    I.CmdFillBuffer(cb, dst, dstOffset + 60, 4, 0);   // word 15 spare
     const VkDeviceSize n2 = (VkDeviceSize)V.N * 8, n1 = (VkDeviceSize)V.N * 4, blkB = 64 * (VkDeviceSize)V.B;   // V3B_FLOW: BLK, FD[2], FF[2], TF
     VkBufferCopy fc[4] = {{blkB + 2 * n2, dstOffset + L.ff0, 2 * n2}, {blkB, dstOffset + L.fd0, 2 * n2},   // FF[0..1], FD[0..1] (adjacent in dst)
-                          {0, dstOffset + L.blk, blkB}};
-    I.CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, dst, 3, fc);
+                          {0, dstOffset + L.blk, blkB}, {blkB + 4 * n2, dstOffset + L.tf, 2 * n2}};   // TF slot 0 (task 109)
+    I.CmdCopyBuffer(cb, g.bufs[V3B_FLOW].b, dst, 4, fc);
     VkBufferCopy ac[2] = {{0, dstOffset + L.map0, 2 * n1}, {(VkDeviceSize)4 * V.N * 4, dstOffset + L.s, n1}};   // MAP[0..1]; S at word 4N
     I.CmdCopyBuffer(cb, g.bufs[V3B_AUX].b, dst, 2, ac);
     VkBufferCopy gc[2] = {{g0, dstOffset + L.g, 64 * 4}, {(VkDeviceSize)5 * V.N * 4, dstOffset + L.cells, (VkDeviceSize)V.N8 * 12}};   // the state G, words 0..63 (step E2: dominant motions, camera, wide counters); s8, E, C

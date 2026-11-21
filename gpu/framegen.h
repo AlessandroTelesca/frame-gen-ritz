@@ -740,16 +740,17 @@ public:
     // Debug / test only (gpu/v3test.cpp): MotionVersion::V3's estimate. All return false unless the selected version is V3 and a size is held.
     // recordDebugV3(): copies the latest V3 estimate into dst (TRANSFER_DST usage) at dstOffset, laid out as debugV3Layout() says: a header of
     // 16 uint32 [0 magic 'V3DB' = 0x42443356, 1 version = 1, 2 W, 3 H, 4 fw, 5 fh, 6 bw, 7 bh (level-0 8x8 block grid), 8 flowScale, 9 number of
-    // levels, 10 G.mode (0 normal, 1 scene cut), 11 G.unsureCount, 12 G.failMix (float bits), 13 the scene-cut divergence D (float bits; v3_decide), 14..15 spare], then fw*fh vec2 each (flow px, all
+    // levels, 10 G.mode (0 normal, 1 scene cut), 11 G.unsureCount, 12 G.failMix (float bits), 13 the scene-cut divergence D (float bits; v3_decide), 14 the t of T-field slot 0 (float bits; version 2, task 109), 15 spare], then fw*fh vec2 each (flow px, all
     // full prev->curr vectors): FF[0] (F01, prev's grid, filled), FF[1] (F10, curr's grid), FD[0], FD[1] (dense, before the fill); then fw*fh
     // uint32 each: MAP[0], MAP[1] (cost8 | e8 << 8 | amb8 << 16 | g8 << 24), S (the static-structure mask, float bits); then BLK, the block
     // records of every level (V3B_FLOW's first region: per level l, direction d, slot p, gw_l*gh_l vec4 (vx, vy, cost, amb); gpu/V3.md
-    // section 4). Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. In the skeleton build
+    // section 4); then G words 0..63, the cells (s8, E, C), and (version 2, task 109) T-field slot 0 (fw*fh x 4 words: packHalf2x16(gA), packHalf2x16(gB),
+    // packUnorm4x8(oA, holeA, uA, 0), packUnorm4x8(oB, holeB, uB, 0): the latest synth's). Preceded by a COMPUTE write -> TRANSFER read barrier; the caller adds its own TRANSFER -> HOST barrier. In the skeleton build
     // (no estimate yet) everything is zero, except the flows of a recordDebugV3Inject, which FF and FD hold unchanged.
     struct DebugV3Layout {
         uint32_t W, H, fw, fh, bw, bh, fscale, nLevels;
         uint32_t lw[16], lh[16], lgw[16], lgh[16];   // per level: size and 8x8 / 4x4 block grid (gpu/V3.md section 2)
-        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, cells, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
+        VkDeviceSize ff0, ff1, fd0, fd1, map0, map1, s, blk, blkLevel[16], g, cells, tf, size;   // g: the first 64 words of the state G, after the BLK arrays (step E2: domValid / affValid at word 6, dom[4] at 8, aff[6] at 16, wide counters at 25 / 26)   // byte offsets in dst (relative to dstOffset), blkLevel[l] = BLK of level l (4 arrays: (d, p) = (0,0), (0,1), (1,0), (1,1))
     };
     bool debugV3Layout(DebugV3Layout& l) const;
     bool recordDebugV3(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset);

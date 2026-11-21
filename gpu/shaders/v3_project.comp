@@ -113,6 +113,11 @@ void main() {
             a *= 1.0 - xf; b *= 1.0 - xf;
         }
     }
+    // (task 109) a vector that is not finite or lies beyond the half-float range of the record (NaN, inf; |v| >= 60000 flow px) is no motion at all: it
+    // would reach the synth as NaN / inf tap positions (the frame's corner texel, or black). It becomes the zero vector with that hypothesis a hole, so
+    // the other hypothesis or the plain blend takes over. Nothing finite and sane passes this test (NaN fails every comparison).
+    if (!all(lessThan(abs(gA), vec2(60000.0)))) { gA = vec2(0.0); a = vec3(0.0, 1.0, 0.0); }
+    if (!all(lessThan(abs(gB), vec2(60000.0)))) { gB = vec2(0.0); b = vec3(0.0, 1.0, 0.0); }
     const int N = pc.fw * pc.fh;
     const int o = pc.fdOff + 8 * N + int(gz) * 4 * N + 4 * (m.y * pc.fw + m.x);
     fl[o] = uintBitsToFloat(packHalf2x16(gA));

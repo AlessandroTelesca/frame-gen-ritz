@@ -228,10 +228,16 @@ void main() {
     }
     accumulate(2, aff, a);
     red12(a);
-    const bool affOk = a[0] >= 0.4 * a[1] && a[1] >= 8.0 && abs(det) > 1e-4 * sw0 * sw0 * sw0;   // (the weight of the last round)
+    // (task 109) a model that is not finite or moves some part of the frame by more than the frame's size is no model ("finite or zeroed" by the tests
+    // above already; this makes it explicit and also catches an absurd finite one): |a0| + |a1| + |a2| bounds the x motion over the frame (|X|, |Y| <= 1)
+    const float lim = 2.0 * max(pc.cx, pc.cy);   // the flow frame's larger side (cx, cy = fw / 2, fh / 2)
+    const bool affSane = abs(aff[0]) + abs(aff[1]) + abs(aff[2]) < lim && abs(aff[3]) + abs(aff[4]) + abs(aff[5]) < lim;   // (false for NaN / inf)
+    const bool affOk = a[0] >= 0.4 * a[1] && a[1] >= 8.0 && abs(det) > 1e-4 * sw0 * sw0 * sw0 && affSane;   // (the weight of the last round)
 
     if (tid == 0) {
         uint valid = uint(domOk);
+        for (int k = 0; k < 4; k++)   // (task 109) likewise a dominant motion: not finite or beyond the frame is no peak
+            if (!(abs(dom[k].x) < lim && abs(dom[k].y) < lim)) valid &= ~(1u << k);
         for (int k = 0; k < 4; k++) {
             ax[g + G_DOM + 2 * k] = floatBitsToUint(dom[k].x);
             ax[g + G_DOM + 2 * k + 1] = floatBitsToUint(dom[k].y);
