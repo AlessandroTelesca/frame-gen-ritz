@@ -266,7 +266,7 @@ void main() {
             v3Pair(pAp, pAc, nearT, wi.CAp, wi.CAc, soA, em0A, hitA V3L_ARG(vAp, vAc));
             v3Pair(pBp, pBc, nearT, wi.CBp, wi.CBc, soB, em0B, hitB V3L_ARG(vBp, vBc));
             // (tuning D3) an occluded hypothesis owns one frame only (A prev, B curr): that tap outside the frame is no source at all, so the hypothesis is a hole
-            // (task 109) a hypothesis whose taps BOTH lie far outside the picture (more than V3_FAR0..V3_FAR1 px past the edge in both frames: a vector
+            // (task 109) a hypothesis whose taps BOTH lie outside the picture (outside(): the 2 px ramp of edgeReject, in both frames: a vector
             // longer than the frame, or a large one near a corner) has no source at all: clamp-to-edge would read the frame's border texels (black with a
             // dark border). It is a hole too; the weight it keeps (both hypotheses far) goes to the zero-vector blend below (farW). A tap just past the edge
             // (content entering or leaving, edgeReject) is not touched: its partner is inside.
@@ -345,7 +345,7 @@ void main() {
                     const vec2 aP = xs - tA * gA, aC = xs + (1.0 - tA) * gA, bP = xs + tB * gB, bC = xs - (1.0 - tB) * gB;
                     v3Pair(aP, aC, nearT, cAp, cAc, so_, e_, h_ V3L_DUM);
                     v3Pair(bP, bC, nearT, cBp, cBc, so_, e_, h_ V3L_DUM);
-                    {   // (task 109) a smear set whose two taps of a hypothesis both lie far outside reads no border texel: that hypothesis' share is the blend
+                    {   // (task 109) a smear set whose two taps of a hypothesis both lie outside reads no border texel: that hypothesis' share is the blend
                         const float fA = min(outside(aP), outside(aC)), fB = min(outside(bP), outside(bC));
                         if (fA > 0.0) { cAp = mix(cAp, blend0, fA); cAc = mix(cAc, blend0, fA); }
                         if (fB > 0.0) { cBp = mix(cBp, blend0, fB); cBc = mix(cBc, blend0, fB); }
@@ -354,7 +354,7 @@ void main() {
                 }
                 C = mix(C, Cm * (1.0 / 9.0), smoothstep(0.05, 0.5, wo.s));
             }
-            // (task 109) the weight still on hypotheses whose taps both lie far outside (both hypotheses far: all of it) takes the zero-vector blend of the
+            // (task 109) the weight still on hypotheses whose taps both lie outside (both hypotheses outside: all of it) takes the zero-vector blend of the
             // two real frames at the pixel, not a mix of border texels
             {
                 const float farW = wA * farA + wB * farB;
