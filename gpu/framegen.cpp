@@ -931,6 +931,16 @@ struct Interpolator::Impl {
     void uiFreeEntry(UiEntry& e);
     void uiDestroy();
     void uiAdopted(const Settings& old);
+    bool uiChanged(const Settings& old, const UiBox& oldBox, const UiBox& oldWork) const {   // the UI mode or its box changed (set = the new settings)
+        if (set.uiProtection != old.uiProtection) return true;
+        if (set.uiProtection == UiProtection::Off) return false;
+        const UiBox b = computeBox();
+        return !(b == oldBox) || !(computeWork(b) == oldWork);
+    }
+    void uiForget(VkImageView v) {   // a refused observe / a track of v: the entry keyed by v no longer holds v's content (task 112)
+        const int e = uiFind(v);
+        if (e >= 0) { uiE[e].key = VK_NULL_HANDLE; uiE[e].seq = 0; if (uiLast == e) uiLast = -1; }
+    }
     int uiFind(VkImageView v) const;
     int uiPick(VkImageView v) const;
     VkDescriptorSet takeUiSet(Frame src, Frame img, const UiBuf& s, const UiBuf& m);
@@ -1265,15 +1275,16 @@ void Interpolator::Impl::uiDestroy() {
 // New settings were adopted (old = the previous ones): switching off forgets the observed frames (their views may
 // be reused by the host without notice), and a gap in observation restarts the stillness counters.
 void Interpolator::Impl::uiAdopted(const Settings& old) {
+    // (seq too: a synth of the pair estimated before the change then fails its sequence check, task 112)
     if (set.uiProtection == UiProtection::Off) {
-        for (UiEntry& e : uiE) e.key = VK_NULL_HANDLE;
+        for (UiEntry& e : uiE) { e.key = VK_NULL_HANDLE; e.seq = 0; }
         uiLast = -1;
     }
     if (set.uiProtection != UiProtection::WholeScreen) uiCellHist = false;
     if (set.uiProtection == UiProtection::Off || old.uiProtection == UiProtection::Off) uiBoxHist = false;
     // V2 keeps another state layout and another mask format than the other modes: nothing observed under one is valid under the other
     if (set.uiProtection != old.uiProtection && (set.uiProtection == UiProtection::CrosshairV2 || old.uiProtection == UiProtection::CrosshairV2)) {
-        for (UiEntry& e : uiE) e.key = VK_NULL_HANDLE;
+        for (UiEntry& e : uiE) { e.key = VK_NULL_HANDLE; e.seq = 0; }
         uiLast = -1;
         uiBoxHist = false;
     }
@@ -1716,12 +1727,15 @@ bool Interpolator::setSettings(const Settings& s) {
     // frees nothing, so no GPU wait); false = the creation failed and nothing changed (a version created before a later failure
     // is kept, unused, for releaseUnusedMotion()).
     Settings old = m->set;
+    const UiBox oldBox = m->computeBox(), oldWork = m->computeWork(oldBox);
     m->set = s;
     if (!m->motionEnsure() || !m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
     // A switch of the motion version drops the estimate, the way the library already has for "no estimate" (after init/resize):
-    // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version.
-    if (s.motionVersion != old.motionVersion) m->haveEst = false;
+    // recordSynth / recordSynthBlur return false until the next recordEstimate, which runs the new version. So does a change of
+    // the UI protection mode or of its box (task 112): the remaining synths of the pair would paste the new mode's patch over the
+    // old mode's mask.
+    if (s.motionVersion != old.motionVersion || m->uiChanged(old, oldBox, oldWork)) m->haveEst = false;
     return true;
 }
 
@@ -1729,13 +1743,14 @@ bool Interpolator::reconfigure(const Settings& s) {
     if (!m || settingsError(s)) return false;
     bool structural = s.flowScale != m->set.flowScale || s.pyramidMinSide != m->set.pyramidMinSide;
     Settings old = m->set;
+    const UiBox oldBox = m->computeBox(), oldWork = m->computeWork(oldBox);
     m->set = s;
     if (!m->motionEnsure()) { m->set = old; return false; }
     // re-create only if a size is held (W == 0: a later resize() creates the buffers with the new settings)
     if (structural && m->W) return m->rebuild(m->W, m->H, m->info.viewFormat, true);   // (drops the estimate anyway)
     if (!m->uiEnsure()) { m->set = old; return false; }
     m->uiAdopted(old);
-    if (s.motionVersion != old.motionVersion) m->haveEst = false;   // as in setSettings
+    if (s.motionVersion != old.motionVersion || m->uiChanged(old, oldBox, oldWork)) m->haveEst = false;   // as in setSettings
     return true;
 }
 
@@ -2817,9 +2832,12 @@ bool Interpolator::recordObserve(VkCommandBuffer cb, Frame frame) {
     Impl& I = *m;
     if (!I.framesOk(frame)) return false;
     if (I.set.uiProtection == UiProtection::Off) return true;
-    if (!I.uiActive()) return false;
+    // Every refusal from here on forgets the entry keyed by this view (task 112): it holds what the view showed before, and
+    // an estimate that found it by view would run on that old content (the next estimate of a pair with this view now
+    // runs unprotected, a synth of a pair estimated with the old entry fails its sequence check).
+    if (!I.uiActive()) { I.uiForget(frame.view); return false; }
     I.uiExplicit = true;
-    if (I.uiFrameSets + I.uiObserveSets() > kUiSets) return false;
+    if (I.uiFrameSets + I.uiObserveSets() > kUiSets) { I.uiForget(frame.view); return false; }
     if (I.profiling && I.qpool && !I.profPending) {   // an observe opens a profile that the next recordEstimate continues
         I.qcount = 0;
         I.qnames.clear();
@@ -2828,7 +2846,8 @@ bool Interpolator::recordObserve(VkCommandBuffer cb, Frame frame) {
         I.qnames.push_back("start");
     }
     I.profPending = I.profiling && I.qpool;
-    return I.uiObserveRecord(cb, frame);
+    if (!I.uiObserveRecord(cb, frame)) { I.uiForget(frame.view); return false; }
+    return true;
 }
 
 bool Interpolator::recordTrack(VkCommandBuffer cb, Frame frame) {
@@ -2836,6 +2855,9 @@ bool Interpolator::recordTrack(VkCommandBuffer cb, Frame frame) {
     Impl& I = *m;
     if (!I.framesOk(frame)) return false;
     if (I.set.uiProtection == UiProtection::Off) return true;
+    // A tracked view holds a new frame that has no clean copy: an entry still keyed by it (an earlier observe of the same
+    // view) is forgotten whatever the outcome (task 112; a pair with this view then runs unprotected, as documented)
+    I.uiForget(frame.view);
     if (!I.uiActive()) return false;
     if (I.uiFrameSets + I.uiObserveSets() > kUiSets) return false;
     return I.uiTrackRecord(cb, frame);

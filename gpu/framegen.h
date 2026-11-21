@@ -587,6 +587,10 @@ public:
     // protection Off. Returns false and records nothing if the object is not initialised, a descriptor ring is
     // full (see below) or the first-use allocation failed (protection then stays off for that frame: do not
     // call recordEstimate on the frame expecting a protected result; calling it is still valid and unprotected).
+    // A false return also forgets the entry an earlier observe of the same view left (task 112): the view holds new
+    // pixels, so a pair with it runs unprotected and a synth of a pair estimated from the old entry returns false. A
+    // recordTrack forgets it the same way. A change of uiProtection or of its box (setSettings / reconfigure) drops
+    // the estimate like a motion version switch: recordSynth returns false until the next recordEstimate.
     // `frame` is the cache key: when a view is observed again, its earlier entry is replaced, so a host that reuses
     // views (a ring of images) MUST observe each new content, or the library would pair new pixels with a stale mask.
     // At least kUiFrames = 3 observed frames are kept (LRU by observe order; Settings::uiHistory keeps more): the

@@ -6,6 +6,7 @@
 //                                            (only MotionVersion::Learned reads them)
 //   uitest deep [W H]                        Settings::uiHistory: a synth from a pair 10 frames back still finds its clean copies (default 640x360)
 //   uitest track [W H]                       recordTrack: UI protection kept warm while the host does not generate (default 640x360)
+//   uitest stale [W H]                       task 112: a refused recordObserve forgets the view's old entry; a UI mode / box change drops the estimate (default 640x360)
 //   uitest trackbench [W H]                  GPU cost of recordTrack vs recordObserve (default 1920x1080 and 2560x1440)
 //   uitest bench [W H]                       per-pass GPU times, moving and still scene (default 1920x1080 and 2560x1440)
 // check also covers CrosshairV2 (the V2 block at its end): pixel-exact crosshair, the shrinking / growing mask control against V1,
@@ -1491,6 +1492,89 @@ static int trackCheck(int W, int H) {
     return fails ? 1 : 0;
 }
 
+// ---- stale (task 112): the two contract bugs of task 111.
+// 1. A refused recordObserve must not leave the view's old entry valid: the host reuses a ring slot (view) for a new frame, the
+//    observe of it is refused (here: the kUiSets ring is full), and the next estimate of a pair with that view must not run on
+//    the clean copy of what the slot held before. It runs unprotected: byte-identical to the same pair with protection Off.
+// 2. A change of the UI mode or of its box between the estimate and a synth drops the estimate (recordSynth false), as a switch of
+//    the motion version does; any other runtime change keeps it.
+static int staleCheck(int W, int H) {
+    Scene sc(W, H, 44, 0, 0);
+    Settings s; s.uiProtection = UiProtection::Crosshair;
+    s.uiBoxHeightFrac = 43.0f / H;
+    printf("stale %dx%d (%s)\n", W, H, algoV3() ? "v3" : algoV2() ? "v2" : "v1/learned");
+    Img ring[3];
+    for (auto& r : ring) r = makeImage(W, H, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    Img out = makeImage(W, H, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    begin();
+    for (auto& r : ring) imgBarrier(r.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    imgBarrier(out.img, VK_IMAGE_LAYOUT_UNDEFINED, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    submit();
+    const std::vector<uint8_t> f0 = sc.frame(0), f1 = sc.frame(1), f2 = sc.frame(6), f9 = sc.frame(9);
+    {   // 1.
+        Interpolator fg;
+        if (!makeInterp(fg, W, H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+        upload(f0, ring[0], W, H); upload(f1, ring[1], W, H); upload(f9, ring[2], W, H);
+        begin(); fg.beginFrame();
+        const bool ok0 = fg.recordObserve(cb, ring[0].view) && fg.recordObserve(cb, ring[1].view) && fg.recordEstimate(cb, ring[0].view, ring[1].view) && fg.recordSynth(cb, ring[0].view, ring[1].view, out.view, 0.5f);
+        submit();
+        upload(f2, ring[0], W, H);   // the host reuses slot 0 for a new frame
+        begin(); fg.beginFrame();
+        int filled = 0;
+        while (filled < 200 && fg.recordObserve(cb, ring[2].view)) filled++;   // fill the kUiSets ring on another view
+        const bool obs = fg.recordObserve(cb, ring[0].view);
+        const bool est = fg.recordEstimate(cb, ring[1].view, ring[0].view), syn = est && fg.recordSynth(cb, ring[1].view, ring[0].view, out.view, 0.5f);
+        submit();
+        const std::vector<uint8_t> outA = download(out, W, H);
+        vkDeviceWaitIdle(dev); fg.destroy();
+        Settings off = s; off.uiProtection = UiProtection::Off;
+        Interpolator fo;
+        if (!makeInterp(fo, W, H, off)) { fprintf(stderr, "init failed\n"); exit(1); }
+        begin(); fo.beginFrame();
+        const bool okR = fo.recordEstimate(cb, ring[1].view, ring[0].view) && fo.recordSynth(cb, ring[1].view, ring[0].view, out.view, 0.5f);
+        submit();
+        const std::vector<uint8_t> outRef = download(out, W, H);
+        vkDeviceWaitIdle(dev); fo.destroy();
+        size_t diff = 0;
+        for (size_t i = 0; i < outA.size(); i++) diff += outA[i] != outRef[i];
+        printf(" refused observe: %d observes filled the ring, observe of the reused view %s; estimate %s, synth %s; %zu bytes differ from the pair run with protection Off\n",
+               filled, obs ? "accepted" : "refused", est ? "ok" : "refused", syn ? "ok" : "refused", diff);
+        expect(ok0 && okR, "the setup pairs record");
+        expect(!obs, "the observe of the reused view is refused (test has teeth)");
+        expect(est && syn, "the next pair with the reused view still records (unprotected)");
+        expect(diff == 0, "that pair runs on the host's frames, not on the slot's old clean copy: byte-identical to protection Off");
+    }
+    {   // 2.
+        struct Ch { const char* name; Settings to; bool drops; };
+        std::vector<Ch> chs;
+        { Settings t = s; t.uiProtection = UT_V2_ENUM; if ((int)t.uiProtection) chs.push_back({"Crosshair -> CrosshairV2", t, true}); }
+        { Settings t = s; t.uiProtection = UiProtection::Off; chs.push_back({"Crosshair -> Off", t, true}); }
+        { Settings t = s; t.uiProtection = UiProtection::WholeScreen; chs.push_back({"Crosshair -> WholeScreen", t, true}); }
+        { Settings t = s; t.uiBoxHeightFrac = 61.0f / H; chs.push_back({"box height", t, true}); }
+        { Settings t = s; t.uiStillFrames = s.uiStillFrames + 1; chs.push_back({"uiStillFrames (no box change)", t, false}); }
+        { Settings t = s; chs.push_back({"the same settings", t, false}); }
+        for (const Ch& c : chs) {
+            Interpolator fg;
+            if (!makeInterp(fg, W, H, s)) { fprintf(stderr, "init failed\n"); exit(1); }
+            upload(f0, ring[0], W, H); upload(f1, ring[1], W, H);
+            begin(); fg.beginFrame();
+            const bool ok0 = fg.recordObserve(cb, ring[0].view) && fg.recordObserve(cb, ring[1].view) && fg.recordEstimate(cb, ring[0].view, ring[1].view) && fg.recordSynth(cb, ring[0].view, ring[1].view, out.view, 0.25f);
+            submit();
+            const bool set = fg.setSettings(algo(c.to));
+            begin(); fg.beginFrame();
+            const bool syn = fg.recordSynth(cb, ring[0].view, ring[1].view, out.view, 0.75f);
+            submit();
+            vkDeviceWaitIdle(dev); fg.destroy();
+            printf(" %-30s setSettings %s, the next synth of the pair %s\n", c.name, set ? "ok" : "refused", syn ? "records" : "is refused");
+            expect(ok0 && set, "setup and setSettings");
+            expect(syn == !c.drops, c.drops ? "a UI mode / box change drops the estimate" : "another change keeps the estimate");
+        }
+    }
+    for (auto& r : ring) { vkDestroyImageView(dev, r.view, nullptr); vkDestroyImage(dev, r.img, nullptr); vkFreeMemory(dev, r.mem, nullptr); }
+    vkDestroyImageView(dev, out.view, nullptr); vkDestroyImage(dev, out.img, nullptr); vkFreeMemory(dev, out.mem, nullptr);
+    return fails ? 1 : 0;
+}
+
 // ---- cost: GPU time per call, back to back (8 per command buffer), moving scene; observe = the same call with recordObserve
 static void trackBench(int W, int H) {
     const int NIMG = 16;
@@ -1932,7 +2016,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--hash")) hash = true;
         else pos.push_back(argv[i]);
     }
-    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
+    if (pos.empty() || (pos[0] != "check" && pos[0] != "bench" && pos[0] != "deep" && pos[0] != "track" && pos[0] != "trackbench" && pos[0] != "stale")) { fprintf(stderr, "usage: uitest check|bench|deep|track|trackbench|stale [--bgra] [--hash] [--algo v1|v2|learned|v3] [--mode quality|performance] [--detail-split] [W H]\n"); return 2; }
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -1985,6 +2069,16 @@ int main(int argc, char** argv) {
             if (pos.size() >= 3) trackBench(atoi(pos[1].c_str()), atoi(pos[2].c_str()));
             else { trackBench(1920, 1080); trackBench(2560, 1440); }
         }
+#endif
+    } else if (pos[0] == "stale") {
+#ifdef UITEST_NO_UI
+        fprintf(stderr, "stale needs the UI API\n");
+        return 2;
+#else
+        int W = pos.size() >= 3 ? atoi(pos[1].c_str()) : 640, H = pos.size() >= 3 ? atoi(pos[2].c_str()) : 360;
+        initStaging((size_t)W * H * 4);
+        rc = staleCheck(W, H);
+        printf(rc ? "RESULT: FAIL (%d)\n" : "RESULT: PASS\n", fails);
 #endif
     } else if (pos[0] == "deep") {
 #ifdef UITEST_NO_UI
