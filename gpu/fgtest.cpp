@@ -14,6 +14,8 @@
 // learnedNet=e2v3|e1v3|e2v4|e1v4|e2v5|e1v5|g2v2|g2v3|m2v2|m2v3 (MotionVersion::Learned's net), learnedHalf, learnedZeroTest, learnedStaticGuard (0|1); ui=off|crosshair|wholescreen|crosshairv2 =
 // uiProtection, with uiHistory uiBoxHeightFrac uiBoxWidth uiBoxHeight uiCrosshairArea uiBoxOffsetX uiBoxOffsetY uiStillFrames
 // uiStillThreshold uiInpaintReach uiMaxStillFraction uiContrastThreshold uiLeaveFrames uiReentryFrames uiEstimateFill), passed to init.
+// Also every field by its own name with a number (motionVersion uiProtection blurSamples blurWeights v2Mode learnedNet v3Guard: the enum's
+// value), as a host capture's `setting` lines write them: gpu/replay_capture.py replays such a capture through fgtest (task 109).
 // UI protection (ui != off in --set or --then): every real frame is recordObserve'd once, in pair order, into a ring of 3 input
 // images; consecutive pairs (pair k+1's prev path == pair k's curr path) form one frame stream, as a host sees it. A fresh
 // Interpolator (start, --window) has to warm up: CrosshairV2 / Crosshair mask a pixel only after uiStillFrames (8) still frames,
@@ -66,7 +68,8 @@ static bool parseSettings(char* str, framegen::Settings& s) {
             else { fprintf(stderr, "algo=v1|v2|learned|v3, not %s\n", eq + 1); return false; }
         }
         else if (k == "learnedNet") {   // MotionVersion::Learned's net by its name (framegen::learnedNetName: e2v3 | e1v3 | e2v4 | e1v4 | e2v5 | e1v5 | g2v2|g2v3|m2v2|m2v3)
-            if (!framegen::learnedNetFromName(eq + 1, &s.learnedNet)) {
+            if (eq[1] >= '0' && eq[1] <= '9') s.learnedNet = (framegen::LearnedNet)(uint32_t)v;   // a capture's number
+            else if (!framegen::learnedNetFromName(eq + 1, &s.learnedNet)) {
                 fprintf(stderr, "learnedNet=");
                 for (uint32_t n = 0; n < framegen::kLearnedNets; n++) fprintf(stderr, "%s%s", n ? "|" : "", framegen::learnedNetName((framegen::LearnedNet)n));
                 fprintf(stderr, ", not %s\n", eq + 1);
@@ -75,8 +78,8 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         }
         else if (k == "v2Mode") {   // MotionVersion::V2's mode: quality | performance
             std::string a = eq + 1;
-            if (a == "quality") s.v2Mode = framegen::V2Mode::Quality;
-            else if (a == "performance") s.v2Mode = framegen::V2Mode::Performance;
+            if (a == "quality" || a == "0") s.v2Mode = framegen::V2Mode::Quality;
+            else if (a == "performance" || a == "1") s.v2Mode = framegen::V2Mode::Performance;
             else { fprintf(stderr, "v2Mode=quality|performance, not %s\n", eq + 1); return false; }
         }
         else if (k == "trustLow") s.trustLow = (float)v;
@@ -131,6 +134,11 @@ static bool parseSettings(char* str, framegen::Settings& s) {
         else if (k == "uiLeaveFrames") s.uiLeaveFrames = (uint32_t)v;
         else if (k == "uiReentryFrames") s.uiReentryFrames = (uint32_t)v;
         else if (k == "uiEstimateFill") s.uiEstimateFill = v != 0;
+        // task 109 (gpu/replay_capture.py): the remaining field names a host capture writes, enums as their numbers (validate() refuses a bad one)
+        else if (k == "motionVersion") s.motionVersion = (framegen::MotionVersion)(uint32_t)v;
+        else if (k == "uiProtection") s.uiProtection = (framegen::UiProtection)(uint32_t)v;
+        else if (k == "blurSamples") s.blurSamples = (uint32_t)v;
+        else if (k == "blurWeights") s.blurWeights = (framegen::BlurWeights)(uint32_t)v;
         else { fprintf(stderr, "unknown setting %s\n", tok); return false; }
     }
     return true;

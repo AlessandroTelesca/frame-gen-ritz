@@ -120,6 +120,7 @@ It costs more than V1: 1080p 2x, back-to-back per pair, e2v5 1.35-1.66 ms (half 
 | `gpu/pacingtest.cpp`, `gpu/minitest.h` | CPU-only tests of the pacing header and the lag-spike buffer (`meson test`), with a tiny Catch2 stand-in |
 | `gpu/shaders/*.comp` | GLSL compute passes (`ui_*.comp`: static-UI protection, `blur_*.comp`: motion blur); `format.glsl` selects the per-format variants of the colour passes |
 | `gpu/fgtest.cpp` | Test and benchmark tool for raw RGBA frame files |
+| `gpu/replay_capture.py` | Replays a host's frame capture (gamescope-ritz `capture.txt` v=1 with its raw images) through `fgtest` and prints, per generated frame, its difference from the captured output and the dark measures of both |
 | `gpu/uitest.cpp` | Validation and benchmark of static-UI protection on a synthetic scene |
 | `gpu/formattest.cpp` | Single-frame checks of every image format (Rgb10, RgbaF16, Nv12, P010) against Rgba8 on a synthetic scene |
 | `gpu/blurtest.cpp`, `gpu/blendbench.comp` | Validation and benchmark of the motion blur on a synthetic scene (the shader is the naive blend the benchmark compares against) |
