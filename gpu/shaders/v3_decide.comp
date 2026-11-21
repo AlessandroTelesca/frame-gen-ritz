@@ -2,7 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 // MotionVersion::V3, build step Y2 (gpu/V3.md section 3.12): the pair's decisions, one workgroup of 64 threads, at the end of the estimate.
 //   Scene cut: for each of the 9 tiles, p_b = (h0_b + 1) / (N_t0 + 64) and q_b likewise from frame 1 (the 64-bin luma histograms v3_hist filled); the
-//     symmetric KL divergence D_t = sum_b (p_b - q_b) ln(p_b / q_b); D = the mean over the tiles; cut = v3SceneCut > 0 && D > v3SceneCut.
+//     symmetric KL divergence D_t = sum_b (p_b - q_b) ln(p_b / q_b); D = the mean over the tiles; cut = v3SceneCut > 0 && D > v3SceneCut, or the hard rule below (task 112).
 //     Deviation from the page (a fade must not be a cut): D is also taken with frame 1's histogram carried to frame 0's lighting by the pair's own gain
 //     and offset (the gm, K the search matches with, from the sums of v3_hist: y0 = gm y1 - K; each bin's count is spread over the bins it covers
 //     after the map), and D = the smaller of the two. A fade or a flash is an affine change of the luma and its D collapses; a change of scene is not.
@@ -19,6 +19,15 @@
 #include "v3_common.glsl"
 #include "v3_est.glsl"
 layout(local_size_x = 64) in;
+
+// (task 112) the hard "the two frames do not correspond" rule: fixed, no setting reaches them (gpu/V3.md, "As built (user test 3, task 112)").
+// u = the unsure flow pixels of both grids, G.unsureCount / (2 fw fh) (all of them, not only those that could find a partner); D as above.
+// The pair does not correspond if u > 0.88 and D > 0.5 (almost nothing matched and the picture changed), or u > 0.5 and D > 4.5 (a change of
+// the picture no real motion makes: a cleared buffer, a flat frame, another scene with other levels). Measured on 521 real pairs and 88 that do
+// not correspond (1440x1080, flowScale 4 and 2; gpu/V3.md appendix item 29): real pairs up to 75 ms apart reach u 0.85 (with D 0.69) and D 2.89
+// (with u 0.81: a large particle in front of the camera); scenes that do not correspond have u 0.53-0.98 and D 0.64-15.
+const float V3_HARD_U1 = 0.88, V3_HARD_D1 = 0.5;
+const float V3_HARD_U2 = 0.5, V3_HARD_D2 = 4.5;
 
 shared float sD[16], sDc[16];
 
@@ -60,8 +69,13 @@ void main() {
         float D = 0.0, Dc = 0.0;
         for (int t = 0; t < 9; t++) { D += sD[t]; Dc += sDc[t]; }
         D = min(D, Dc) * (1.0 / 9.0);
-        const bool cut = pc.cutThresh > 0.0 && D > pc.cutThresh;
         const float N2 = 2.0 * float(pc.fw) * float(pc.fh);
+        // (task 112) the last-resort rule no setting switches off: two frames that do not correspond (another scene, a cleared buffer, a stale
+        // frame of another place; a torn frame only when most of it is wrong) leave almost every flow pixel of both grids unsure AND change the luma histograms; hard but real motion
+        // leaves one of the two low. Then the pair is a cut whatever v3SceneCut / globalFallback say.
+        const float uAll = float(ax[g + G_UNSURE_COUNT]) / N2;
+        const bool hard = (uAll > V3_HARD_U1 && D > V3_HARD_D1) || (uAll > V3_HARD_U2 && D > V3_HARD_D2);
+        const bool cut = (pc.cutThresh > 0.0 && D > pc.cutThresh) || hard;
         const float share = float(ax[g + G_UNSURE_ELIG]) / max(float(ax[g + G_ELIG]), 0.25 * N2);
         const float failMix = smoothstep(pc.globalFrac, 1.5 * pc.globalFrac, share);
         const float meanCost = float(ax[g + G_COST_SUM]) / 16.0 / N2;   // levels (G.costSum: fixed point x16 over both grids)

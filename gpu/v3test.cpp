@@ -1014,13 +1014,17 @@ int main(int argc, char** argv) {
     int selfFails = 0;
     if (which == "all" || which == "decide") {
         // the decisions on pairs that are not ordinary: a cut (two unrelated frames) is mode 1, noise against a picture is failMix 1; a lighting change (gamma) is neither
-        // (task 103) the scene cut is off by default (Settings::v3SceneCut = 0, never): the cut rows set the old threshold 0.45 explicitly, and the row
-        // "cut (default)" runs the same unrelated pair with the default: no cut, a generated frame (finite, not a copy of either real frame)
+        // (task 103) the scene cut is off by default (Settings::v3SceneCut = 0, never): the cut rows set the old threshold 0.45 explicitly.
+        // (task 112) the row "cut (default)" runs the same unrelated pair with the default settings and "cut (all off)" with every fallback
+        // setting off (v3SceneCut 0, globalFallback 1.0, trust 254 / 255, sceneCutSad 255): the hard rule of v3_decide (the two frames do not
+        // correspond) makes both a cut, and every generated frame is the nearer real frame. (Before task 112 "cut (default)" expected a
+        // generated frame: the cross-fade that the owner's mosaic came from.)
         struct Case { const char* name; int expectMode; float expectFail; float thresh; };
-        const Case cases[] = {{"cut", 1, -1, 0.45f}, {"noise", 0, 1, 0.45f}, {"gamma 0.5", 0, 0, 0.45f}, {"cut (default)", 0, -1, -1.0f}};
+        const Case cases[] = {{"cut", 1, -1, 0.45f}, {"noise", 0, 1, 0.45f}, {"gamma 0.5", 0, 0, 0.45f}, {"cut (default)", 1, -1, -1.0f}, {"cut (all off)", 1, -1, -2.0f}};
         for (const Case& cs : cases) {
             framegen::Settings st = info.settings;
             if (cs.thresh >= 0.0f) st.v3SceneCut = cs.thresh;
+            if (cs.thresh == -2.0f) { st.v3SceneCut = 0.0f; st.globalFallback = 1.0f; st.trustLow = 254; st.trustHigh = 255; st.sceneCutSad = 255.0f; }
             gFg.setSettings(st);
             Scene A, B;
             A.W = B.W = W; A.H = B.H = H;
@@ -1041,7 +1045,7 @@ int main(int argc, char** argv) {
             const bool ok = rok && r.mode == cs.expectMode && (cs.expectFail < 0 || r.failMix == cs.expectFail);
             printf("%-20s decide mode %d  failMix %.2f  histogram D %.3f (v3SceneCut %.2f)   %s (expected mode %d%s)\n", cs.name, r.mode, r.failMix, r.histD, st.v3SceneCut, ok ? "PASS" : "FAIL", cs.expectMode, cs.expectFail < 0 ? "" : ", failMix 1.00 (or 0.00 for the gamma pair)");
             verdict(ok, true);
-            if (rok && ts.size() && cs.thresh < 0.0f) {   // the default on a true cut: one generated frame per t, not a copy of either real frame
+            if (false) {   // (before task 112) the default on a true cut: one generated frame per t, not a copy of either real frame
                 for (size_t k = 0; k < ts.size(); k++) {
                     size_t same0 = 0, same1 = 0;
                     double d0 = 0.0, d1 = 0.0;
