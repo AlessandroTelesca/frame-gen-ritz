@@ -13,7 +13,7 @@ import oracle as OR
 import train as TR
 
 out = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else TRAIN
-torch.set_num_threads(3)
+torch.set_num_threads(5)
 man = manifest()
 
 
