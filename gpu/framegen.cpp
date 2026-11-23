@@ -51,6 +51,7 @@
 #include "v2_qmorph_s_spv.h"
 // MotionVersion::V3 (gpu/V3.md): its raw planes (v3_planes) and its synthesis (v3_synth) read colour and have a variant per format (probed per format below)
 #include "v3_synth_spv.h"
+#include "v3_synth_b_spv.h"   // Settings::v3Blend: the synthesis with the learned-blend nets, -DV3B=1 (Rgba8 / Bgra8 only)
 #include "v3_synth_l_spv.h"   // hook (l) v3DetailSplit: the same synthesis built with -DV3L=1 (per format below)
 // (the estimate's other passes: plain builds, they work on V3's own planes and the luma)
 #include "v3_planes_spv.h"
@@ -272,7 +273,7 @@ struct Spv { const uint32_t* code = nullptr; size_t size = 0; };
 #define SPV(n) Spv{n##_spv, sizeof(n##_spv)}
 // The format-specific shaders of one Format (the others - motion estimate - are the same for every format).
 struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, uiInpaint, uiPatch, blurError, blurResolve, uiInpaintC, uiPatchC, uiV2Update, uiV2Fill,
-    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes, v3SynthL; };
+    v2Morph, v2MorphS, v2QMorph, v2QMorphS, mlDup, mlGuard, mlPlanes, v3Synth, v3Planes, v3SynthL, v3SynthB; };
 #define COLOUR_SET(f) ColourSpv{SPV(luma##f), SPV(error##f), SPV(resolve##f), SPV(fallback##f), SPV(ui_detect##f), \
     SPV(ui_box_update##f), SPV(ui_inpaint##f), SPV(ui_patch##f), SPV(blur_error##f), SPV(blur_resolve##f), Spv{}, Spv{}, \
     SPV(ui_v2_update##f), SPV(ui_v2_lumafill##f), Spv{}, Spv{}, Spv{}, Spv{}}
@@ -283,7 +284,7 @@ struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, ui
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
     case Format::Rgba8:
-        c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, );
+        c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, ); c.v3SynthB = SPV(v3_synth_b);   // (v3Blend: the plain format only; the others keep it empty = the rule)
 #ifdef FG_HAVE_ML
         ML_SET(c, );
 #endif
@@ -503,7 +504,7 @@ static_assert(sizeof(V3PC) == sizeof(PC), "V3PC is pushed over PC's range");
 // task 105: hudBonus in V3 (gpu/V3.md "As built (HUD bonus, task 105)"): K converts V1's levels (5x5 mean abs luma error) to V3's cost units; P = the ramps
 const float kV3HudK = 0.7f;
 const float kV3HudP[5] = {1.0f, 3.0f, 1.5f, 4.0f, 10.0f};
-enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8 };   // synth mode bits (shaders/v3_common.glsl)
+enum V3Mode : int { V3M_GAUSS = 1, V3M_DETAIL = 2, V3M_DUMP = 8, V3M_BLEND_SHIFT = 4 };   // (bits 4, 5: Settings::v3Blend)   // synth mode bits (shaders/v3_common.glsl)
 // MotionVersion::Learned's duplicate test: FGR's own, proto/harness.py DUP_DIFF (and gpu/compare.py): a pair whose mean over the
 // pixels of the channel-mean |a - c| is at most this many 8-bit levels is a duplicate ("re-encoded duplicate frames differ by up to
 // ~0.5"). The net is skipped there and the field is zero (shaders/ml_dup.comp).
@@ -592,6 +593,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
             P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
             P_V3_SYNTH_L,   // (hook (l) v3DetailSplit: the synthesis built with -DV3L=1)
+            P_V3_SYNTH_B,   // (Settings::v3Blend: the synthesis built with -DV3B=1, Rgba8 / Bgra8 only)
             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
@@ -1685,7 +1687,7 @@ bool Interpolator::validate(const Settings& s) {
            s.searchRadius >= 1 && s.searchRadius <= 12 && s.searchRadiusTop >= 1 && s.searchRadiusTop <= 12 &&
            (s.flowScale == 1 || s.flowScale == 2 || s.flowScale == 4) && s.pyramidMinSide >= 16 && s.pyramidMinSide <= 256 &&
            (uint32_t)s.uiProtection <= (uint32_t)UiProtection::CrosshairV2 && (uint32_t)s.motionVersion <= (uint32_t)MotionVersion::V3 &&
-           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
+           (uint32_t)s.v2Mode <= (uint32_t)V2Mode::Performance && (uint32_t)s.v3Guard <= (uint32_t)V3Guard::V2Motion && s.v3Blend <= 3 && (uint32_t)s.learnedNet < (uint32_t)kMlNets &&
            in(s.v3Smear, 0.0f, 1.0f) && in(s.v3OcclSoft, 0.25f, 4.0f) && in(s.v3Unsure, 0.25f, 4.0f) && in(s.v3SceneCut, 0.0f, 4.0f) &&
            s.blurSamples <= kBlurMaxSamples && (uint32_t)s.blurWeights <= (uint32_t)BlurWeights::Gaussian &&
            in(s.uiCrosshairArea, 0.0f, 1.0f) && s.uiCrosshairArea > 0.0f &&
@@ -1832,6 +1834,7 @@ bool Interpolator::Impl::motionEnsure() {
         spv[P_V2_STATIC].sp = SPV(v2_static);   // V2's shader as is (V3 pushes V3PC, whose first 8 ints are V2PC's; b14 has V2B_QUAL's S / s8 offsets)
         spv[P_V3_SYNTH] = {cs.v3Synth, spec};
         spv[P_V3_SYNTH_L] = {cs.v3SynthL, spec};
+        spv[P_V3_SYNTH_B] = {cs.v3SynthB, spec};
     }
     // Learned: V1's luma, synthesis and blur, its own passes instead of V1's search; the convs specialised per layer shape and net
     // (shaders/ml_conv.comp: GI, GO, LINEAR), and the weights buffer
@@ -3446,10 +3449,12 @@ bool Interpolator::Impl::v3Synth(VkCommandBuffer cb, Frame srcP, Frame srcC, Fra
     }
     // synth mode: bit 0 Gaussian blur weights, bit 1 hook (l) v3DetailSplit (also selects the -DV3L=1 build P_V3_SYNTH_L, which does not read it), bit 3 the weights dump
     // (lw = the stride of the dumped pixels in the raster, lh = their number)
-    v.mode = (gauss ? V3M_GAUSS : 0) | (set.v3DetailSplit ? V3M_DETAIL : 0) | (dumpCount ? V3M_DUMP : 0);
+    // Settings::v3Blend >= 1 selects the -DV3B=1 build (P_V3_SYNTH_B; bits 4, 5 = the variant), unless the detail split is on or this format has no such build (then the rule)
+    const bool blend = set.v3Blend != 0 && !set.v3DetailSplit && mo[(int)MotionVersion::V3].pipes[P_V3_SYNTH_B];
+    v.mode = (gauss ? V3M_GAUSS : 0) | (set.v3DetailSplit ? V3M_DETAIL : 0) | (dumpCount ? V3M_DUMP : 0) | (blend ? (int)set.v3Blend << V3M_BLEND_SHIFT : 0);
     v.lw = (int)dumpStride;
     v.lh = (int)dumpCount;
-    r.runV3(set.v3DetailSplit ? P_V3_SYNTH_L : P_V3_SYNTH, v, divUp((int)W, 8), divUp((int)H, 8));
+    r.runV3(set.v3DetailSplit ? P_V3_SYNTH_L : blend ? P_V3_SYNTH_B : P_V3_SYNTH, v, divUp((int)W, 8), divUp((int)H, 8));
     const char* name = n == 1 ? "synth" : "blur synth";
     if (estUi) {
         r.barrier(CS, VK_ACCESS_SHADER_WRITE_BIT, CS, RW);

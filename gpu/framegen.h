@@ -353,6 +353,12 @@ struct Settings {
     float v3SceneCut = 0.0f;
     bool v3ColourWindow = false;
     bool v3DetailSplit = false;
+    // v3Blend (0..3, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of three small per-pixel nets instead of the hand-written rule: 1 / 2 = four
+    // choices (the four taps), 3 = six choices (also the two real frames' own pixel). The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by
+    // gpu/ml/blend/export_glsl.py; the committed header is all zeros = every variant equals the rule up to a 1e-3 floor in the prior). 0 = the rule, byte-identical to V3
+    // without the setting. Only the plain Rgba8 / Bgra8 build has the nets: with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
+    // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).
+    uint8_t v3Blend = 0;
     // v3Guard (see V3Guard): V2 Quality's motion estimate also runs on each pair and corrects (Guard) or replaces (V2Motion) V3's dense motion field
     // before V3's occlusion / fill / synthesis; Off = the default, V3 exactly as without it. Needs V2's subgroup requirements (a device that cannot
     // run MotionVersion::V2, Interpolator::settingsError, refuses it with the reason V2 gets). While on, searchRadius, searchRadiusTop,
