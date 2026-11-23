@@ -15,3 +15,7 @@ Trains the three tiny per-pixel nets of `v3Blend` (SPEC section 4, `gpu/ml/blend
 
 Rerun: `build_cache.py real --cap 8192`, `build_cache.py teacher --cap 2048`, `train.py $BLEND/train/out/real_only`, `train.py $BLEND/train/out/with_teacher --teacher`, `score.py`.
 Run the export with `python3 gpu/ml/blend/export_glsl.py A.npz B.npz C.npz -o somewhere.glsl` (never to `gpu/shaders/` unless intended).
+
+## Diagnosis (size, loss, inputs)
+
+`extras.py` (sigma, s per cached row, rows asserted to line up), `diag.py RUN [--steps N] [--batch B]` (RUN = base mse h32 h64x2 h64x2+ h64x2mse; trains the 4- and 6-choice form on the real cache rows only, scores cached val rows and a 3 M-row train subsample into `$BLEND/train/diag/RUN.json`), `diag_report.py` (-> `diag.md` / `diag.json`). Needs about 8 GB of RAM for the whole cache; run with `ccorral --`.
