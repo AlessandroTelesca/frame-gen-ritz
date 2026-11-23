@@ -1,0 +1,24 @@
+
+== 120to60: model(a, a+2) vs real a+1
+group             n | method    PSNR dB     MAE  >30 share
+minecraft120    312 | teacher     28.51   3.810      2.78%
+minecraft120    312 | avg         27.04   5.241      4.56%
+battlefield      26 | teacher     29.76   2.871      1.60%
+battlefield      26 | avg         25.29   6.093      5.74%
+all             338 | teacher     28.60   3.738      2.69%
+all             338 | avg         26.88   5.307      4.66%
+per-anchor teacher PSNR: min 19.37  median 30.89  max 52.70
+
+== 30to60: model(a, a+4) vs real a+2
+group             n | method    PSNR dB     MAE  >30 share
+minecraft120    312 | teacher     26.95   4.800      4.07%
+minecraft120    312 | avg         25.05   6.915      7.47%
+battlefield      26 | teacher     26.97   4.327      3.35%
+battlefield      26 | avg         22.86   8.910      9.61%
+all             338 | teacher     26.95   4.764      4.01%
+all             338 | avg         24.83   7.068      7.63%
+per-anchor teacher PSNR: min 19.22  median 28.69  max 51.76
+wrote /home/mo/DieGanzeSau/AI_Video_Training_Data/blend/teacher/img/120to60_worst_minecraft120_08_1560.png (MSE 751.2)
+wrote /home/mo/DieGanzeSau/AI_Video_Training_Data/blend/teacher/img/120to60_median_minecraft120_11_2280.png (MSE 53.5)
+wrote /home/mo/DieGanzeSau/AI_Video_Training_Data/blend/teacher/img/30to60_worst_minecraft120_14_1560.png (MSE 778.9)
+wrote /home/mo/DieGanzeSau/AI_Video_Training_Data/blend/teacher/img/30to60_median_minecraft120_13_120.png (MSE 88.0)
