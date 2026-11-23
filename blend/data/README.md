@@ -25,4 +25,4 @@ The teacher frames live in `$BLEND/teacher/<clip>/mid_<i>.rgba` (`i` = the targe
     python3 dump.py --kind teacher --ids ids.txt        # ids.txt: one sample id per line; without --ids: every teacher sample
     python3 oracle.py --kind teacher                     # oracle weights for them (the CLI takes --kind real|teacher)
 
-Options: `--split train|val`, `--chunk N` (pairs per lock hold, default 30, about 30 s), `--vmax` (8192) / `--vmax-forza` (32768), `--force`, `--outdir`.
+Options: `--split train|val`, `--chunk N` (pairs per lock hold, default 30, about 30 s), `--vmax` (8192) / `--vmax-forza` (32768), `--force`, `--outdir`, `--jobs N` (run N chunks at once, default 1; N about the number of cores is meant for a machine whose GPU is otherwise idle), `--no-gpu-lock` (leave out `flock gpu.lock`, needed for `--jobs` to really run at once; `ccorral --` is used only if installed).
