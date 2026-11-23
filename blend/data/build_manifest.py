@@ -24,7 +24,10 @@ for name in all_clips():
     skipped[name] = a["skipped"]
     cls, plan = (120, PLAN120) if is120(name) else (60, PLAN60)
     for anc in a["kept"]:
-        split = "val" if (name == "racing_forza6_c" or anc >= 0.9 * a["frames"]) else "train"
+        if foreign(name) and foreign(name).get("split"):   # clips.json: "split" "val" / "train" = the whole clip
+            split = foreign(name)["split"]
+        else:   # the last 10 % of the clip (the owner's own clips: and racing_forza6_c as a whole)
+            split = "val" if ((name == "racing_forza6_c" and not FOREIGN) or anc >= 0.9 * a["frames"]) else "train"
         for case, po, co, ts in plan:
             for ti, (t, kind, to) in enumerate(ts):
                 out.append({"id": f"{name}_{anc:06d}_{case}_{ti}", "clip": name, "class": cls, "case": case,

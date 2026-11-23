@@ -26,6 +26,9 @@ Everything here produces data or numbers; the library only holds the final weigh
    `... score CLIP`, `... video CLIP`, `... clean CLIP` (deletes the raw frames), and once `... report` (`$BLEND/render/scores.md`, `scores.json`).
    Clips: `racing_forza6_a`, `_b`, `_c`, `fps_cs2_a`, `minecraft_rtx_a`, `indie_schedule1_a`, `realworld_portland_walk_a`.
 
+## Fine-tuning on other footage
+To adapt the nets to a recording from elsewhere without moving big files: [FINETUNE.md](FINETUNE.md) (the handoff note); results go to `blend/weights/<name>/` (`blend/weights/base/` = the weights in use).
+
 ## Where the data lives
 All under `$BLEND` (not in the repository): `frames/` (raw RGBA8 1920x1080), `records/` and `records_t/` (weight-stage dumps), `rife/` (teacher code and weights), `teacher/`, `train/` (`cache/`, `out/`, `scores.md`),
 `render/` (`30to60/`, `60to120/` mp4, `scores.md`, `scores.json`, `json/`, `raw/` while a clip is being processed).

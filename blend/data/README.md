@@ -5,9 +5,9 @@ Python 3 + numpy only (no Pillow). `BLEND` (env, default `/home/mo/DieGanzeSau/A
 
 | script | what |
 |---|---|
-| `common.py` | paths, clip lists, `group(clip)` |
-| `extract.py CLIP` | one ffmpeg pass per clip (`select=between(..)`, `-fps_mode passthrough`, rgba), drops anchors with repeated frames (mean abs diff < 0.05), writes `frames/<clip>/<idx>.rgba` and `frames/<clip>.anchors.json` |
-| `build_manifest.py` | merges the anchor files into `frames/manifest.json` (+ `skipped.json`), writes `frames/DONE` |
+| `common.py` | paths, clip lists, `group(clip)`; with `$BLEND/clips.json` (recordings from elsewhere, see [FINETUNE.md](../FINETUNE.md)) only the clips named there exist: `{"name": {"path": "/abs/file.mkv", "fps": 120, "group": "forza", "skip": [[0, 35.5]], "split": "val"}}` (`skip` and `split` optional) |
+| `extract.py CLIP [--every SECONDS]` | one ffmpeg pass per clip (`select=between(..)`, `-fps_mode passthrough`, rgba), drops anchors with repeated frames (mean abs diff < 0.05), writes `frames/<clip>/<idx>.rgba` and `frames/<clip>.anchors.json`. `--every` = anchor step in seconds (default: today's steps); `clips.json` `skip` ranges give no anchors; checks 1920x1080 and, for 120 fps clips, the real rate; a missing `nb_frames` (`.mkv`) falls back to the packet count; the select expression is built as a tree (a plain `a+b+..` chain of more than about 100 terms makes ffmpeg fail) |
+| `build_manifest.py` | merges the anchor files into `frames/manifest.json` (+ `skipped.json`), writes `frames/DONE`; clips from `clips.json`: the last 10 % of every clip is validation unless its entry says `"split": "val"` or `"train"` (whole clip) |
 | `dump.py` | the weight-stage dump: runs `fgtest --window 1 --set algo=v3 --t T --v3weights .. --v3wmax N` for chunks of pairs (one `flock gpu.lock ccorral --` call per chunk, same t), appends prev / curr / target / x / y / id columns, writes `records/<id>.npy` ([n, 40] float32) and `records/index.json`; failures go to `records/failed.json` |
 | `oracle.py` | exact per-pixel simplex-constrained least squares over the 4 taps (and over taps + prev(x) + curr(x)); `--selftest` checks it against a brute-force grid; CLI writes `records/<id>.oracle.npy` ([n, 10]) |
 | `measure.py` | the D8 tables (rule / oracle 4 / oracle 6 / time blend / nearest, per split x group x case; Forza by unsure and vector length) -> `records/measure.md/.json` |

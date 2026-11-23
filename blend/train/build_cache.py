@@ -52,6 +52,7 @@ if __name__ == "__main__":
                 out.setdefault(man[sid]["split"], []).append((sid, d))
             if i % 200 == 0:
                 print(i, len(ids), flush=True)
+    os.makedirs(CACHE, exist_ok=True)
     for split, lst in out.items():
         name = f"{kind}_{split}"
         d = {k: np.concatenate([x[1][k] for x in lst]) for k in lst[0][1]}
