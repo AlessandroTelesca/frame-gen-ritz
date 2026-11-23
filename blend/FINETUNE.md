@@ -59,9 +59,11 @@ git log --oneline -1
 export REPO=$PWD
 ```
 
+Every command below needs `REPO` here and `BLEND` (section 2) exported in the shell, and `OWNER_ROWS` in 3.6; if an error mentions a path starting with `/blend` or `/gpu`, one of them is not set.
+
 The scripts were tested at commit `4fa2f47` of `dev` (and everything after it that only touches other files). Use the tip of `dev` of your fork after syncing it with `Ritze03/frame-gen-ritz` (`git fetch https://github.com/Ritze03/frame-gen-ritz.git dev && git merge --ff-only FETCH_HEAD` if your fork is behind).
 
-Build the test program `fgtest` (plain setup is enough; about 3 to 6 minutes; it compiles many shaders):
+Build the test program `fgtest` (plain setup is enough; under about 6 minutes (it took 6 seconds on a fast 20-thread machine); it compiles many shaders):
 
 ```
 cd $REPO/gpu
@@ -116,7 +118,7 @@ Needed: `width=1920`, `height=1080`, `r_frame_rate=120/1` (119.88 is accepted to
 
 ## 3. The steps, in order
 
-Run everything in the same shell (`REPO` and `BLEND` exported). **If a step stops (reboot, Ctrl-C, error), run the same command again**; what to expect on a rerun is stated per step. Times marked "estimate" were not measured on your machine.
+Run everything in the same shell (`REPO` and `BLEND` exported; each step starts with the `cd` it needs). **If a step stops (reboot, Ctrl-C, error), run the same command again**; what to expect on a rerun is stated per step. Times marked "estimate" were not measured on your machine.
 
 ### 3.1 extract: frames around sampled positions
 
@@ -133,6 +135,7 @@ Writes `$BLEND/frames/<clip>/<frameindex>.rgba` (raw 1920x1080 RGBA, 8.3 MB each
 ### 3.2 manifest
 
 ```
+cd $REPO/blend/data
 python3 build_manifest.py
 ```
 
@@ -143,6 +146,7 @@ Writes `$BLEND/frames/manifest.json` (every sample: which frames, what target; `
 Close games and every other GPU program first. `fgtest` uses the GPU through Vulkan; do not use the machine for anything GPU-heavy while this runs.
 
 ```
+cd $REPO/blend/data
 python3 dump.py --kind real --jobs 8 --no-gpu-lock --vmax-forza 8192
 ```
 
@@ -153,6 +157,7 @@ After this step the frames are no longer needed by the next steps. To save 62 GB
 ### 3.4 oracle: the best possible mix per pixel (the training target)
 
 ```
+cd $REPO/blend/data
 python3 oracle.py --procs 14
 ```
 
@@ -172,16 +177,17 @@ Writes `$BLEND/train/cache/real_train_*.npy` and `real_val_*.npy` (and prints `r
 Put the file the owner sent you at a known place, for example `export OWNER_ROWS=$HOME/owner_rows.npz`. Then:
 
 ```
+cd $REPO/blend/train
 ~/venv-blend/bin/python train.py $BLEND/train/out_ft \
     --init $REPO/blend/weights/base --mix $OWNER_ROWS \
     --steps 4000 --lr 2e-4 --lr-end 1e-5 --threads 8
 ```
 
-What it does: starts from the owner's current weights (`blend/weights/base`) instead of from scratch; every batch of 65,536 pixels is half your rows (from the cache) and half the owner's rows from other games (`owner_rows.npz`, balanced over its 8 groups, 40 % Forza), so the nets learn your footage without forgetting the rest. Every 500 steps it validates on your held-out rows and on the owner's validation rows, and **keeps the step with the lowest mean of both** (step 0 = the unchanged base weights, so the result is never worse than the start on that measure). Learning rate: `2e-4` falling to `1e-5` (cosine), a tenth of the rate of the from-scratch run (`2e-3`), because the start is already trained and a high rate only throws it away; 4,000 steps because the from-scratch run needed 6,000 to 15,000 and a fine-tune needs fewer. **These two numbers are a reasoned choice, not tuned on real foreign footage**; if the validation numbers printed every 500 steps keep falling to the last step, a run with `--steps 8000` is fine. Load: CPU only (`--threads 8`), RAM about 4 GB. Time: measured on the owner's machine 300 steps in 8 s with 4 threads, so 4,000 steps take about 2 to 4 minutes (estimate; plus about 1 minute to load the files and score at the end). Writes into `$BLEND/train/out_ft`: `A.npz B.npz C.npz log.json scores.md run.json`. Worked: the last lines are `best {...}` and `wrote scores.md and run.json`. Resume: just run it again (a run is short and has no checkpoints); to try other settings write to a different folder, e.g. `out_ft2`.
+What it does: starts from the owner's current weights (`blend/weights/base`) instead of from scratch; every batch of 65,536 pixels is half your rows (from the cache) and half the owner's rows from other games (`owner_rows.npz`, balanced over its 8 groups, 40 % Forza), so the nets learn your footage without forgetting the rest. Every 500 steps it validates on your held-out rows and on the owner's validation rows, and **keeps the step with the lowest mean of both** (step 0 = the unchanged base weights, so the result is never worse than the start on that measure). Learning rate: `2e-4` falling to `1e-5` (cosine), a tenth of the rate of the from-scratch run (`2e-3`), because the start is already trained and a high rate only throws it away; 4,000 steps because the from-scratch run needed 6,000 to 15,000 and a fine-tune needs fewer. **These two numbers are a reasoned choice, not tuned on real foreign footage**; if the numbers printed every 500 steps (each line: the validation loss of A, B, C on your rows, then on the owner's rows; lower is better; the changes are in the 4th or 5th digit, that is normal) keep falling to the last step, a run with `--steps 8000` is fine. Load: CPU only (`--threads 8`), RAM about 4 GB. Time: measured on the owner's machine 300 steps in 8 s with 4 threads, so 4,000 steps take about 2 to 4 minutes (estimate; plus about 1 minute to load the files and score at the end). Writes into `$BLEND/train/out_ft`: `A.npz B.npz C.npz log.json scores.md run.json`. Worked: the last lines are `best {...}` and `wrote scores.md and run.json`. Resume: just run it again (a run is short and has no checkpoints); to try other settings write to a different folder, e.g. `out_ft2`.
 
 ## 4. Checks before sending
 
-Open `$BLEND/train/out_ft/scores.md`. For each of the nets A, B, C it shows PSNR (dB, higher is better), MAE (average error in colour levels, lower is better) and the share of pixels with an error above 30 levels (lower is better), each for **rule** (the hand-written weights), **base** (the owner's weights) and **tuned** (your result), (i) on your held-out rows and (ii) on the owner's validation rows per game group.
+Open `$BLEND/train/out_ft/scores.md` (a markdown file with two tables, titled "Local validation rows" = table (i) and "Validation rows of the --mix file" = table (ii); `tuned` is the result of this run). For each of the nets A, B, C it shows PSNR (dB, higher is better), MAE (average error in colour levels, lower is better) and the share of pixels with an error above 30 levels (lower is better), each for **rule** (the hand-written weights), **base** (the owner's weights) and **tuned** (your result), (i) on your held-out rows and (ii) on the owner's validation rows per game group.
 
 A sane result:
 - on **your validation rows** (table i): `tuned` is not worse than `base`, and ideally better (a gain of 0.1 dB or more is a good result; the point of the exercise);
@@ -194,7 +200,7 @@ Also check `run.json`: it lists no absolute paths and no user names (the scripts
 
 ## 5. Sending it back
 
-Choose a short name for the folder, e.g. `forza-rx9070xt` (letters, digits, `-`). In your fork:
+Write the PR text first (see below) into a file `~/pr.txt`, outside the repository. Choose a short name for the folder, e.g. `forza-rx9070xt` (letters, digits, `-`). In your fork:
 
 ```
 cd $REPO
@@ -209,9 +215,9 @@ gh pr create --repo Ritze03/frame-gen-ritz --base dev --head YOURNAME:weights/fo
     --title "Weights: Forza fine-tune (forza-rx9070xt)" --body-file ~/pr.txt
 ```
 
-(Write the PR text first into the file `~/pr.txt`, outside the repository; or open the pull request on the web page, base branch `dev`.) `git status --short` before the commit must list exactly those five files and nothing else.
+(Instead of `gh pr create` you can open the pull request on the GitHub web page of your fork, base branch `dev`.) If `git commit` says "Author identity unknown", run `git config user.name "anything"` and `git config user.email "anything@example.invalid"` once inside the clone (without `--global`) and commit again. If `git push` asks for a password or fails with an authentication error, run `gh auth login` and then `gh auth setup-git`. `git status --short` before the commit must list exactly those five files and nothing else.
 
-The PR text should say: how much footage (number of recordings, total minutes, 1920x1080, 120 fps), the sampling (`--every 2`, number of anchors kept, number of samples: see `run.json`), the training options (steps, learning rate), the machine (CPU, GPU, "Nobara"), whether anything failed or was changed, and the **score table**: paste the rows of table (i) and the `all` rows of table (ii) from `scores.md` (the full file is in the PR as well), plus one sentence on whether the result is sane by the checks above.
+The PR text should say: how much footage (number of recordings, total minutes, 1920x1080, 120 fps), the sampling (`--every 2`, number of anchors kept: `anchors_kept` per clip in `run.json`; the number of samples is 4 per anchor; the total minutes are `frames` / 120 / 60 summed over the clips), the training options (steps, learning rate), the machine (CPU, GPU, "Nobara"), whether anything failed or was changed, and the **score table**: paste the rows of table (i) and the `all` rows of table (ii) from `scores.md` (the full file is in the PR as well), plus one sentence on whether the result is sane by the checks above.
 
 **Do not** commit footage, frames, records, the cache or `owner_rows.npz`. **Do not** change any other file of the repository. **Do not** regenerate the shader header (`gpu/shaders/v3_blend_weights.glsl`): the owner does that himself after scoring your weights on his side.
 
