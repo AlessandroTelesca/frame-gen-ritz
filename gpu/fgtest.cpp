@@ -23,7 +23,8 @@
 // same command buffer as record(t[0]) -> out.rgba.0, setSettings(--set + these) then record(t[0]) -> out.rgba.1 (runtime-change
 // test; --then algo=.. switches the motion version between the two records).
 // --stats: after each pair print "STATS <pair> <untrusted px> <SAD sum x256> <SAD blocks> <W*H>" to stdout (the inputs of the
-// whole-frame fallback / scene-cut decisions of the pair's last synth, via Interpolator::recordDebugCounters; read-only).
+// whole-frame fallback / scene-cut decisions of the pair's last synth, via Interpolator::recordDebugCounters; read-only), then "BLEND <pair> <0|1>"
+// (Interpolator::v3BlendActive(): 1 = the learned-blend build runs under the settings).
 // --window N: destroy + init the Interpolator before every N-th pair (pair 0, N, 2N, ..): independent windows of consecutive
 // pairs in one call, no state carried across (bench/score; UI protection warms up again per window). Neither changes any output.
 // --dump DIR (created if missing): after each pair write DIR/pair_NNNN.fgmaps (Interpolator::recordDebugMaps, read-only, output unchanged): a 64-byte
@@ -825,7 +826,10 @@ int main(int argc, char** argv) {
             vkDestroyBuffer(dev, wb, nullptr);
             vkFreeMemory(dev, wm, nullptr);
         }
-        if (stats) printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
+        if (stats) {
+            printf("STATS %zu %u %u %u %zu\n", pairIdx, dbgMap[0], dbgMap[1], fg.debugSadBlocks(), (size_t)W * H);
+            printf("BLEND %zu %d\n", pairIdx, (int)fg.v3BlendActive());   // Interpolator::v3BlendActive(): 1 = the learned-blend build ran under the settings
+        }
         for (size_t k = 0; k < tcur.size(); k++) {
             begin();
             imgBarrier(cb, outs[k], VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

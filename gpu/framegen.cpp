@@ -51,7 +51,7 @@
 #include "v2_qmorph_s_spv.h"
 // MotionVersion::V3 (gpu/V3.md): its raw planes (v3_planes) and its synthesis (v3_synth) read colour and have a variant per format (probed per format below)
 #include "v3_synth_spv.h"
-#include "v3_synth_b_spv.h"   // Settings::v3Blend: the synthesis with the learned-blend nets, -DV3B=1 (Rgba8 / Bgra8 only)
+#include "v3_synth_b_spv.h"   // Settings::v3Blend: the synthesis with the learned-blend nets, -DV3B=1 (Rgba8 / Bgra8 and Rgb10)
 #include "v3_synth_l_spv.h"   // hook (l) v3DetailSplit: the same synthesis built with -DV3L=1 (per format below)
 // (the estimate's other passes: plain builds, they work on V3's own planes and the luma)
 #include "v3_planes_spv.h"
@@ -131,6 +131,10 @@
 #define FG_HAVE_V3_RGB10 1
 #include "v3_synth_rgb10_spv.h"
 #include "v3_synth_l_rgb10_spv.h"
+#if __has_include("v3_synth_b_rgb10_spv.h")
+#define FG_HAVE_V3B_RGB10 1
+#include "v3_synth_b_rgb10_spv.h"   // Settings::v3Blend in rgb10 (-DFG_FORMAT_RGB10=1 -DV3B=1); a host build without it runs the rule
+#endif
 #include "v3_planes_rgb10_spv.h"
 #endif
 // f16: all its variant headers are generated together (gpu/meson.build `formats` option), so one probe stands for the set.
@@ -284,7 +288,7 @@ struct ColourSpv { Spv luma, error, resolve, fallback, uiDetect, uiBoxUpdate, ui
 bool colourSpv(Format f, ColourSpv& c) {
     switch (f) {
     case Format::Rgba8:
-        c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, ); c.v3SynthB = SPV(v3_synth_b);   // (v3Blend: the plain format only; the others keep it empty = the rule)
+        c = COLOUR_SET(); V2_SET(c, ); V3_SET(c, ); c.v3SynthB = SPV(v3_synth_b);   // (v3Blend: Rgba8 / Bgra8 and Rgb10; the other formats keep it empty = the rule)
 #ifdef FG_HAVE_ML
         ML_SET(c, );
 #endif
@@ -300,6 +304,9 @@ bool colourSpv(Format f, ColourSpv& c) {
 #endif
 #ifdef FG_HAVE_V3_RGB10
         V3_SET(c, _rgb10);
+#ifdef FG_HAVE_V3B_RGB10
+        c.v3SynthB = SPV(v3_synth_b_rgb10);
+#endif
 #endif
         return true;
 #endif
@@ -593,7 +600,7 @@ enum Pipe { P_LUMA, P_DOWN, P_MEDHIST, P_MEDHIST_WIDE, P_SEARCH, P_SEARCH_WIDE, 
             // MotionVersion::V3 (gpu/V3.md section 7; the skeleton fills P_LUMA and P_V3_SYNTH only, the others are reserved for the steps E1..Y2)
             P_V3_PLANES, P_V3_PYR, P_V3_HIST, P_V3_SEARCH, P_V3_WIDE, P_V3_STATS, P_V3_DENSE, P_V3_OCCL, P_V3_FILL, P_V3_ENCLOSE, P_V3_DECIDE, P_V3_PROJECT, P_V3_SYNTH,
             P_V3_SYNTH_L,   // (hook (l) v3DetailSplit: the synthesis built with -DV3L=1)
-            P_V3_SYNTH_B,   // (Settings::v3Blend: the synthesis built with -DV3B=1, Rgba8 / Bgra8 only)
+            P_V3_SYNTH_B,   // (Settings::v3Blend: the synthesis built with -DV3B=1, Rgba8 / Bgra8 and Rgb10)
             P_V3_SEARCH_J, P_V3_SEARCH_TOP_J, P_V3_DENSE_J,   // (hook (j) v3ColourWindow: the search and dense passes built with the colour-window weights; the plain ones stay as they are)
             P_V3_SEARCH_TOP,   // (E1: the top level's exhaustive search, its own pipeline: its shared patch must not cost the other levels' occupancy)
             P_V3_ANCHOR, P_V3_GUARD,   // (task 104, Settings::v3Guard: created with the V2 estimate passes P_DOWN / P_V2_MEDHIST* / P_V2_SEARCH* / P_V2_REPICK / P_V2_CLEAN / P_V2_QFIELD in V3's group)
@@ -2016,6 +2023,11 @@ void Interpolator::Impl::motionFree(MotionGroup& g) {
 
 Format Interpolator::format() const {
     return m ? m->fmt : Format::Rgba8;
+}
+
+bool Interpolator::v3BlendActive() const {
+    ColourSpv c;
+    return m && m->mv3() && m->set.v3Blend != 0 && !m->set.v3DetailSplit && colourSpv(m->fmt, c) && c.v3SynthB.code;
 }
 
 Settings Interpolator::settings() const {

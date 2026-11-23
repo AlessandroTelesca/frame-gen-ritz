@@ -6,7 +6,9 @@
          weights r (columns 22..25) must come from a dump at v3Blend 0 (a dump at v3Blend >= 1 holds the net's weights there; its inputs are the same).
     npz: W1 [8][NI], b1 [8], W2 [K][8], b2 [K] (NI 25, K 4: four choices; NI 34, K 6: six choices, then e0 / e1 [n, 3] (levels) = prev(x) / curr(x) are needed).
     Returns the four tap weights (before any renormalisation) and, for six choices, w4 + w5 (zeros otherwise).
-CLI: ref.py RULE_DUMP.bin NET_DUMP.bin WEIGHTS.npz W H prev.rgba curr.rgba STRIDE  -> prints the max |difference| of w0..w3 and w4 + w5 (NET_DUMP = the shader's).
+CLI: ref.py RULE_DUMP.bin NET_DUMP.bin WEIGHTS.npz W H prev.rgba curr.rgba STRIDE [rgb10]  -> prints the max |difference| of w0..w3 and w4 + w5 (NET_DUMP = the shader's).
+    The optional last argument rgb10: the dump came from `fgtest --format rgb10`, whose upload turns each 8-bit value v into the PQ code of 1000 * (v/255)^2.4 nits
+    (rounded to 10 bit); the shader's working values e0 / e1 are code * 255 / 1023 (variant C only).
 """
 import sys
 import numpy as np
@@ -38,6 +40,13 @@ def blend_weights(rec, npz, e0=None, e1=None):
     w = e / e.sum(axis=1, keepdims=True)
     return w[:, :4], (w[:, 4] + w[:, 5] if k == 6 else np.zeros(len(w), np.float32))
 
+def rgb10_levels(v8):
+    """8-bit file values -> the working values (levels) of fgtest --format rgb10's upload."""
+    n = 1000.0 * (np.asarray(v8, np.float64) / 255.0) ** 2.4
+    p = np.minimum(n / 10000.0, 1.0) ** 0.1593017578125
+    code = np.floor(((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p)) ** 78.84375 * 1023.0 + 0.5)
+    return (code * (255.0 / 1023.0)).astype(np.float32)
+
 def read_dump(path, n=28):
     return np.fromfile(path, np.float32).reshape(-1, n)
 
@@ -50,6 +59,6 @@ if __name__ == "__main__":
         idx = np.arange(len(R), dtype=np.int64) * stride
         pa = np.fromfile(pf, np.uint8).reshape(H * W, 4)[idx, :3].astype(np.float32)
         ca = np.fromfile(cf, np.uint8).reshape(H * W, 4)[idx, :3].astype(np.float32)
-        e0, e1 = pa, ca
+        e0, e1 = (rgb10_levels(pa), rgb10_levels(ca)) if sys.argv[9:] == ["rgb10"] else (pa, ca)
     w, w45 = blend_weights(R, npz, e0, e1)
     print("records %d  max|dw0..3| %.3g  max|dw45| %.3g" % (len(R), np.abs(w - N[:, 22:26]).max(), np.abs(w45 - N[:, 27]).max()))

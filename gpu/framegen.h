@@ -356,7 +356,7 @@ struct Settings {
     // v3Blend (0..3, EXPERIMENTAL, default 0): the synthesis' blend weights come from one of three small per-pixel nets instead of the hand-written rule: 1 / 2 = four
     // choices (the four taps), 3 = six choices (also the two real frames' own pixel). The weights are baked in at build time (gpu/shaders/v3_blend_weights.glsl, written by
     // gpu/ml/blend/export_glsl.py; the committed header is all zeros = every variant equals the rule up to a 1e-3 floor in the prior). 0 = the rule, byte-identical to V3
-    // without the setting. Only the plain Rgba8 / Bgra8 build has the nets: with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
+    // without the setting. Only the Rgba8 / Bgra8 and Rgb10 builds have the nets (v3BlendActive() says whether they run): with another Format, or with v3DetailSplit on, a non-zero value falls back to the rule (gpu/V3.md
     // 3.16 "As built (learned blend)"). Acts in the synthesis (from the next recordSynth, no re-estimate), selects a third build of it (P_V3_SYNTH_B).
     uint8_t v3Blend = 0;
     // v3Guard (see V3Guard): V2 Quality's motion estimate also runs on each pair and corrects (Guard) or replaces (V2Motion) V3's dense motion field
@@ -511,6 +511,9 @@ public:
     bool reconfigure(const Settings&);
     // The active settings (defaults if not initialised).
     Settings settings() const;
+    // True if the next V3 synthesis would run the learned-blend build under the active settings: motionVersion V3, v3Blend != 0, v3DetailSplit off and a blend build for
+    // this Format (Rgba8 / Bgra8, Rgb10). False if not initialised. For a host's status line (a non-zero v3Blend alone does not mean the nets run).
+    bool v3BlendActive() const;
 
     // Call once per command buffer / submission, before its first record*() call: resets the
     // per-submission counts of both descriptor rings (see "Descriptor rings" below).
