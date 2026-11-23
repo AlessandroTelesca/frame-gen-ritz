@@ -1,0 +1,81 @@
+{
+ "commit": "3f56f96a370d7bca85aa4490802608423c700716",
+ "tracked_files_changed": false,
+ "options": {
+  "steps": 4000,
+  "seed": 0,
+  "lr": 0.0002,
+  "lr_end": 1e-05,
+  "threads": 8,
+  "batch": 65536,
+  "init": "base",
+  "mix": "owner_rows.npz",
+  "teacher": false
+ },
+ "steps": 4000,
+ "best_step": {
+  "A": 4000,
+  "B": 4000,
+  "C": 4000
+ },
+ "train_seconds": 55.7,
+ "rows_local_train": {
+  "forza": 10493952
+ },
+ "rows_local_val": {
+  "forza": 1179648
+ },
+ "rows_mix": {
+  "train": {
+   "forza": 800004,
+   "cs2": 171428,
+   "schedule1": 171428,
+   "minecraft_rtx": 171428,
+   "minecraft_vanilla": 171428,
+   "portland": 171428,
+   "minecraft120": 171428,
+   "battlefield": 171428
+  },
+  "val": {
+   "forza": 100000,
+   "cs2": 65312,
+   "schedule1": 24492,
+   "minecraft_rtx": 32656,
+   "minecraft_vanilla": 32656,
+   "portland": 16328,
+   "minecraft120": 100000,
+   "battlefield": 97968
+  }
+ },
+ "batch_local": {
+  "forza": 32768
+ },
+ "batch_mix": {
+  "cs2": 2808,
+  "schedule1": 2808,
+  "minecraft_rtx": 2808,
+  "minecraft_vanilla": 2808,
+  "portland": 2808,
+  "minecraft120": 2808,
+  "battlefield": 2808,
+  "forza": 13112
+ },
+ "clips": {
+  "forza_1": {
+   "fps": 120,
+   "frames": 187503,
+   "frames_from": "packet count",
+   "anchors_every_s": 2.0,
+   "anchors_kept": 712,
+   "anchors_dropped_repeated": 16
+  },
+  "forza_2": {
+   "fps": 120,
+   "frames": 173701,
+   "frames_from": "packet count",
+   "anchors_every_s": 2.0,
+   "anchors_kept": 713,
+   "anchors_dropped_repeated": 0
+  }
+ }
+}
